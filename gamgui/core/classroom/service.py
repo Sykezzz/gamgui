@@ -39,6 +39,7 @@ class ClassroomValidationError(ValueError):
 class OwnerTransferPreview:
     course: CourseDetail
     target_email: str
+    target_owner_id: str = ""
 
 
 class ClassroomService:
@@ -151,10 +152,20 @@ class ClassroomService:
     ) -> OwnerTransferPreview:
         course = await self._live_course(course_id)
         self._require_course_writable(course)
-        target = await self._require_active_user(target_email)
-        if course.owner_email and target == course.owner_email:
+        target, target_owner_id = await self._require_active_user_identity(target_email)
+        if target_owner_id and course.owner_id and target_owner_id == course.owner_id:
             raise ClassroomValidationError(f"{target} already owns this course.")
-        return OwnerTransferPreview(course=course, target_email=target)
+        if (
+            (not target_owner_id or not course.owner_id)
+            and course.owner_email
+            and target == course.owner_email
+        ):
+            raise ClassroomValidationError(f"{target} already owns this course.")
+        return OwnerTransferPreview(
+            course=course,
+            target_email=target,
+            target_owner_id=target_owner_id,
+        )
 
     async def transfer_owner(
         self, course_id: str, target_email: str
@@ -164,7 +175,22 @@ class ClassroomService:
             preview.course.id, preview.target_email
         )
         current = await self._patch_after(result, preview.course.id)
-        if result.ok and current.owner_email != preview.target_email:
+        verified = _owner_ids_match(preview.target_owner_id, current.owner_id)
+        if result.ok and not verified and (
+            not preview.target_owner_id or not current.owner_id
+        ):
+            try:
+                current = await self._live_course(
+                    preview.course.id, include_owner_email=True
+                )
+            except Exception:
+                pass
+            verified = _owner_ids_match(preview.target_owner_id, current.owner_id)
+            if not verified and (not preview.target_owner_id or not current.owner_id):
+                verified = bool(current.owner_email) and (
+                    current.owner_email == preview.target_email
+                )
+        if result.ok and not verified:
             return (
                 ChangeResult(
                     preview=result.preview,
@@ -495,28 +521,40 @@ class ClassroomService:
         )
         return teaching[:MAX_PAGE_SIZE], enrolled[:MAX_PAGE_SIZE]
 
-    async def _live_course(self, course_id: str) -> CourseDetail:
+    async def _live_course(
+        self, course_id: str, *, include_owner_email: bool = False
+    ) -> CourseDetail:
         clean_id = (course_id or "").strip()
         if not clean_id:
             raise ClassroomValidationError("A course ID is required.")
-        course = await self.connector.get_course(clean_id)
+        course = await self.connector.get_course(
+            clean_id, include_owner_email=include_owner_email
+        )
         if not course.id:
             raise ClassroomValidationError("That course no longer exists.")
         return course
 
-    async def _patch_after(self, result: ChangeResult, course_id: str) -> CourseDetail:
-        current = await self._live_course(course_id)
+    async def _patch_after(
+        self, result: ChangeResult, course_id: str, *, include_owner_email: bool = False
+    ) -> CourseDetail:
+        current = await self._live_course(
+            course_id, include_owner_email=include_owner_email
+        )
         if result.ok:
             await asyncio.to_thread(self.course_index.upsert, self.domain, current)
         return current
 
     async def _require_active_user(self, email: str) -> str:
+        canonical, _ = await self._require_active_user_identity(email)
+        return canonical
+
+    async def _require_active_user_identity(self, email: str) -> Tuple[str, str]:
         target = normalize_email(email)
         if not valid_email(target):
             raise ClassroomValidationError("Enter a valid internal user email.")
         try:
             user = await self.connector.get_user(
-                target, fields=("primaryEmail", "suspended")
+                target, fields=("id", "primaryEmail", "suspended")
             )
         except Exception as exc:
             raise ClassroomValidationError(
@@ -531,7 +569,11 @@ class ClassroomService:
             raise ClassroomValidationError(
                 f"{canonical} is suspended and cannot be enrolled or made owner."
             )
-        return canonical
+        raw = getattr(user, "raw", {})
+        owner_id = ""
+        if isinstance(raw, dict):
+            owner_id = str(raw.get("id") or raw.get("ID") or "").strip()
+        return canonical, owner_id
 
     def _validate_desired(self, desired: Sequence[str]) -> List[str]:
         values: List[str] = []
@@ -579,6 +621,10 @@ class ClassroomService:
 
 def _residual_labels(diff: RosterDiff) -> Tuple[str, ...]:
     return tuple([f"add:{email}" for email in diff.adds] + [f"remove:{email}" for email in diff.removes])
+
+
+def _owner_ids_match(expected: str, actual: str) -> bool:
+    return bool(expected and actual and expected == actual)
 
 
 def _owner_email(

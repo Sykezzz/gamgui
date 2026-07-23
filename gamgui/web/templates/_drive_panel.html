@@ -32,8 +32,19 @@
     <button type="submit" class="rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2">Search</button>
   </form>
 
-  <div id="drive-results" aria-live="polite">
-    {% include "_drive_rows.html" %}
+  <div class="grid items-start gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(28rem,1fr)]">
+    <div id="drive-results" class="min-w-0" aria-live="polite">
+      {% include "_drive_rows.html" %}
+    </div>
+    <aside id="drive-detail"
+           class="min-w-0"
+           aria-label="Selected file management"
+           aria-live="polite"
+           tabindex="-1"
+           hx-on::after-swap="if (event.detail.target === this) this.focus({preventScroll:true})">
+      <div class="rounded-xl border border-dashed border-brand-gray/50 bg-brand-white p-6 text-center text-sm text-brand-blueink">
+        Select Manage beside a file to preview it, edit details, review sharing, or transfer ownership.
+      </div>
+    </aside>
   </div>
-  <div id="drive-detail" aria-live="polite"></div>
 </section>

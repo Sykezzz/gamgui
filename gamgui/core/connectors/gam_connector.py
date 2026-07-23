@@ -20,7 +20,7 @@ from ..classroom.index import CourseIndex
 from ..classroom.models import CourseDetail, CourseParticipant, CourseSummary
 from ..directory_index import DirectoryIndex, Page
 from ..gam.commands import GAMCommands, SIGNATURE_USER_FIELDS, build_user_query
-from ..gam.errors import GAMErrorKind
+from ..gam.errors import GAMError, GAMErrorKind
 from ..gam.models import (
     CalendarACL,
     CalendarEvent,
@@ -449,11 +449,43 @@ class GAMConnector(Connector):
                     pass
                 raise cancellation
 
-    async def get_course(self, course_id: str) -> CourseDetail:
-        stdout = await self.runner.run_authenticated(
-            self.domain, GAMCommands.info_course(course_id)
-        )
-        return CourseDetail.from_json(parse_one(stdout))
+    async def get_course(
+        self,
+        course_id: str,
+        *,
+        include_owner_email: bool = False,
+        include_aliases: bool = False,
+        best_effort_enrichment: bool = False,
+    ) -> CourseDetail:
+        attempts = [(include_owner_email, include_aliases)]
+        if best_effort_enrichment:
+            # A deleted legacy owner can make ``owneremail`` fail even though the
+            # Classroom course itself is valid. Preserve aliases when possible,
+            # then fall back to the core course resource.
+            if include_owner_email:
+                attempts.append((False, include_aliases))
+            attempts.append((False, False))
+
+        deduplicated = list(dict.fromkeys(attempts))
+        last_detail = CourseDetail.from_json({})
+        for index, (with_owner_email, with_aliases) in enumerate(deduplicated):
+            try:
+                stdout = await self.runner.run_authenticated(
+                    self.domain,
+                    GAMCommands.info_course(
+                        course_id,
+                        include_owner_email=with_owner_email,
+                        include_aliases=with_aliases,
+                    ),
+                )
+            except GAMError:
+                if index == len(deduplicated) - 1:
+                    raise
+                continue
+            last_detail = CourseDetail.from_json(parse_one(stdout))
+            if last_detail.id or index == len(deduplicated) - 1:
+                return last_detail
+        return last_detail
 
     async def list_course_participants(
         self, course_id: str, role: str

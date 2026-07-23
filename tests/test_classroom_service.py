@@ -81,15 +81,31 @@ async def test_metadata_and_state_changes_re_read_and_patch_index(classroom):
 
 
 async def test_owner_transfer_requires_active_user_and_verifies_result(classroom):
-    service, _, _, _ = classroom
+    service, connector, _, _ = classroom
     preview = await service.prepare_owner_transfer("123", "newowner@example.com")
     assert preview.target_email == "newowner@example.com"
+    assert preview.target_owner_id == "id-newowner@example.com"
+    before_transfer = len(connector.calls)
     result, current = await service.transfer_owner("123", "newowner@example.com")
     assert result.ok
-    assert current.owner_email == "newowner@example.com"
+    assert current.owner_id == "id-newowner@example.com"
+    assert [
+        call
+        for call in connector.calls[before_transfer:]
+        if call[0] == "get_course"
+    ] == [
+        ("get_course", "123", False, False, False),
+        ("get_course", "123", False, False, False),
+    ]
 
+    transfer_calls = len(
+        [call for call in connector.calls if call[0] == "transfer_course_owner"]
+    )
     with pytest.raises(ClassroomValidationError, match="already owns"):
         await service.prepare_owner_transfer("123", "newowner@example.com")
+    assert len(
+        [call for call in connector.calls if call[0] == "transfer_course_owner"]
+    ) == transfer_calls
 
 
 async def test_owner_transfer_fails_closed_when_live_owner_is_missing(classroom):
@@ -110,6 +126,45 @@ async def test_owner_transfer_fails_closed_when_live_owner_is_missing(classroom)
     assert not result.ok
     assert current.owner_email == ""
     assert "did not show the new owner" in result.detail
+    assert connector.calls[-1] == ("get_course", "123", True, False, False)
+
+
+async def test_owner_transfer_repairs_orphaned_owner_without_owner_email_enrichment(
+    classroom,
+):
+    service, connector, _, _ = classroom
+    connector.courses["123"] = replace(
+        connector.courses["123"], owner_email="", owner_id="deleted-owner"
+    )
+    original = connector.get_course
+
+    async def reject_orphan_owner_enrichment(
+        course_id,
+        *,
+        include_owner_email=False,
+        include_aliases=False,
+        best_effort_enrichment=False,
+    ):
+        if include_owner_email:
+            raise RuntimeError("owner lookup not found")
+        return await original(
+            course_id,
+            include_owner_email=include_owner_email,
+            include_aliases=include_aliases,
+            best_effort_enrichment=best_effort_enrichment,
+        )
+
+    connector.get_course = reject_orphan_owner_enrichment
+
+    preview = await service.prepare_owner_transfer("123", "newowner@example.com")
+    result, current = await service.transfer_owner("123", "newowner@example.com")
+
+    assert preview.target_email == "newowner@example.com"
+    assert result.ok
+    assert current.owner_id == "id-newowner@example.com"
+    assert not any(
+        call[0] == "get_course" and call[2] for call in connector.calls
+    )
 
 
 async def test_owner_teacher_cannot_be_removed(classroom):

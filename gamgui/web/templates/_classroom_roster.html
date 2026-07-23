@@ -19,7 +19,9 @@
         <span class="block truncate font-medium text-brand-black">{{ member.label }}</span>
         {% if member.full_name and member.email %}<span class="block truncate text-xs text-brand-blueink">{{ member.email }}</span>{% endif %}
       </span>
-      {% set is_owner = role == "teachers" and course.owner_email and member.email == course.owner_email %}
+      {% set owner_id_match = course.owner_id and member.user_id and member.user_id == course.owner_id %}
+      {% set owner_email_match = course.owner_email and member.email and member.email == course.owner_email %}
+      {% set is_owner = role == "teachers" and (owner_id_match or owner_email_match) %}
       {% if is_owner %}
       <span class="shrink-0 rounded-full bg-brand-blue/10 px-2 py-0.5 text-xs font-medium text-brand-blueink">Owner</span>
       {% elif course.roster_editable and member.email %}

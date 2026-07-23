@@ -71,13 +71,32 @@ def test_course_detail_does_not_load_hidden_rosters(web_client):
     response = client.get("/classroom/course/123")
     assert response.status_code == 200
     assert "English 1" in response.text
+    assert "teacher@example.com" in response.text
+    assert "d:Section_123" in response.text
     assert "Teachers" in response.text and "Students" in response.text
+    assert (
+        "get_course",
+        "123",
+        True,
+        True,
+        True,
+    ) in connector.calls
     assert not any(call[0] == "list_course_participants" for call in connector.calls)
 
     roster = client.get("/classroom/course/123/roster", params={"role": "students"})
     assert roster.status_code == 200
     assert "student1@example.com" in roster.text
     assert any(call[0] == "list_course_participants" for call in connector.calls)
+
+
+def test_teacher_roster_marks_owner_by_stable_user_id(web_client):
+    client, _connector, _ = web_client
+
+    roster = client.get("/classroom/course/123/roster", params={"role": "teachers"})
+
+    assert roster.status_code == 200
+    assert roster.text.count(">Owner<") == 1
+    assert roster.text.count(">Remove<") == 1
 
 
 def test_create_course_is_always_provisioned(web_client):

@@ -205,12 +205,21 @@ class GAMCommands:
         return argv
 
     @staticmethod
-    def info_course(course_id: str, fields: Optional[Sequence[str]] = None) -> List[str]:
-        # owneremail + aliases are explicit expansion flags and are safe for a single selected course.
-        return [
-            "info", "course", course_id, "owneremail", "aliases",
-            "fields", ",".join(fields or COURSE_DETAIL_FIELDS), "formatjson",
-        ]
+    def info_course(
+        course_id: str,
+        fields: Optional[Sequence[str]] = None,
+        *,
+        include_owner_email: bool = False,
+        include_aliases: bool = False,
+    ) -> List[str]:
+        # Owner-email and alias enrichment can fail when a legacy course owner is unavailable.
+        # A selected course must remain manageable from its own Classroom resource fields.
+        argv = ["info", "course", course_id]
+        if include_owner_email:
+            argv.append("owneremail")
+        if include_aliases:
+            argv.append("aliases")
+        return argv + ["fields", ",".join(fields or COURSE_DETAIL_FIELDS), "formatjson"]
 
     @staticmethod
     def create_course(
