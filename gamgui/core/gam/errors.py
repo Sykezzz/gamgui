@@ -93,6 +93,11 @@ class GAMError(Exception):
         return _REMEDIATION[self.kind]
 
     @property
+    def error_code(self) -> str:
+        """Stable operator-facing category; never includes command or tenant data."""
+        return f"GAM-{self.kind.value.replace('_', '-').upper()}"
+
+    @property
     def message(self) -> str:
         tail = (self.stderr or "").strip().splitlines()
         detail = tail[-1] if tail else ""

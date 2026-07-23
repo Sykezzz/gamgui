@@ -18,7 +18,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ...core import guard
-from ...core.gam.errors import GAMError
+from ...core.gam.errors import GAMError, GAMErrorKind
 from ...core.signatures import smart_quote_warning
 from ..jobs import start_job
 from ..server import TEMPLATES
@@ -82,15 +82,40 @@ def _err(request: Request, message: str) -> HTMLResponse:
     return TEMPLATES.TemplateResponse(request, "_action_result.html", {"ok": False, "message": message})
 
 
-def _error_page(request: Request, message: str) -> HTMLResponse:
+def _error_page(
+    request: Request,
+    message: str,
+    error_code: str = "",
+) -> HTMLResponse:
     """A full-page friendly error (for full-page GET routes)."""
-    return TEMPLATES.TemplateResponse(request, "error.html", {"message": message})
+    return TEMPLATES.TemplateResponse(
+        request,
+        "error.html",
+        {"message": message, "error_code": error_code},
+    )
 
 
 def _friendly(exc: Exception) -> str:
     if isinstance(exc, GAMError):
         return exc.remediation
     return "Something went wrong talking to GAM. Please try again."
+
+
+def _user_detail_error_code(exc: Exception) -> str:
+    if isinstance(exc, GAMError):
+        return exc.error_code
+    return "USR-DETAIL-READ"
+
+
+def _user_detail_error_message(exc: Exception) -> str:
+    if isinstance(exc, GAMError):
+        if exc.kind is GAMErrorKind.UNKNOWN:
+            return (
+                "GAM reported an unclassified error. Retry, and report the "
+                "error code if it continues."
+            )
+        return exc.remediation
+    return "The user record could not be loaded. Please try again."
 
 
 @router.get("", response_class=HTMLResponse)
@@ -150,12 +175,22 @@ async def user_detail(request: Request, email: str) -> HTMLResponse:
     try:
         # A detail request is one bounded lookup. It must never populate the whole tenant first.
         user = await conn.get_user(email)
-        await st.patch_directory_user(user)
     except Exception as exc:
-        return _error_page(request, _friendly(exc))
+        return _error_page(
+            request,
+            _user_detail_error_message(exc),
+            _user_detail_error_code(exc),
+        )
+
+    # The directory index is refresh-owned derived data. A read-only detail page
+    # must not take SQLite's single writer or wait behind a tenant-wide refresh.
     return TEMPLATES.TemplateResponse(
         request, "user_detail.html",
-        {"user": user, "email": user.primary_email, "suspended": user.suspended},
+        {
+            "user": user,
+            "email": user.primary_email,
+            "suspended": user.suspended,
+        },
     )
 
 

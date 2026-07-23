@@ -131,6 +131,104 @@ def test_user_detail_uses_one_direct_lookup_and_zero_hidden_panel_calls(
     assert "/drive/user?email=" in response.text
 
 
+def test_user_detail_never_writes_the_directory_index(client, monkeypatch):
+    from gamgui.core.gam.models import GAMUser
+
+    state = client.app.state.gamgui
+
+    async def detail(email, fields=None):
+        return GAMUser.from_json(
+            {
+                "primaryEmail": email,
+                "name": {"givenName": "Live", "familyName": "Result"},
+            }
+        )
+
+    async def forbidden_index_patch(_user):
+        raise AssertionError("a read-only detail request must not write the index")
+
+    monkeypatch.setattr(state.connector, "get_user", detail)
+    monkeypatch.setattr(
+        state,
+        "patch_directory_user",
+        forbidden_index_patch,
+        raising=False,
+    )
+
+    response = client.get(
+        "/users/detail", params={"email": "live-result@example.com"}
+    )
+
+    assert response.status_code == 200
+    assert "Live Result" in response.text
+    assert "Something went wrong talking to GAM" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_code"),
+    (
+        ("auth_expired", "GAM-AUTH-EXPIRED"),
+        ("scope_missing", "GAM-SCOPE-MISSING"),
+        ("rate_limited", "GAM-RATE-LIMITED"),
+        ("not_found", "GAM-NOT-FOUND"),
+        ("permission_denied", "GAM-PERMISSION-DENIED"),
+        ("not_authenticated", "GAM-NOT-AUTHENTICATED"),
+        ("timeout", "GAM-TIMEOUT"),
+        ("unknown", "GAM-UNKNOWN"),
+    ),
+)
+def test_user_detail_gam_failure_has_stable_error_code(
+    client, monkeypatch, kind, expected_code
+):
+    from gamgui.core.gam.errors import GAMError, GAMErrorKind
+
+    expected_remediation = GAMError(
+        GAMErrorKind(kind),
+        exit_code=1,
+        stderr="invalid_grant",
+    ).remediation
+    if kind == "unknown":
+        expected_remediation = (
+            "GAM reported an unclassified error. Retry, and report the "
+            "error code if it continues."
+        )
+
+    async def expired(*_args, **_kwargs):
+        raise GAMError(
+            GAMErrorKind(kind),
+            exit_code=1,
+            stderr="invalid_grant",
+        )
+
+    monkeypatch.setattr(client.app.state.gamgui.connector, "get_user", expired)
+    response = client.get(
+        "/users/detail", params={"email": "expired@example.com"}
+    )
+
+    assert response.status_code == 200
+    assert expected_code in response.text
+    assert expected_remediation in response.text
+    assert "invalid_grant" not in response.text
+
+
+def test_user_detail_unexpected_read_failure_has_stable_error_code(
+    client, monkeypatch
+):
+    async def unexpected(*_args, **_kwargs):
+        raise RuntimeError("private internal detail")
+
+    monkeypatch.setattr(client.app.state.gamgui.connector, "get_user", unexpected)
+    response = client.get(
+        "/users/detail", params={"email": "private@example.com"}
+    )
+
+    assert response.status_code == 200
+    assert "The user record could not be loaded" in response.text
+    assert "Something went wrong talking to GAM" not in response.text
+    assert "USR-DETAIL-READ" in response.text
+    assert "private internal detail" not in response.text
+
+
 def test_warm_user_table_is_bounded_and_does_not_call_gam(client, monkeypatch):
     from gamgui.core.gam.models import GAMUser
     from gamgui.web.routes.users import PAGE_SIZE

@@ -1,9 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Problem — GamGUI Console{% endblock %}
 {% block content %}
-<div class="rounded-2xl border border-amber-300 bg-amber-50 p-6">
+<div class="rounded-2xl border border-amber-300 bg-amber-50 p-6" role="alert">
   <p class="eyebrow text-amber-700">Something went wrong</p>
   <p class="mt-2 text-sm text-amber-800">{{ message }}</p>
+  {% if error_code %}
+    <div class="mt-3 rounded-lg border border-amber-300/70 bg-amber-100/70 px-3 py-2 text-xs text-amber-900">
+      <p>
+        Error code
+        <code class="font-mono font-semibold tabular-nums">{{ error_code }}</code>
+      </p>
+      <p class="mt-1">Include this code when reporting the problem.</p>
+    </div>
+  {% endif %}
   <a href="/users" class="mt-4 inline-flex items-center rounded-lg border border-amber-400 px-3.5 py-2 text-sm font-medium text-amber-800 hover:bg-amber-100 transition-colors">← Back to users</a>
 </div>
 {% endblock %}

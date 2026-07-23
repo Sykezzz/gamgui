@@ -35,3 +35,8 @@ def test_navigation_uses_stable_main_shell_with_full_page_fallback():
     assert 'hx-target="#app-main"' in base
     assert 'hx-select="#app-main"' in base
     assert '<main id="app-main"' in base
+
+
+def test_base_declares_a_local_favicon_without_a_network_probe():
+    base = (ROOT / "gamgui" / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+    assert '<link rel="icon" href="data:," />' in base

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from gamgui.core.gam.errors import GAMErrorKind, classify_stderr
+from gamgui.core.gam.errors import GAMError, GAMErrorKind, classify_stderr
 
 
 @pytest.mark.parametrize(
@@ -20,6 +20,23 @@ from gamgui.core.gam.errors import GAMErrorKind, classify_stderr
 )
 def test_classify_stderr(stderr, expected):
     assert classify_stderr(stderr) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    (
+        (GAMErrorKind.AUTH_EXPIRED, "GAM-AUTH-EXPIRED"),
+        (GAMErrorKind.SCOPE_MISSING, "GAM-SCOPE-MISSING"),
+        (GAMErrorKind.RATE_LIMITED, "GAM-RATE-LIMITED"),
+        (GAMErrorKind.NOT_FOUND, "GAM-NOT-FOUND"),
+        (GAMErrorKind.PERMISSION_DENIED, "GAM-PERMISSION-DENIED"),
+        (GAMErrorKind.NOT_AUTHENTICATED, "GAM-NOT-AUTHENTICATED"),
+        (GAMErrorKind.TIMEOUT, "GAM-TIMEOUT"),
+        (GAMErrorKind.UNKNOWN, "GAM-UNKNOWN"),
+    ),
+)
+def test_gam_error_codes_are_stable(kind, expected):
+    assert GAMError(kind, exit_code=1).error_code == expected
 
 
 def test_own_acl_deletion_is_permission_denied():
