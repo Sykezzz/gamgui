@@ -90,8 +90,10 @@ def test_catalog_matches_grammar():
     from gamgui.core.catalog.parser import parse_grammar
 
     cat_json = ROOT / "gamgui" / "resources" / "gam7" / "command_catalog.json"
-    if not cat_json.exists():
-        pytest.skip("command_catalog.json not generated")
+    assert cat_json.is_file(), (
+        "command_catalog.json disappeared after vendoring GAM; "
+        "scripts/fetch_gam.sh must preserve the committed Builder catalog"
+    )
     data = json.loads(cat_json.read_text())
     fresh = parse_grammar(GAM_COMMANDS_REF.read_text(errors="replace"))
     assert data["version"] == EXPECTED_GAM_VERSION, "regenerate command_catalog.json (scripts/build_command_catalog.py)"

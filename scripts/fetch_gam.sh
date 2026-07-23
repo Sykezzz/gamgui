@@ -11,6 +11,7 @@ set -euo pipefail
 REPO="GAM-team/GAM"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/gamgui/resources/gam7"
+CATALOG="$DEST/command_catalog.json"
 # Pinned for reproducible builds. Override with `--tag latest` to grab the newest release.
 TAG="v7.46.11"
 
@@ -107,6 +108,13 @@ fi
 GAM_DIR="$(dirname "$GAM_BIN")"
 
 echo "==> Installing into $DEST"
+# ``command_catalog.json`` is an application resource committed alongside the
+# downloaded payload. Keep it while replacing the payload so a routine
+# ``make gam`` does not make the command browser unusable. GAM bumps regenerate
+# the catalog explicitly after this script completes.
+if [ -f "$CATALOG" ]; then
+  cp "$CATALOG" "$TMP/command_catalog.json"
+fi
 rm -rf "$DEST"
 mkdir -p "$DEST"
 cp -R "$GAM_DIR"/. "$DEST"/
@@ -114,6 +122,9 @@ chmod +x "$DEST/gam"
 
 printf '%s\n' "$VERSION" > "$DEST/VERSION"
 printf '%s  %s\n' "$SHA" "$ASSET_NAME" > "$DEST/SHA256"
+if [ -f "$TMP/command_catalog.json" ]; then
+  cp "$TMP/command_catalog.json" "$CATALOG"
+fi
 
 echo "==> Done. Vendored GAM $VERSION."
 "$DEST/gam" version 2>/dev/null | head -2 || echo "(could not run gam version yet — may need Gatekeeper approval)"
