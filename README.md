@@ -283,6 +283,8 @@ only quiets your own Keychain.)
 
 The app also caches the three secrets in-process for a sliding window (default 5 min) so a burst of
 actions doesn't re-prompt; tune with `GAMGUI_SECRET_CACHE_TTL` (seconds; `0` disables).
+On macOS, refreshed OAuth data updates the existing Keychain item in place so its per-item
+**Always Allow** authorization survives token refreshes.
 
 ### District branch topology
 

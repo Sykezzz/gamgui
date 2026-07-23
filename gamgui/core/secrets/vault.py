@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from typing import Dict, Optional, Protocol, Tuple
 
@@ -61,18 +62,100 @@ class InMemoryBackend:
         self._store.pop(self._k(service, username), None)
 
 
+class _DarwinSecurityAPI:
+    """Small, injectable Security.framework adapter for ACL-preserving password writes."""
+
+    def __init__(self) -> None:
+        from ctypes import c_void_p
+
+        from keyring.backends.macOS import api
+
+        self._api = api
+        self.item_not_found = api.error.item_not_found
+        self.duplicate_item = -25299  # errSecDuplicateItem
+        self._update = api._sec.SecItemUpdate
+        self._update.restype = api.OS_status
+        self._update.argtypes = (c_void_p, c_void_p)
+
+    def _identity(self, service: str, username: str) -> dict:
+        return {
+            "kSecClass": self._api.k_("kSecClassGenericPassword"),
+            "kSecAttrService": service,
+            "kSecAttrAccount": username or "",
+        }
+
+    def update_generic_password(self, service: str, username: str, password: str) -> int:
+        query = self._api.create_query(**self._identity(service, username))
+        attributes = self._api.create_query(kSecValueData=password)
+        return int(self._update(query, attributes))
+
+    def add_generic_password(self, service: str, username: str, password: str) -> int:
+        query = self._api.create_query(
+            **self._identity(service, username),
+            kSecValueData=password,
+        )
+        return int(self._api.SecItemAdd(query, None))
+
+    def raise_for_status(self, status: int) -> None:
+        try:
+            self._api.Error.raise_for_status(status)
+        except self._api.KeychainDenied as exc:
+            from keyring.errors import KeyringLocked
+
+            raise KeyringLocked(f"Can't store password on keychain: {exc}") from exc
+        except self._api.Error as exc:
+            from keyring.errors import PasswordSetError
+
+            raise PasswordSetError(f"Can't store password on keychain: {exc}") from exc
+
+
+def _set_darwin_password(api, service: str, username: str, password: str) -> None:
+    """Update an existing item in place so its macOS Keychain ACL remains attached."""
+
+    status = api.update_generic_password(service, username, password)
+    if status == api.item_not_found:
+        status = api.add_generic_password(service, username, password)
+        if status == api.duplicate_item:
+            # Another app instance created the item between our update and add.
+            status = api.update_generic_password(service, username, password)
+    api.raise_for_status(status)
+
+
+def _uses_native_macos_keyring(keyring_module) -> bool:
+    """Return whether keyring selected its built-in macOS Keychain backend."""
+
+    if sys.platform != "darwin":
+        return False
+    try:
+        backend_type = type(keyring_module.get_keyring())
+    except Exception:
+        return False
+    return (
+        backend_type.__module__ == "keyring.backends.macOS"
+        and backend_type.__name__ == "Keyring"
+    )
+
+
 class _KeyringBackend:
     """Default backend — lazily imports ``keyring`` so core tests don't require it installed."""
 
-    def __init__(self) -> None:
-        import keyring  # noqa: F401  (import-time check that it's available)
+    def __init__(self, keyring_module=None, darwin_api=None) -> None:
+        if keyring_module is None:
+            import keyring as keyring_module
 
-        self._keyring = keyring
+        self._keyring = keyring_module
+        self._uses_darwin_api = _uses_native_macos_keyring(keyring_module)
+        self._darwin_api = darwin_api if self._uses_darwin_api else None
+        if self._uses_darwin_api and self._darwin_api is None:
+            self._darwin_api = _DarwinSecurityAPI()
 
     def get_password(self, service: str, username: str) -> Optional[str]:
         return self._keyring.get_password(service, username)
 
     def set_password(self, service: str, username: str, password: str) -> None:
+        if self._uses_darwin_api:
+            _set_darwin_password(self._darwin_api, service, username, password)
+            return
         self._keyring.set_password(service, username, password)
 
     def delete_password(self, service: str, username: str) -> None:
