@@ -95,18 +95,24 @@ def test_export_offered_exactly_for_todrive_reads(client):
 
 
 def test_hardening_csp_and_local_assets(client):
-    # The UI loads no remote executable scripts (vendored locally) and ships security headers.
+    # The UI loads no remote scripts, stylesheets, or fonts and ships security headers.
     page = client.get("/builder")
-    assert "/static/vendor/tailwind-play.js" in page.text
+    assert "/static/app.css" in page.text
     assert "/static/vendor/htmx-1.9.12.min.js" in page.text
+    assert "tailwind-play.js" not in page.text
+    assert "fonts.googleapis.com" not in page.text
     assert "cdn.tailwindcss.com" not in page.text and "unpkg.com" not in page.text
     h = page.headers
+    assert "default-src 'self'" in h.get("content-security-policy", "")
+    assert "font-src 'self'" in h.get("content-security-policy", "")
     assert "frame-ancestors 'none'" in h.get("content-security-policy", "")
     assert "object-src 'none'" in h.get("content-security-policy", "")
     assert h.get("x-content-type-options") == "nosniff"
     assert h.get("referrer-policy") == "no-referrer"
     # the vendored assets are actually served
     assert client.get("/static/vendor/htmx-1.9.12.min.js").status_code == 200
+    assert client.get("/static/app.css").status_code == 200
+    assert client.get("/static/fonts/source-sans-3-latin-400-normal.woff2").status_code == 200
 
 
 def test_dense_pages_use_full_window_width(client):

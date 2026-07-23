@@ -8,6 +8,7 @@ venv/
 .pytest_cache/
 build/
 dist/
+node_modules/
 
 # Vendored GAM7 binary — fetched via scripts/fetch_gam.sh, never committed
 gamgui/resources/gam7/*

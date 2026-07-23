@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Vendor the front-end assets into gamgui/web/static/vendor/ so the UI loads NO remote scripts:
-# it works offline and a CDN compromise can't inject JS that could read the launch token.
-# Re-run when bumping htmx/Tailwind. htmx is verified against its published SRI; the Tailwind Play
-# CDN is versionless, so we snapshot it and record its sha256 for auditability.
+# Vendor the executable browser dependency and rebuild static CSS/fonts.
+# The UI loads no remote scripts, stylesheets, or fonts at runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,8 +20,10 @@ if [ "$GOT" != "$HTMX_SRI" ]; then
 fi
 echo "    verified SRI $GOT"
 
-echo "==> Tailwind Play (versionless JIT compiler — snapshot)"
-curl -fsSL "https://cdn.tailwindcss.com" -o "$DEST/tailwind-play.js"
-echo "    sha256 $(shasum -a 256 "$DEST/tailwind-play.js" | awk '{print $1}')"
+echo "==> Static Tailwind CSS + fonts"
+if [ ! -d "$ROOT/node_modules" ]; then
+  (cd "$ROOT" && npm ci)
+fi
+(cd "$ROOT" && npm run build:css)
 
-echo "==> Done. If filenames changed, update the <script> tags in gamgui/web/templates/base.html."
+echo "==> Done. If the htmx filename changed, update gamgui/web/templates/base.html."

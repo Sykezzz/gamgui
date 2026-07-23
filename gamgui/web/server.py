@@ -83,13 +83,17 @@ class AppState:
 class TokenGateMiddleware(BaseHTTPMiddleware):
     """Allow static assets; otherwise require the launch token (cookie, else ?token= which sets it).
 
-    Also stamps security headers on every response: a CSP locking down object/base/frame/form
-    vectors (no script-src directive — the app uses inline handlers and all scripts are now same-origin
-    vendored, so there is no remote script to constrain), nosniff, and no-referrer (so the ?token= in
-    the first URL can't leak to fonts.googleapis via the Referer header)."""
+    Also stamps security headers on every response: a same-origin CSP, nosniff, and no-referrer.
+    Inline script/style remains temporarily allowed for existing server-rendered handlers; remote
+    code, fonts, frames, connections, and form targets remain denied."""
 
     SECURITY_HEADERS = {
-        "Content-Security-Policy": "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        "Content-Security-Policy": (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; font-src 'self'; "
+            "img-src 'self' data: blob:; connect-src 'self'; frame-src 'self' blob:; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        ),
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
     }

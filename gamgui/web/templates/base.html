@@ -5,59 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}GamGUI — Console{% endblock %}</title>
 
-  <!-- Type: Source Serif 4 / Source Sans 3 are the open-source twins of
-       Minion Pro / Myriad Pro (same foundry lineage). System serif/sans fall back if offline. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet" />
-
-  <!-- Vendored locally (no runtime CDN): the UI loads no remote executable scripts, works offline,
-       and a CDN compromise can't inject JS that could read the launch token. See scripts/vendor_assets.sh. -->
-  <script src="/static/vendor/tailwind-play.js"></script>
+  <!-- Generated and vendored locally: no runtime CSS compilation or remote font request. -->
+  <link rel="stylesheet" href="/static/app.css" />
   <script src="/static/vendor/htmx-1.9.12.min.js" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            ink: "#141414",        // near-black body text (brand black is #000000)
-            paper: "#FAF9F6",      // warm off-white page
-            brand: {
-              black: "#000000",
-              white: "#FFFFFF",
-              gray: "#B2B4BB",     // warm gray
-              blue: "#69829E",     // slate blue
-              blueink: "#52647B",  // darker slate for text/hover contrast on white
-            },
-          },
-          fontFamily: {
-            serif: ['"Source Serif 4"', "Minion Pro", "Georgia", "serif"],
-            sans: ['"Source Sans 3"', "Myriad Pro", "-apple-system", "BlinkMacSystemFont", "system-ui", "sans-serif"],
-          },
-        },
-      },
-    };
-  </script>
-  <style>
-    :root { color-scheme: light; }
-    body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
-    /* Tracked caps label. */
-    .eyebrow { text-transform: uppercase; letter-spacing: 0.18em; font-size: 0.68rem; font-weight: 600; }
-    .wordmark { text-transform: uppercase; letter-spacing: 0.22em; }
-    /* Global indeterminate loading bar (shown during HTMX requests + page navigations). */
-    #loadbar { position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 60; overflow: hidden; opacity: 0; transition: opacity .15s; pointer-events: none; }
-    #loadbar.on { opacity: 1; }
-    #loadbar::before { content: ""; position: absolute; height: 100%; width: 35%; background: #69829E; animation: lbslide 1s ease-in-out infinite; }
-    @keyframes lbslide { 0% { left: -35%; } 50% { left: 50%; } 100% { left: 100%; } }
-    .spinner { display: inline-block; width: 0.9rem; height: 0.9rem; border: 2px solid rgba(105,130,158,.3); border-top-color: #69829E; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: -2px; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    /* Unmissable "working" pill (bottom-right) — shown whenever a request is in flight. */
-    #busy { position: fixed; bottom: 1rem; right: 1rem; z-index: 70; display: none; align-items: center; gap: .5rem;
-            padding: .5rem .85rem; border-radius: 9999px; background: #141414; color: #fff; font-size: .8rem;
-            box-shadow: 0 6px 20px rgba(0,0,0,.18); pointer-events: none; }
-    #busy.on { display: inline-flex; }
-    #busy .spinner { border-color: rgba(255,255,255,.35); border-top-color: #fff; }
-  </style>
 </head>
 <body class="h-full bg-paper text-ink font-sans">
   <div id="loadbar"></div>
@@ -68,7 +18,9 @@
         <a href="/" class="wordmark font-serif text-lg text-brand-black">GamGUI</a>
         <span class="h-4 w-px bg-brand-gray/60"></span>
         <span class="eyebrow text-brand-blueink">Console</span>
-        <nav class="ml-auto text-sm flex items-center gap-5 text-brand-blueink/80">
+        <nav class="ml-auto text-sm flex items-center gap-5 text-brand-blueink/80"
+             hx-boost="true" hx-target="#app-main" hx-select="#app-main"
+             hx-swap="outerHTML show:top" hx-push-url="true">
           <a class="hover:text-brand-black transition-colors" href="/">Home</a>
           <a class="hover:text-brand-black transition-colors" href="/users">Users</a>
           <a class="hover:text-brand-black transition-colors" href="/groups">Groups</a>
@@ -82,7 +34,7 @@
         </nav>
       </div>
     </header>
-    <main class="mx-auto {% block container_class %}max-w-5xl{% endblock %} px-6 py-10">
+    <main id="app-main" tabindex="-1" class="mx-auto {% block container_class %}max-w-5xl{% endblock %} px-6 py-10">
       {% block content %}{% endblock %}
     </main>
     <footer class="mx-auto {{ self.container_class() }} px-6 py-8 text-xs text-brand-gray">
