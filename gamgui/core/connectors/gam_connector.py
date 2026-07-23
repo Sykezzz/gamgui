@@ -7,10 +7,12 @@ The rest of the app talks to this object and never sees GAM syntax.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Sequence
 
 from ..audit import AuditLog
+from ..directory_index import DirectoryIndex
 from ..gam.commands import GAMCommands, build_user_query
 from ..gam.errors import GAMErrorKind
 from ..gam.models import (
@@ -24,7 +26,7 @@ from ..gam.models import (
     Vacation,
 )
 from ..calendar_index import IndexedCalendar
-from ..gam.parser import parse_one, parse_records
+from ..gam.parser import iter_records_file, parse_one, parse_records
 from ..gam.runner import GAMRunner
 from .base import (
     Capability,
@@ -105,10 +107,32 @@ class GAMConnector(Connector):
         stdout = await self.runner.run_authenticated(self.domain, argv)
         return GAMUser.from_json(parse_one(stdout))
 
+    async def refresh_directory_users(self, index: DirectoryIndex) -> int:
+        """Spool a full user export and atomically replace the local summary index."""
+        if index.domain != self.domain.strip().lower():
+            raise ValueError("directory index domain does not match connector domain")
+        argv = GAMCommands.print_users()
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            return await asyncio.to_thread(
+                index.replace_users,
+                (GAMUser.from_json(record) for record in iter_records_file(result.path)),
+            )
+
     async def list_groups(self) -> List[GAMGroup]:
         argv = GAMCommands.print_groups()
         stdout = await self.runner.run_authenticated(self.domain, argv)
         return [GAMGroup.from_json(r) for r in parse_records(stdout)]
+
+    async def refresh_directory_groups(self, index: DirectoryIndex) -> int:
+        """Spool a full group export and atomically replace the local summary index."""
+        if index.domain != self.domain.strip().lower():
+            raise ValueError("directory index domain does not match connector domain")
+        argv = GAMCommands.print_groups()
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            return await asyncio.to_thread(
+                index.replace_groups,
+                (GAMGroup.from_json(record) for record in iter_records_file(result.path)),
+            )
 
     async def list_group_members(self, group: str) -> List[GroupMember]:
         argv = GAMCommands.print_group_members(group)

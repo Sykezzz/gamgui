@@ -10,10 +10,11 @@ HTTP layer offline.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -23,6 +24,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.calendar_index import CalendarIndex, default_index_path
 from ..core.connectors.gam_connector import GAMConnector
+from ..core.directory_index import (
+    DEFAULT_STALE_SECONDS,
+    DirectoryIndex,
+    Page,
+    default_index_path as default_directory_index_path,
+)
+from ..core.gam.models import GAMGroup, GAMUser
 from ..core.gam.runner import GAMRunner
 from ..core.secrets.ephemeral import sweep_stale_configs
 from ..core.secrets.vault import SecretsVault
@@ -43,11 +51,39 @@ class AppState:
     user_cache: UserCache = field(default_factory=UserCache)
     jobs: dict = field(default_factory=dict)  # id -> ApplyJob, for polled progress on long batch ops
     calendar_index: Optional[CalendarIndex] = None  # persistent calendar name-search index (derived data)
+    directory_index: Optional[DirectoryIndex] = None  # bounded user/group summary search
     cal_index_job_id: str = ""  # the in-flight index-rebuild job, if any (guards double-rebuilds)
     catalog: object = None  # the GAM command catalog (lazy-loaded by the Builder route)
     builder_sequence: list = field(default_factory=list)  # the working drag-built command sequence
     runbooks: object = None  # onboarding role templates + welcome email (lazy-loaded by the route)
     sig_templates: object = None  # saved HTML signature templates (lazy-loaded by the signatures route)
+    _directory_refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _directory_refresh_tasks: Dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.connector is not None:
+            self.ensure_directory_index()
+
+    def ensure_directory_index(self) -> Optional[DirectoryIndex]:
+        if self.connector is None:
+            return None
+        domain = self.connector.domain.strip().lower()
+        if self.directory_index is not None and self.directory_index.domain == domain:
+            return self.directory_index
+        if self.directory_index is not None:
+            path = self.directory_index.path
+        elif self.runner.base_dir is not None:
+            path = Path(self.runner.base_dir) / "directory_index.db"
+        else:
+            path = default_directory_index_path()
+        self.directory_index = DirectoryIndex(path, domain)
+        return self.directory_index
+
+    def activate_connector(self, connector: GAMConnector) -> None:
+        """Activate a verified domain and bind its isolated directory snapshot."""
+        self.connector = connector
+        self.audit_domain = connector.domain
+        self.ensure_directory_index()
 
     async def users(self, force: bool = False) -> list:
         """The cached user list (one ``gam print users`` shared by the list + reports)."""
@@ -61,6 +97,121 @@ class AppState:
 
     def invalidate_users(self) -> None:
         self.user_cache.invalidate()
+        index = self.ensure_directory_index()
+        if index is not None:
+            index.mark_stale("users")
+
+    async def directory_users(
+        self,
+        query: str = "",
+        scope: str = "all",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Page[GAMUser]:
+        index = self.ensure_directory_index()
+        if index is None:
+            return Page([], None, 0, None, False)
+        await self._ensure_directory_snapshot("users", refresh)
+        return await asyncio.to_thread(
+            index.search_users,
+            query,
+            scope,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+
+    async def directory_groups(
+        self,
+        query: str = "",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Page[GAMGroup]:
+        index = self.ensure_directory_index()
+        if index is None:
+            return Page([], None, 0, None, False)
+        await self._ensure_directory_snapshot("groups", refresh)
+        return await asyncio.to_thread(
+            index.search_groups,
+            query,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+
+    async def patch_directory_user(self, user: GAMUser) -> None:
+        index = self.ensure_directory_index()
+        if index is not None:
+            await asyncio.to_thread(index.upsert_user, user)
+
+    async def _ensure_directory_snapshot(self, kind: str, force: bool) -> None:
+        index = self.ensure_directory_index()
+        if index is None:
+            return
+        current = self._directory_refresh_tasks.get(kind)
+        if force:
+            if current is not None and not current.done():
+                await current
+            else:
+                await self._refresh_directory(kind, force=True)
+            return
+        if not await asyncio.to_thread(index.has_snapshot, kind):
+            await self._refresh_directory(kind, force=False)
+            return
+        if await asyncio.to_thread(index.is_stale, kind, DEFAULT_STALE_SECONDS):
+            self._schedule_directory_refresh(kind)
+
+    def _schedule_directory_refresh(self, kind: str) -> None:
+        current = self._directory_refresh_tasks.get(kind)
+        if current is not None and not current.done():
+            return
+        index = self.ensure_directory_index()
+        if index is None:
+            return
+        index.set_refreshing(kind, True)
+        task = asyncio.create_task(self._refresh_directory(kind, force=False))
+        self._directory_refresh_tasks[kind] = task
+
+        def _finish(done: asyncio.Task) -> None:
+            if self._directory_refresh_tasks.get(kind) is done:
+                self._directory_refresh_tasks.pop(kind, None)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # Keep serving the previous snapshot. A manual refresh surfaces the live error.
+                pass
+
+        task.add_done_callback(_finish)
+
+    async def _refresh_directory(self, kind: str, force: bool) -> None:
+        index = self.ensure_directory_index()
+        connector = self.connector
+        if index is None or connector is None:
+            return
+        async with self._directory_refresh_lock:
+            if not force and not await asyncio.to_thread(
+                index.is_stale, kind, DEFAULT_STALE_SECONDS
+            ):
+                index.set_refreshing(kind, False)
+                return
+            index.set_refreshing(kind, True)
+            try:
+                if kind == "users":
+                    await connector.refresh_directory_users(index)
+                elif kind == "groups":
+                    await connector.refresh_directory_groups(index)
+                else:
+                    raise ValueError(f"unknown directory snapshot kind: {kind}")
+            finally:
+                index.set_refreshing(kind, False)
 
     @classmethod
     def create(cls, vault: Optional[SecretsVault] = None, token: Optional[str] = None) -> "AppState":
@@ -77,6 +228,7 @@ class AppState:
             connector=connector,
             token=token or secrets.token_urlsafe(24),
             calendar_index=CalendarIndex(default_index_path()),
+            directory_index=DirectoryIndex(default_directory_index_path(), domain) if domain else None,
         )
 
 

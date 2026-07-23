@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gamgui.core.gam.parser import parse_one, parse_records
+from gamgui.core.gam.parser import iter_records_file, parse_one, parse_records, parse_records_file
 
 
 def test_empty_returns_empty():
@@ -68,3 +68,19 @@ def test_plain_csv():
     recs = parse_records(text)
     assert recs[0]["primaryEmail"] == "x@e.com"
     assert recs[1]["suspended"] == "True"  # plain CSV values stay strings
+
+
+def test_spooled_ndjson_is_iterated(fixtures_dir):
+    records = list(iter_records_file(fixtures_dir / "print_users.json"))
+    assert len(records) == 3
+    assert records[-1]["primaryEmail"] == "carol@example.com"
+
+
+def test_spooled_json_array_and_csv(tmp_path, fixtures_dir):
+    assert len(parse_records_file(fixtures_dir / "group_members.json")) == 2
+    path = tmp_path / "records.csv"
+    path.write_text(
+        'primaryEmail,JSON\n"x@e.com","{""primaryEmail"":""x@e.com"",""suspended"":true}"\n',
+        encoding="utf-8",
+    )
+    assert parse_records_file(path) == [{"primaryEmail": "x@e.com", "suspended": True}]

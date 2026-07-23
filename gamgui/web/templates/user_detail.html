@@ -29,15 +29,15 @@
   </div>
 
   <!-- Tabs keep this content-heavy page within the window — one section group at a time. -->
-  <nav class="flex gap-1 border-b border-brand-gray/30 text-sm">
-    <button type="button" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="overview">Overview</button>
-    <button type="button" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="mail">Mail</button>
-    <button type="button" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="sharing">Sharing</button>
-    <button type="button" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="danger">Account</button>
+  <nav class="flex gap-1 border-b border-brand-gray/30 text-sm" role="tablist" aria-label="User administration sections">
+    <button id="ud-tab-overview" type="button" role="tab" aria-controls="ud-panel-overview" aria-selected="false" tabindex="-1" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="overview">Overview</button>
+    <button id="ud-tab-mail" type="button" role="tab" aria-controls="ud-panel-mail" aria-selected="false" tabindex="-1" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="mail">Mail</button>
+    <button id="ud-tab-sharing" type="button" role="tab" aria-controls="ud-panel-sharing" aria-selected="false" tabindex="-1" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="sharing">Sharing</button>
+    <button id="ud-tab-danger" type="button" role="tab" aria-controls="ud-panel-danger" aria-selected="false" tabindex="-1" class="ud-tab border-b-2 border-transparent px-3 py-2 text-brand-gray hover:text-brand-black" data-tab="danger">Account</button>
   </nav>
 
   <!-- OVERVIEW: identity + role/store -->
-  <div class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 space-y-4" data-tab="overview">
+  <div id="ud-panel-overview" class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 space-y-4" data-tab="overview" role="tabpanel" aria-labelledby="ud-tab-overview" tabindex="0">
     <div class="grid gap-4 sm:grid-cols-2">
       <div class="{{ card }}">
         <h2 class="eyebrow text-brand-gray">Account</h2>
@@ -66,10 +66,10 @@
   </div>
 
   <!-- MAIL: signature | delegates + vacation -->
-  <div class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden grid gap-4 sm:grid-cols-2 items-start" data-tab="mail">
+  <div id="ud-panel-mail" class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden grid gap-4 sm:grid-cols-2 items-start" data-tab="mail" role="tabpanel" aria-labelledby="ud-tab-mail" tabindex="0">
     <div class="{{ card }}">
       <h2 class="eyebrow text-brand-gray">Gmail signature</h2>
-      <div id="sig-current" class="mt-3 max-h-40 overflow-y-auto" hx-get="/users/signature/current?email={{ email | urlencode }}" hx-trigger="load"><p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p></div>
+      <div id="sig-current" class="mt-3 max-h-40 overflow-y-auto" data-user-detail-lazy hx-get="/users/signature/current?email={{ email | urlencode }}" hx-trigger="ud-load once"><p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p></div>
       <form class="mt-1 space-y-3" hx-post="/users/signature" hx-target="#sig-result" hx-swap="innerHTML">
         <input type="hidden" name="email" value="{{ email }}" />
         <textarea name="signature" rows="3" class="{{ input_cls }}" placeholder="Best,&#10;{{ user.full_name }}"></textarea>
@@ -83,13 +83,13 @@
     <div class="space-y-4">
       <div class="{{ card }}">
         <h2 class="eyebrow text-brand-gray">Mailbox delegates</h2>
-        <div id="delegates" class="mt-3" hx-get="/users/delegates?email={{ email | urlencode }}" hx-trigger="load">
+        <div id="delegates" class="mt-3" data-user-detail-lazy hx-get="/users/delegates?email={{ email | urlencode }}" hx-trigger="ud-load once">
           <p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p>
         </div>
       </div>
       <div class="{{ card }}">
         <h2 class="eyebrow text-brand-gray">Vacation responder</h2>
-        <div id="vacation" class="mt-3" hx-get="/users/vacation?email={{ email | urlencode }}" hx-trigger="load">
+        <div id="vacation" class="mt-3" data-user-detail-lazy hx-get="/users/vacation?email={{ email | urlencode }}" hx-trigger="ud-load once">
           <p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p>
         </div>
       </div>
@@ -97,24 +97,24 @@
   </div>
 
   <!-- SHARING: groups | calendar access -->
-  <div class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden grid gap-4 sm:grid-cols-2 items-start" data-tab="sharing">
+  <div id="ud-panel-sharing" class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden grid gap-4 sm:grid-cols-2 items-start" data-tab="sharing" role="tabpanel" aria-labelledby="ud-tab-sharing" tabindex="0">
     <div class="{{ card }}">
       <h2 class="eyebrow text-brand-gray">Groups</h2>
-      <div id="user-groups" class="mt-3" hx-get="/users/groups?email={{ email | urlencode }}" hx-trigger="load">
+      <div id="user-groups" class="mt-3" data-user-detail-lazy hx-get="/users/groups?email={{ email | urlencode }}" hx-trigger="ud-load once">
         <p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p>
       </div>
     </div>
     <div class="{{ card }}">
       <h2 class="eyebrow text-brand-gray">Calendar access</h2>
       <p class="text-xs text-brand-blueink/70 mt-1">Who can see or edit this person's primary calendar.</p>
-      <div id="calendar" class="mt-3" hx-get="/users/calendar?email={{ email | urlencode }}" hx-trigger="load">
+      <div id="calendar" class="mt-3" data-user-detail-lazy hx-get="/users/calendar?email={{ email | urlencode }}" hx-trigger="ud-load once">
         <p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading…</p>
       </div>
     </div>
   </div>
 
   <!-- ACCOUNT / DANGER: suspend + delete -->
-  <div class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden space-y-4" data-tab="danger">
+  <div id="ud-panel-danger" class="ud-panel max-h-[calc(100vh-19rem)] overflow-y-auto pr-1 hidden space-y-4" data-tab="danger" role="tabpanel" aria-labelledby="ud-tab-danger" tabindex="0">
     <div class="{{ card }}">
       <h2 class="eyebrow text-brand-gray">Suspend &amp; delete</h2>
       <div id="suspend-zone" class="mt-3">
@@ -136,22 +136,53 @@
 </div>
 
 <script>
-  // Simple tabs: show one section group at a time so this content-heavy page fits the window.
   (function () {
-    var tabs = document.querySelectorAll(".ud-tab");
-    var panels = document.querySelectorAll(".ud-panel");
-    function show(name) {
-      panels.forEach(function (p) { p.classList.toggle("hidden", p.dataset.tab !== name); });
+    var tabs = Array.prototype.slice.call(document.querySelectorAll(".ud-tab"));
+    var panels = Array.prototype.slice.call(document.querySelectorAll(".ud-panel"));
+
+    function loadOnce(panel) {
+      if (!panel || panel.dataset.loaded === "true") return;
+      panel.dataset.loaded = "true";
+      panel.querySelectorAll("[data-user-detail-lazy]").forEach(function (target) {
+        htmx.trigger(target, "ud-load");
+      });
+    }
+
+    function show(name, focusTab) {
+      var activePanel = null;
+      panels.forEach(function (p) {
+        var on = p.dataset.tab === name;
+        p.classList.toggle("hidden", !on);
+        p.setAttribute("aria-hidden", on ? "false" : "true");
+        if (on) activePanel = p;
+      });
       tabs.forEach(function (t) {
         var on = t.dataset.tab === name;
+        t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
         t.classList.toggle("text-brand-black", on);
         t.classList.toggle("border-brand-blue", on);
         t.classList.toggle("text-brand-gray", !on);
         t.classList.toggle("border-transparent", !on);
+        if (on && focusTab) t.focus();
       });
+      loadOnce(activePanel);
     }
-    tabs.forEach(function (t) { t.addEventListener("click", function () { show(t.dataset.tab); }); });
-    show("overview");
+
+    tabs.forEach(function (tab, index) {
+      tab.addEventListener("click", function () { show(tab.dataset.tab, false); });
+      tab.addEventListener("keydown", function (event) {
+        var next = index;
+        if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+        else if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+        else if (event.key === "Home") next = 0;
+        else if (event.key === "End") next = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        show(tabs[next].dataset.tab, true);
+      });
+    });
+    show("overview", false);
   })();
 </script>
 {% endblock %}

@@ -16,7 +16,8 @@ from __future__ import annotations
 import csv
 import io
 import json
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, Iterator, List
 
 _JSON_COLUMN = "JSON"
 
@@ -55,6 +56,73 @@ def parse_one(stdout: str) -> Dict[str, Any]:
     """Parse output expected to describe a single record; returns ``{}`` if none."""
     records = parse_records(stdout)
     return records[0] if records else {}
+
+
+def iter_records_file(path: Path) -> Iterator[Dict[str, Any]]:
+    """Yield records from a spooled GAM output file without loading NDJSON/CSV into one string.
+
+    JSON arrays still require ``json.load`` because the standard library has no incremental array
+    parser. GAM's large ``formatjson`` exports are normally newline-delimited JSON or CSV, both of
+    which stay streaming here.
+    """
+    source = Path(path)
+    with source.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        first = ""
+        while True:
+            line = fh.readline()
+            if not line:
+                return
+            if line.strip():
+                first = line
+                break
+
+        stripped = first.lstrip()
+        if stripped.startswith("["):
+            fh.seek(0)
+            yield from _coerce_to_records(json.load(fh))
+            return
+
+        if stripped.startswith("{"):
+            first_value = _try_json(first.strip())
+            if first_value is not None:
+                yield from _coerce_to_records(first_value)
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    value = _try_json(line.strip())
+                    if value is None:
+                        raise ValueError("invalid newline-delimited JSON in GAM output")
+                    yield from _coerce_to_records(value)
+                return
+            # Pretty-printed single-object JSON is uncommon but valid.
+            fh.seek(0)
+            yield from _coerce_to_records(json.load(fh))
+            return
+
+        fh.seek(0)
+        reader = csv.DictReader(fh)
+        fieldnames = [field for field in (reader.fieldnames or []) if field is not None]
+        if _JSON_COLUMN in fieldnames:
+            for row in reader:
+                parsed = _try_json(row.get(_JSON_COLUMN) or "")
+                if parsed is None:
+                    continue
+                siblings = {
+                    key: value
+                    for key, value in row.items()
+                    if key is not None and key != _JSON_COLUMN and value not in (None, "")
+                }
+                for record in _coerce_to_records(parsed):
+                    yield {**siblings, **record}
+            return
+
+        for row in reader:
+            yield {key: value for key, value in row.items() if key is not None}
+
+
+def parse_records_file(path: Path) -> List[Dict[str, Any]]:
+    """List-returning companion to :func:`iter_records_file` for small file consumers."""
+    return list(iter_records_file(path))
 
 
 # --- internals -------------------------------------------------------------------------

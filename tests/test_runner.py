@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import stat
+import sys
+from pathlib import Path
+
 import pytest
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
@@ -71,3 +77,74 @@ def test_strip_cfgdir_noise_keeps_unrelated_output():
 
     out = "primaryEmail\na@e.com\nb@e.com"
     assert strip_cfgdir_noise(out, Path("/var/run/gamcfg-xyz")) == out  # untouched when dir not present
+
+
+async def test_authenticated_output_can_be_securely_spooled(vault, tmp_path, domain):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = (
+        "import os,sys;"
+        "print('Created: '+os.environ['GAMCFGDIR']+'/gamcache');"
+        "sys.stdout.write('x'*2000000)"
+    )
+    async with runner.run_authenticated_to_file(domain, ["-c", script]) as result:
+        spool_path = result.path
+        assert spool_path.exists()
+        assert result.stdout_bytes == 2_000_000
+        assert spool_path.stat().st_size == 2_000_000
+        if os.name == "posix":
+            assert stat.S_IMODE(spool_path.stat().st_mode) & 0o077 == 0
+    assert not spool_path.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+async def test_spool_is_removed_when_consumer_fails(vault, tmp_path, domain):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        async with runner.run_authenticated_to_file(
+            domain, ["-c", "print('private output')"]
+        ) as result:
+            spool_path = result.path
+            raise RuntimeError("consumer failed")
+    assert not spool_path.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+async def test_cancelling_spooled_command_stops_process_and_removes_files(
+    vault, tmp_path, domain
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=30,
+    )
+
+    async def run_slow_export():
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "import sys,time; print('private', flush=True); time.sleep(30)"],
+        ):
+            raise AssertionError("cancelled export must not reach its consumer")
+
+    task = asyncio.create_task(run_slow_export())
+    for _ in range(100):
+        if list(tmp_path.glob("gamcfg-*/gam-output-*.tmp")):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("spool file was not created")
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert list(tmp_path.glob("gamcfg-*")) == []

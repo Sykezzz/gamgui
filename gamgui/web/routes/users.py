@@ -62,6 +62,21 @@ def _table_context(users, q: str = "", scope: str = "all", page: int = 1) -> dic
     }
 
 
+def _indexed_table_context(result, q: str = "", scope: str = "all", page: int = 1) -> dict:
+    pages = max(1, math.ceil(result.total / PAGE_SIZE))
+    page = max(1, min(page, pages))
+    return {
+        "users": result.items,
+        "q": q,
+        "scope": scope,
+        "page": page,
+        "pages": pages,
+        "total": result.total,
+        "snapshot_age_seconds": result.snapshot_age_seconds,
+        "refreshing": result.refreshing,
+    }
+
+
 def _err(request: Request, message: str) -> HTMLResponse:
     """A small inline error fragment (for HTMX swap targets)."""
     return TEMPLATES.TemplateResponse(request, "_action_result.html", {"ok": False, "message": message})
@@ -84,14 +99,20 @@ async def users_page(request: Request) -> HTMLResponse:
     if st.connector is None:
         return TEMPLATES.TemplateResponse(request, _USERS_PAGE, {"connected": False})
     try:
-        users = await st.users()
+        result = await st.directory_users(limit=PAGE_SIZE)
     except Exception as exc:
         return TEMPLATES.TemplateResponse(
             request, _USERS_PAGE,
             {"connected": True, "domain": st.connector.domain, "error": _friendly(exc), **_table_context([])},
         )
     return TEMPLATES.TemplateResponse(
-        request, _USERS_PAGE, {"connected": True, "domain": st.connector.domain, **_table_context(users)}
+        request,
+        _USERS_PAGE,
+        {
+            "connected": True,
+            "domain": st.connector.domain,
+            **_indexed_table_context(result),
+        },
     )
 
 
@@ -103,10 +124,21 @@ async def users_table(
     if st.connector is None:
         return _err(request, "Not connected — run setup first.")
     try:
-        users = await st.users(force=bool(refresh))
+        requested_page = max(1, page)
+        result = await st.directory_users(
+            q,
+            scope,
+            limit=PAGE_SIZE,
+            offset=(requested_page - 1) * PAGE_SIZE,
+            refresh=bool(refresh),
+        )
     except Exception as exc:
         return _err(request, _friendly(exc))
-    return TEMPLATES.TemplateResponse(request, "_users_table.html", _table_context(users, q, scope, page))
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_users_table.html",
+        _indexed_table_context(result, q, scope, requested_page),
+    )
 
 
 @router.get("/detail", response_class=HTMLResponse)
@@ -116,13 +148,9 @@ async def user_detail(request: Request, email: str) -> HTMLResponse:
     if conn is None:
         return TEMPLATES.TemplateResponse(request, _USERS_PAGE, {"connected": False, "users": []})
     try:
-        # Serve identity/role/security from the cached directory (reliable JSON path) so opening a
-        # user is instant. Delegates and mail settings load lazily. Fall back to a direct lookup
-        # only for a user not in the cached list (e.g. a deep link).
-        users = await st.users()
-        user = next((u for u in users if u.primary_email.lower() == email.lower()), None)
-        if user is None:
-            user = await conn.get_user(email)
+        # A detail request is one bounded lookup. It must never populate the whole tenant first.
+        user = await conn.get_user(email)
+        await st.patch_directory_user(user)
     except Exception as exc:
         return _error_page(request, _friendly(exc))
     return TEMPLATES.TemplateResponse(

@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import AsyncIterator, List, Optional, Sequence
 
 from ..secrets.ephemeral import EphemeralConfig
 from ..secrets.vault import SecretsVault
@@ -43,6 +45,53 @@ class RunResult:
     stdout: str
     stderr: str
     returncode: int
+
+
+@dataclass(frozen=True)
+class SpooledRunResult:
+    path: Path
+    stdout_bytes: int
+
+
+def _strip_cfgdir_noise_file(path: Path, cfgdir: Path) -> None:
+    """Streaming file equivalent of :func:`strip_cfgdir_noise`."""
+    needle = str(cfgdir).encode("utf-8")
+    fd, clean_name = tempfile.mkstemp(prefix="gam-output-clean-", dir=str(path.parent))
+    clean_path = Path(clean_name)
+    os.chmod(clean_path, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as target, path.open("rb") as source:
+            for line in source:
+                if needle not in line:
+                    target.write(line)
+        os.replace(clean_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            clean_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _secure_remove(path: Path) -> None:
+    """Best-effort overwrite followed by reliable removal of a spool file."""
+    try:
+        size = path.stat().st_size
+        with path.open("r+b", buffering=0) as fh:
+            zeroes = b"\x00" * (1024 * 1024)
+            remaining = size
+            while remaining > 0:
+                chunk = min(remaining, len(zeroes))
+                fh.write(zeroes[:chunk])
+                remaining -= chunk
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def locate_gam_binary() -> Path:
@@ -114,6 +163,43 @@ class GAMRunner:
             returncode=proc.returncode if proc.returncode is not None else -1,
         )
 
+    async def _exec_to_file(
+        self,
+        argv: Sequence[str],
+        cfgdir: Path,
+        timeout: float,
+        stdout_path: Path,
+    ) -> RunResult:
+        self._require_binary()
+        with stdout_path.open("wb", buffering=0) as stdout_file:
+            proc = await asyncio.create_subprocess_exec(
+                str(self.gam_binary),
+                *argv,
+                stdout=stdout_file,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._build_env(cfgdir),
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise GAMError(
+                    GAMErrorKind.TIMEOUT,
+                    exit_code=None,
+                    stderr="command timed out",
+                    argv=list(argv),
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
+        return RunResult(
+            stdout="",
+            stderr=(err or b"").decode("utf-8", "replace"),
+            returncode=proc.returncode if proc.returncode is not None else -1,
+        )
+
     async def run_authenticated(
         self,
         domain: str,
@@ -140,6 +226,52 @@ class GAMRunner:
             async with self._write_lock:
                 return await _do()
         return await _do()
+
+    @asynccontextmanager
+    async def run_authenticated_to_file(
+        self,
+        domain: str,
+        argv: Sequence[str],
+        timeout: Optional[float] = None,
+        serialize: bool = False,
+    ) -> AsyncIterator[SpooledRunResult]:
+        """Stream authenticated GAM stdout to a private ``0600`` file.
+
+        The file exists only inside the context and is overwritten then removed on success,
+        command failure, consumer failure, or cancellation.  This path is for large exports that
+        should not be retained as a bytes object and decoded on the event loop.
+        """
+        command = list(argv)
+        command_timeout = timeout or self.timeout
+
+        @asynccontextmanager
+        async def _do() -> AsyncIterator[SpooledRunResult]:
+            with EphemeralConfig(self.vault, domain, base_dir=self.base_dir) as cfgdir:
+                fd, raw_path = tempfile.mkstemp(prefix="gam-output-", suffix=".tmp", dir=str(cfgdir))
+                os.close(fd)
+                spool_path = Path(raw_path)
+                os.chmod(spool_path, 0o600)
+                try:
+                    result = await self._exec_to_file(
+                        command, cfgdir, command_timeout, spool_path
+                    )
+                    if result.returncode != 0:
+                        raise GAMError.from_run(result.returncode, result.stderr, command)
+                    await asyncio.to_thread(_strip_cfgdir_noise_file, spool_path, cfgdir)
+                    yield SpooledRunResult(
+                        path=spool_path,
+                        stdout_bytes=spool_path.stat().st_size,
+                    )
+                finally:
+                    await asyncio.shield(asyncio.to_thread(_secure_remove, spool_path))
+
+        if serialize:
+            async with self._write_lock:
+                async with _do() as result:
+                    yield result
+            return
+        async with _do() as result:
+            yield result
 
     async def run_in_cfgdir(
         self,

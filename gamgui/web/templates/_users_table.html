@@ -43,7 +43,13 @@
   </table>
 </div>
 <div class="mt-2 flex items-center justify-between text-xs text-brand-gray">
-  <span>{{ total }} total{% if q or scope != 'all' %} (filtered){% endif %}{% if pages > 1 %} · page {{ page }} of {{ pages }}{% endif %}</span>
+  <span>
+    {{ total }} total{% if q or scope != 'all' %} (filtered){% endif %}{% if pages > 1 %} · page {{ page }} of {{ pages }}{% endif %}
+    {% if refreshing is defined and refreshing %} · updating directory…
+    {% elif snapshot_age_seconds is defined and snapshot_age_seconds is not none %}
+      · snapshot {{ ((snapshot_age_seconds / 60) | round(0, 'floor') | int) }}m old
+    {% endif %}
+  </span>
   {% if pages > 1 %}
   <div class="flex items-center gap-2">
     {% if page > 1 %}

@@ -86,6 +86,102 @@ def test_user_detail_lazy_loads_delegates(client):
     assert "Remove" in lazy.text
 
 
+def test_user_detail_uses_one_direct_lookup_and_zero_hidden_panel_calls(
+    client, monkeypatch
+):
+    from gamgui.core.gam.models import GAMUser
+
+    connector = client.app.state.gamgui.connector
+    calls = {"detail": 0, "hidden": 0}
+
+    async def detail(email, fields=None):
+        calls["detail"] += 1
+        return GAMUser.from_json(
+            {
+                "primaryEmail": email,
+                "name": {"givenName": "Direct", "familyName": "Lookup"},
+            }
+        )
+
+    async def hidden(*args, **kwargs):
+        calls["hidden"] += 1
+        return []
+
+    monkeypatch.setattr(connector, "get_user", detail)
+    for name in (
+        "get_signature",
+        "list_delegates",
+        "get_vacation",
+        "list_user_groups",
+        "list_groups",
+        "list_calendar_acls",
+    ):
+        monkeypatch.setattr(connector, name, hidden)
+
+    response = client.get("/users/detail", params={"email": "direct@example.com"})
+    assert response.status_code == 200
+    assert calls == {"detail": 1, "hidden": 0}
+    assert 'hx-trigger="load"' not in response.text
+    assert response.text.count(" data-user-detail-lazy hx-get=") == 5
+    assert response.text.count('hx-trigger="ud-load once"') == 5
+
+
+def test_warm_user_table_is_bounded_and_does_not_call_gam(client, monkeypatch):
+    from gamgui.core.gam.models import GAMUser
+    from gamgui.web.routes.users import PAGE_SIZE
+
+    state = client.app.state.gamgui
+    users = [
+        GAMUser.from_json(
+            {
+                "primaryEmail": f"user{i:04d}@example.com",
+                "name": {"givenName": f"User{i:04d}", "familyName": "Scale"},
+            }
+        )
+        for i in range(120)
+    ]
+    state.directory_index.replace_users(users)
+    calls = {"refresh": 0}
+
+    async def refresh(index):
+        calls["refresh"] += 1
+        return 0
+
+    monkeypatch.setattr(state.connector, "refresh_directory_users", refresh)
+    response = client.get("/users/table", params={"q": "user", "scope": "all"})
+    assert response.status_code == 200
+    assert calls["refresh"] == 0
+    assert response.text.count('href="/users/detail?email=') == PAGE_SIZE
+    assert len(response.content) < 100_000
+
+
+def test_empty_user_index_refreshes_once_then_serves_snapshot(client, monkeypatch):
+    from gamgui.core.gam.models import GAMUser
+
+    state = client.app.state.gamgui
+    calls = {"refresh": 0}
+
+    async def refresh(index):
+        calls["refresh"] += 1
+        return index.replace_users(
+            [
+                GAMUser.from_json(
+                    {
+                        "primaryEmail": "indexed@example.com",
+                        "name": {"givenName": "Indexed", "familyName": "User"},
+                    }
+                )
+            ]
+        )
+
+    monkeypatch.setattr(state.connector, "refresh_directory_users", refresh)
+    first = client.get("/users")
+    second = client.get("/users/table")
+    assert first.status_code == 200 and second.status_code == 200
+    assert "indexed@example.com" in first.text and "indexed@example.com" in second.text
+    assert calls["refresh"] == 1
+
+
 def test_vacation_get_renders_current_state(client):
     r = client.get("/users/vacation", params={"email": "alice@example.com"})
     assert r.status_code == 200
@@ -815,7 +911,7 @@ def test_users_page_shows_friendly_error_not_500(client, monkeypatch):
     async def boom(*a, **k):
         raise GAMError(GAMErrorKind.AUTH_EXPIRED, exit_code=1, stderr="invalid_grant")
 
-    monkeypatch.setattr(client.app.state.gamgui.connector, "list_users", boom)
+    monkeypatch.setattr(client.app.state.gamgui.connector, "refresh_directory_users", boom)
     r = client.get("/users")
     assert r.status_code == 200
     assert "Re-run setup" in r.text  # GAMError.remediation, not a 500

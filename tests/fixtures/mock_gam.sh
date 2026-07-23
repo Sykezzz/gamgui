@@ -35,6 +35,8 @@ fi
 if [ "${1:-}" = "info" ] && [ "${2:-}" = "user" ]; then
   if [ "${3:-}" = "bob@example.com" ]; then
     cat "$GAM_MOCK_FIXTURES/info_user_suspended.json"
+  elif [ "${3:-}" = "carol@example.com" ]; then
+    cat "$GAM_MOCK_FIXTURES/info_user_carol.json"
   else
     cat "$GAM_MOCK_FIXTURES/info_user.json"
   fi

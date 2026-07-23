@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+
 from gamgui.core.connectors.base import RiskLevel
+from gamgui.core.directory_index import DirectoryIndex
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
 
 
@@ -60,6 +63,31 @@ async def test_list_delegates(connector):
 async def test_list_users_have_titles(connector):
     by_email = {u.primary_email: u for u in await connector.list_users()}
     assert by_email["alice@example.com"].title == "IT Director"
+
+
+async def test_directory_refresh_spools_and_indexes_off_event_loop(
+    connector, tmp_path, monkeypatch
+):
+    index = DirectoryIndex(tmp_path / "directory.db", "example.com")
+    caller_thread = threading.get_ident()
+    worker_threads = []
+    replace_users = index.replace_users
+    replace_groups = index.replace_groups
+
+    def tracked_users(items):
+        worker_threads.append(threading.get_ident())
+        return replace_users(items)
+
+    def tracked_groups(items):
+        worker_threads.append(threading.get_ident())
+        return replace_groups(items)
+
+    monkeypatch.setattr(index, "replace_users", tracked_users)
+    monkeypatch.setattr(index, "replace_groups", tracked_groups)
+    assert await connector.refresh_directory_users(index) == 3
+    assert await connector.refresh_directory_groups(index) == 3
+    assert index.status().users == 3 and index.status().groups == 3
+    assert worker_threads and all(thread_id != caller_thread for thread_id in worker_threads)
 
 
 async def test_get_signature(connector):

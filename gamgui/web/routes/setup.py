@@ -96,8 +96,7 @@ async def verify(
     svc = _service(request)
     result = await svc.verify(domain, admin)
     if result.ok:
-        st.connector = GAMConnector(runner=st.runner, domain=domain)
-        st.audit_domain = domain
+        st.activate_connector(GAMConnector(runner=st.runner, domain=domain))
     return TEMPLATES.TemplateResponse(
         request, "_verify.html", {"result": result, "domain": domain, "admin": admin}
     )
