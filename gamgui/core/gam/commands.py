@@ -40,6 +40,17 @@ GROUP_LIST_FIELDS = ("email", "name", "description", "directMembersCount")
 CROS_LIST_FIELDS = ("deviceId", "serialNumber", "status", "orgUnitPath", "annotatedAssetId",
                     "annotatedUser", "lastSync", "model")
 FILE_LIST_FIELDS = ("id", "name", "mimeType", "owners", "modifiedTime", "webViewLink")
+# Keep the domain-wide Classroom snapshot cheap. ``owneremail``, aliases, and participant flags
+# trigger additional API calls per course in GAM, so they belong only on one-course detail reads.
+COURSE_INDEX_FIELDS = (
+    "id", "name", "section", "room", "ownerId", "courseState",
+    "creationTime", "updateTime", "alternateLink",
+)
+COURSE_DETAIL_FIELDS = COURSE_INDEX_FIELDS + (
+    "descriptionHeading", "description",
+)
+COURSE_STATES = ("active", "archived", "provisioned", "declined", "suspended")
+COURSE_ROSTER_ROLES = ("teachers", "students")
 # Superset fetched once and cached to serve the users list (needs title), reports, AND the detail
 # view (so opening a user is instant + uses the reliable JSON path, not the `info user` text format).
 CACHE_FIELDS = (
@@ -116,6 +127,105 @@ class GAMCommands:
         argv = ["info", "user", email, "fields", ",".join(fields or USER_DETAIL_FIELDS)]
         argv.append("formatjson")
         return argv
+
+    # --- Classroom --------------------------------------------------------------------
+    @staticmethod
+    def print_courses(
+        states: Optional[Sequence[str]] = None,
+        teacher: str = "",
+        student: str = "",
+        fields: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        if teacher and student:
+            raise ValueError("Classroom teacher and student filters are mutually exclusive")
+        argv = ["print", "courses"]
+        if teacher:
+            argv += ["teacher", teacher]
+        if student:
+            argv += ["student", student]
+        if states:
+            argv += ["states", ",".join(_validate_course_state(state) for state in states)]
+        argv += ["fields", ",".join(fields or COURSE_INDEX_FIELDS), "formatjson"]
+        return argv
+
+    @staticmethod
+    def info_course(course_id: str, fields: Optional[Sequence[str]] = None) -> List[str]:
+        # owneremail + aliases are explicit expansion flags and are safe for a single selected course.
+        return [
+            "info", "course", course_id, "owneremail", "aliases",
+            "fields", ",".join(fields or COURSE_DETAIL_FIELDS), "formatjson",
+        ]
+
+    @staticmethod
+    def create_course(
+        name: str,
+        teacher: str,
+        *,
+        alias: str = "",
+        section: str = "",
+        room: str = "",
+        description_heading: str = "",
+        description: str = "",
+        state: str = "provisioned",
+    ) -> List[str]:
+        argv = ["create", "course"]
+        if alias:
+            argv += ["alias", alias]
+        argv += ["name", name, "teacher", teacher]
+        if section:
+            argv += ["section", section]
+        if room:
+            argv += ["room", room]
+        if description_heading:
+            argv += ["descriptionheading", description_heading]
+        if description:
+            argv += ["description", description]
+        argv += ["state", _validate_course_state(state)]
+        return argv
+
+    @staticmethod
+    def update_course(
+        course_id: str,
+        *,
+        name: str,
+        section: str = "",
+        room: str = "",
+        description_heading: str = "",
+        description: str = "",
+    ) -> List[str]:
+        # Send the complete editable metadata set so clearing a field is intentional and testable.
+        return [
+            "update", "course", course_id,
+            "name", name,
+            "section", section,
+            "room", room,
+            "descriptionheading", description_heading,
+            "description", description,
+        ]
+
+    @staticmethod
+    def update_course_state(course_id: str, state: str) -> List[str]:
+        return ["update", "course", course_id, "state", _validate_course_state(state)]
+
+    @staticmethod
+    def transfer_course_owner(course_id: str, teacher: str) -> List[str]:
+        # GAM adds a non-teacher as co-teacher before promoting them to owner.
+        return ["update", "course", course_id, "teacher", teacher]
+
+    @staticmethod
+    def print_course_participants(course_id: str, role: str) -> List[str]:
+        return [
+            "print", "course-participants", "course", course_id,
+            "show", _validate_course_role(role), "formatjson",
+        ]
+
+    @staticmethod
+    def add_course_participant(course_id: str, role: str, email: str) -> List[str]:
+        return ["course", course_id, "add", _validate_course_role(role), email]
+
+    @staticmethod
+    def remove_course_participant(course_id: str, role: str, email: str) -> List[str]:
+        return ["course", course_id, "remove", _validate_course_role(role), email]
 
     # --- users (mutating) -------------------------------------------------------------
     @staticmethod
@@ -508,6 +618,22 @@ def _validate_role(role: str) -> str:
     if role not in GROUP_ROLES:
         raise ValueError(f"invalid group role {role!r}; expected one of {GROUP_ROLES}")
     return role
+
+
+def _validate_course_state(state: str) -> str:
+    value = (state or "").strip().lower()
+    if value not in COURSE_STATES:
+        raise ValueError(f"invalid Classroom course state {state!r}; expected one of {COURSE_STATES}")
+    return value
+
+
+def _validate_course_role(role: str) -> str:
+    value = (role or "").strip().lower()
+    if value not in COURSE_ROSTER_ROLES:
+        raise ValueError(
+            f"invalid Classroom roster role {role!r}; expected one of {COURSE_ROSTER_ROLES}"
+        )
+    return value
 
 
 def build_user_query(search: str = "", include_suspended: bool = True) -> Optional[str]:

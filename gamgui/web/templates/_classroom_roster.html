@@ -1,0 +1,65 @@
+{% set field = "w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" %}
+<section class="space-y-4 rounded-xl border border-brand-gray/30 bg-paper/60 p-4" aria-labelledby="roster-heading">
+  <div class="flex items-center justify-between gap-3">
+    <div>
+      <h4 id="roster-heading" class="font-serif text-lg text-brand-black">{{ role | title }}</h4>
+      <p class="text-xs text-brand-blueink"><span class="tabular-nums">{{ members | length }}</span> current member{{ "" if members | length == 1 else "s" }}</p>
+    </div>
+    {% if not course.roster_editable %}<span class="rounded-full border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900">Read only until active</span>{% endif %}
+  </div>
+
+  {% if notice %}<div class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800" role="status">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="alert">{{ error }}</div>{% endif %}
+
+  {% if members %}
+  <ul class="max-h-64 divide-y divide-brand-gray/20 overflow-y-auto rounded-lg border border-brand-gray/30 bg-brand-white">
+    {% for member in members %}
+    <li class="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+      <span class="min-w-0">
+        <span class="block truncate font-medium text-brand-black">{{ member.label }}</span>
+        {% if member.full_name and member.email %}<span class="block truncate text-xs text-brand-blueink">{{ member.email }}</span>{% endif %}
+      </span>
+      {% set is_owner = role == "teachers" and course.owner_email and member.email == course.owner_email %}
+      {% if is_owner %}
+      <span class="shrink-0 rounded-full bg-brand-blue/10 px-2 py-0.5 text-xs font-medium text-brand-blueink">Owner</span>
+      {% elif course.roster_editable and member.email %}
+      <form hx-post="/classroom/course/{{ course.id | urlencode }}/roster/remove" hx-target="#classroom-roster" hx-swap="innerHTML"
+            hx-confirm="Remove {{ member.email }} from this {{ role[:-1] }} roster?">
+        <input type="hidden" name="role" value="{{ role }}" />
+        <input type="hidden" name="email" value="{{ member.email }}" />
+        <button type="submit" class="rounded px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500">Remove</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="rounded-lg border border-dashed border-brand-gray/50 bg-brand-white px-3 py-5 text-center text-sm text-brand-blueink">No {{ role }} returned.</p>
+  {% endif %}
+
+  {% if course.roster_editable %}
+  <form class="flex flex-wrap gap-2" hx-post="/classroom/course/{{ course.id | urlencode }}/roster/add" hx-target="#classroom-roster" hx-swap="innerHTML">
+    <input type="hidden" name="role" value="{{ role }}" />
+    <label class="min-w-0 flex-1 text-sm font-medium text-brand-black">Add {{ role[:-1] }}
+      <input class="{{ field }} mt-1" type="email" name="email" required autocomplete="off" placeholder="person@domain.com" />
+    </label>
+    <button type="submit" class="self-end rounded-lg border border-brand-blue/60 px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Add</button>
+  </form>
+
+  <details class="border-t border-brand-gray/30 pt-3">
+    <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Reconcile exact roster from CSV</summary>
+    <p class="mt-2 text-xs text-brand-blueink">The CSV is the complete desired {{ role }} roster. GamGUI previews additions and removals, never calls GAM's opaque clear/sync commands, and caps a run at 200 changes.</p>
+    <form class="mt-3 space-y-3" enctype="multipart/form-data" hx-post="/classroom/course/{{ course.id | urlencode }}/roster/preview" hx-target="#classroom-roster-preview" hx-swap="innerHTML">
+      <input type="hidden" name="role" value="{{ role }}" />
+      <label class="block text-sm font-medium text-brand-black">Roster CSV
+        <input class="{{ field }} mt-1" type="file" name="roster_file" accept=".csv,text/csv,text/plain" />
+      </label>
+      <label class="block text-sm font-medium text-brand-black">Or paste emails
+        <textarea class="{{ field }} mt-1 min-h-24 font-mono text-xs" name="csv_text" placeholder="email&#10;person1@example.com&#10;person2@example.com"></textarea>
+      </label>
+      <button type="submit" class="rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Preview exact diff</button>
+    </form>
+    <div id="classroom-roster-preview" class="mt-3" aria-live="polite"></div>
+  </details>
+  {% endif %}
+</section>

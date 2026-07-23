@@ -1,0 +1,21 @@
+{% set field = "w-full rounded-lg border border-red-300 bg-white px-3 py-2 font-mono text-sm text-ink focus:border-red-500 focus:outline-none focus:ring-2 focus:ring-red-300" %}
+<div class="rounded-2xl border border-red-300 bg-red-50 p-5 shadow-sm" role="alert">
+  <p class="eyebrow text-red-700">Confirm owner transfer</p>
+  <h3 class="mt-2 font-serif text-xl text-brand-black">{{ preview.course.name }}</h3>
+  <dl class="mt-3 grid gap-2 text-sm sm:grid-cols-[8rem_1fr]">
+    <dt class="text-brand-blueink">Course ID</dt><dd class="font-mono tabular-nums text-brand-black">{{ preview.course.id }}</dd>
+    <dt class="text-brand-blueink">Current owner</dt><dd class="text-brand-black">{{ preview.course.owner_email or preview.course.owner_id or "Unknown" }}</dd>
+    <dt class="text-brand-blueink">New owner</dt><dd class="font-medium text-brand-black">{{ preview.target_email }}</dd>
+  </dl>
+  <p class="mt-3 text-sm text-red-800">Ownership changes course authority. The course is re-read immediately after GAM completes.</p>
+  <form class="mt-4 grid gap-3 sm:grid-cols-2" hx-post="/classroom/course/{{ preview.course.id | urlencode }}/owner" hx-target="#classroom-detail" hx-swap="innerHTML">
+    <input type="hidden" name="target_email" value="{{ preview.target_email }}" />
+    <label class="text-sm font-medium text-brand-black">Type course ID
+      <input class="{{ field }} mt-1" name="confirm_course_id" required autocomplete="off" />
+    </label>
+    <label class="text-sm font-medium text-brand-black">Type destination email
+      <input class="{{ field }} mt-1" name="confirm_target_email" required autocomplete="off" />
+    </label>
+    <button type="submit" class="sm:col-span-2 justify-self-start rounded-lg bg-red-700 px-3.5 py-2 text-sm font-medium text-white hover:bg-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500">Transfer ownership</button>
+  </form>
+</div>

@@ -25,6 +25,7 @@ from ..gam.models import (
     UserCalendar,
     Vacation,
 )
+from ..classroom.models import CourseDetail, CourseParticipant, CourseSummary
 from ..calendar_index import IndexedCalendar
 from ..gam.parser import iter_records_file, parse_one, parse_records
 from ..gam.runner import GAMRunner
@@ -72,7 +73,12 @@ def _parse_signature(text: str) -> str:
 
 class GAMConnector(Connector):
     id = ConnectorID.GOOGLE_WORKSPACE
-    capabilities = {Capability.DIRECTORY, Capability.GROUPS, Capability.MAIL}
+    capabilities = {
+        Capability.DIRECTORY,
+        Capability.GROUPS,
+        Capability.MAIL,
+        Capability.CLASSROOM,
+    }
 
     def __init__(self, runner: GAMRunner, domain: str, audit: Optional[AuditLog] = None) -> None:
         self.runner = runner
@@ -148,6 +154,120 @@ class GAMConnector(Connector):
             if addr:
                 out.append(str(addr))
         return out
+
+    # --- Classroom --------------------------------------------------------------------
+    async def list_courses(
+        self,
+        states: Optional[Sequence[str]] = None,
+        teacher: str = "",
+        student: str = "",
+        fields: Optional[Sequence[str]] = None,
+    ) -> List[CourseSummary]:
+        argv = GAMCommands.print_courses(
+            states=states, teacher=teacher, student=student, fields=fields
+        )
+        stdout = await self.runner.run_authenticated(self.domain, argv)
+        return [CourseDetail.from_json(record) for record in parse_records(stdout)]
+
+    async def get_course(self, course_id: str) -> CourseDetail:
+        stdout = await self.runner.run_authenticated(
+            self.domain, GAMCommands.info_course(course_id)
+        )
+        return CourseDetail.from_json(parse_one(stdout))
+
+    async def list_course_participants(
+        self, course_id: str, role: str
+    ) -> List[CourseParticipant]:
+        stdout = await self.runner.run_authenticated(
+            self.domain, GAMCommands.print_course_participants(course_id, role)
+        )
+        return [
+            CourseParticipant.from_json(record, role=role)
+            for record in parse_records(stdout)
+        ]
+
+    async def create_course(
+        self,
+        *,
+        name: str,
+        owner_email: str,
+        alias: str = "",
+        section: str = "",
+        room: str = "",
+        description_heading: str = "",
+        description: str = "",
+        state: str = "PROVISIONED",
+    ) -> ChangeResult:
+        argv = GAMCommands.create_course(
+            name,
+            owner_email,
+            alias=alias,
+            section=section,
+            room=room,
+            description_heading=description_heading,
+            description=description,
+            state=state,
+        )
+        return await self._run_write("create_course", owner_email, argv, RiskLevel.LOW)
+
+    async def update_course(
+        self,
+        course_id: str,
+        *,
+        name: str,
+        section: str = "",
+        room: str = "",
+        description_heading: str = "",
+        description: str = "",
+    ) -> ChangeResult:
+        argv = GAMCommands.update_course(
+            course_id,
+            name=name,
+            section=section,
+            room=room,
+            description_heading=description_heading,
+            description=description,
+        )
+        return await self._run_write("update_course", course_id, argv, RiskLevel.LOW)
+
+    async def update_course_state(self, course_id: str, state: str) -> ChangeResult:
+        risk = RiskLevel.DESTRUCTIVE if state.strip().upper() == "ARCHIVED" else RiskLevel.LOW
+        return await self._run_write(
+            "update_course_state",
+            course_id,
+            GAMCommands.update_course_state(course_id, state),
+            risk,
+        )
+
+    async def transfer_course_owner(
+        self, course_id: str, target_email: str
+    ) -> ChangeResult:
+        return await self._run_write(
+            "transfer_course_owner",
+            course_id,
+            GAMCommands.transfer_course_owner(course_id, target_email),
+            RiskLevel.DESTRUCTIVE,
+        )
+
+    async def add_course_participant(
+        self, course_id: str, role: str, email: str
+    ) -> ChangeResult:
+        return await self._run_write(
+            "add_course_participant",
+            email,
+            GAMCommands.add_course_participant(course_id, role, email),
+            RiskLevel.LOW,
+        )
+
+    async def remove_course_participant(
+        self, course_id: str, role: str, email: str
+    ) -> ChangeResult:
+        return await self._run_write(
+            "remove_course_participant",
+            email,
+            GAMCommands.remove_course_participant(course_id, role, email),
+            RiskLevel.DESTRUCTIVE,
+        )
 
     async def resolve(self, person: Person) -> Optional[ConnectorAccount]:
         try:

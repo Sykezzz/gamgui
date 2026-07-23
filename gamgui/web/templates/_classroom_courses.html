@@ -1,0 +1,56 @@
+<div class="overflow-hidden rounded-2xl border border-brand-gray/40 bg-brand-white shadow-sm">
+  <div class="flex items-center justify-between gap-3 border-b border-brand-gray/30 px-4 py-3">
+    <p class="text-sm text-brand-blueink"><span class="font-semibold tabular-nums text-brand-black">{{ page.total }}</span> course{{ "" if page.total == 1 else "s" }}</p>
+    {% if page.snapshot_age_seconds is not none %}
+    <p class="text-xs text-brand-blueink">Snapshot {{ (page.snapshot_age_seconds / 60) | round | int }} min old{% if page.refreshing %} · refreshing{% endif %}</p>
+    {% endif %}
+  </div>
+  {% if page.items %}
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">Classroom course search results</caption>
+      <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
+        <tr>
+          <th class="px-4 py-3 font-semibold" scope="col">Course</th>
+          <th class="px-4 py-3 font-semibold" scope="col">Section / room</th>
+          <th class="px-4 py-3 font-semibold" scope="col">State</th>
+          <th class="px-4 py-3 font-semibold" scope="col"><span class="sr-only">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for course in page.items %}
+        <tr>
+          <td class="max-w-md px-4 py-3">
+            <p class="truncate font-medium text-brand-black">{{ course.name or "(untitled course)" }}</p>
+            <p class="mt-0.5 font-mono text-xs tabular-nums text-brand-blueink">{{ course.id }}</p>
+          </td>
+          <td class="px-4 py-3 text-brand-blueink">
+            <span>{{ course.section or "—" }}</span>
+            {% if course.room %}<span class="text-brand-blueink"> · {{ course.room }}</span>{% endif %}
+          </td>
+          <td class="px-4 py-3">
+            <span class="inline-flex rounded-full border border-brand-gray/50 px-2 py-0.5 text-xs font-medium text-brand-blueink">{{ course.state_label }}</span>
+          </td>
+          <td class="px-4 py-3 text-right">
+            <button type="button" class="rounded-lg px-2 py-1 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 hover:text-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                    hx-get="/classroom/course/{{ course.id | urlencode }}" hx-target="#classroom-detail" hx-swap="innerHTML">Manage<span class="sr-only"> {{ course.name }}</span> →</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="p-8 text-center">
+    <p class="font-serif text-lg text-brand-black">No courses found</p>
+    <p class="mt-1 text-sm text-brand-blueink">Adjust the search or refresh the course index.</p>
+  </div>
+  {% endif %}
+  {% if page.next_cursor %}
+  <div class="border-t border-brand-gray/30 p-3 text-center">
+    <button type="button" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+            hx-get="/classroom/courses?q={{ query | urlencode }}&state={{ state_filter | urlencode }}&cursor={{ page.next_cursor | urlencode }}"
+            hx-target="#classroom-courses" hx-swap="innerHTML">Next 50 courses</button>
+  </div>
+  {% endif %}
+</div>

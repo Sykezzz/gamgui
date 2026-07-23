@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Classroom — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% if not connected %}
+<section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
+  <p class="eyebrow text-brand-blueink">Not connected</p>
+  <h1 class="mt-2 font-serif text-2xl text-brand-black">Connect a domain first</h1>
+  <p class="mt-2 text-sm text-brand-blueink/80">{{ "Classroom course and roster tools use the connected GAM7 tenant." }}</p>
+  <a href="/setup" class="mt-4 inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Run setup</a>
+</section>
+{% else %}
+{% set field = "w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-blueink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" %}
+<div class="space-y-6">
+  <header class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <p class="eyebrow text-brand-blueink">Classroom</p>
+      <h1 class="font-serif text-3xl tracking-tight text-brand-black">Course administration</h1>
+      <p class="mt-1 max-w-3xl text-sm text-brand-blueink/80">Search courses, maintain lifecycle and metadata, and reconcile teacher or student rosters from an exact preview.</p>
+    </div>
+    <details class="w-full rounded-2xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm sm:w-auto sm:min-w-80">
+      <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Create provisioned course</summary>
+      <form class="mt-4 space-y-3" hx-post="/classroom/course" hx-target="#classroom-action" hx-swap="innerHTML">
+        <label class="block text-sm font-medium text-brand-black">Course name
+          <input class="{{ field }} mt-1" name="name" required maxlength="750" />
+        </label>
+        <label class="block text-sm font-medium text-brand-black">Owner email
+          <input class="{{ field }} mt-1" type="email" name="owner_email" required autocomplete="off" />
+        </label>
+        <label class="block text-sm font-medium text-brand-black">Stable alias <span class="font-normal text-brand-blueink">(optional)</span>
+          <input class="{{ field }} mt-1 font-mono" name="alias" placeholder="Section_12345" />
+        </label>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <label class="block text-sm font-medium text-brand-black">Section
+            <input class="{{ field }} mt-1" name="section" />
+          </label>
+          <label class="block text-sm font-medium text-brand-black">Room
+            <input class="{{ field }} mt-1" name="room" />
+          </label>
+        </div>
+        <label class="block text-sm font-medium text-brand-black">Description heading
+          <input class="{{ field }} mt-1" name="description_heading" />
+        </label>
+        <label class="block text-sm font-medium text-brand-black">Description
+          <textarea class="{{ field }} mt-1 min-h-20" name="description"></textarea>
+        </label>
+        <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Create provisioned course</button>
+      </form>
+    </details>
+  </header>
+
+  <div id="classroom-action" aria-live="polite"></div>
+
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="course-search-heading">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h2 id="course-search-heading" class="eyebrow text-brand-blueink">Course index</h2>
+        <p class="mt-1 text-xs text-brand-blueink">Searches run locally; course details and rosters are re-read live before changes.</p>
+      </div>
+      <div id="classroom-index">{% include "_classroom_index_status.html" %}</div>
+    </div>
+    <form id="classroom-search" class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]" hx-get="/classroom/courses" hx-target="#classroom-courses" hx-swap="innerHTML" hx-sync="this:replace">
+      <label class="block text-sm font-medium text-brand-black">Search
+        <input class="{{ field }} mt-1" type="search" name="q" value="{{ query }}" placeholder="Name, section, room, owner ID, or course ID"
+               hx-trigger="input changed delay:300ms, search" hx-get="/classroom/courses" hx-target="#classroom-courses" hx-include="#classroom-search" hx-sync="#classroom-search:replace" />
+      </label>
+      <label class="block text-sm font-medium text-brand-black">State
+        <select class="{{ field }} mt-1" name="state" hx-trigger="change" hx-get="/classroom/courses" hx-target="#classroom-courses" hx-include="#classroom-search" hx-sync="#classroom-search:replace">
+          <option value="">All states</option>
+          {% for item in states %}
+          <option value="{{ item }}" {% if state_filter == item %}selected{% endif %}>{{ item | title }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </form>
+  </section>
+
+  <div class="grid items-start gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(28rem,1fr)]">
+    <section id="classroom-courses" aria-live="polite">
+      {% include "_classroom_courses.html" %}
+    </section>
+    <aside id="classroom-detail" aria-live="polite" aria-label="Selected course details">
+      <div class="rounded-2xl border border-dashed border-brand-gray/60 bg-brand-white/60 p-8 text-center">
+        <p class="font-serif text-lg text-brand-black">Select a course</p>
+        <p class="mt-1 text-sm text-brand-blueink">Details and roster controls load only after selection.</p>
+      </div>
+    </aside>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,11 @@
+<div class="flex flex-wrap items-center justify-end gap-2 text-xs text-brand-blueink"
+     {% if index.refreshing %}hx-get="/classroom/index/status" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+  <span><span class="tabular-nums">{{ index.count }}</span> indexed · {{ index.age }}</span>
+  {% if index.refreshing %}
+  <span class="inline-flex items-center gap-1 text-brand-blueink" role="status">Refreshing…</span>
+  {% else %}
+  <button type="button" class="rounded px-1.5 py-1 font-medium text-brand-blueink hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+          hx-post="/classroom/index/refresh" hx-target="#classroom-index" hx-swap="innerHTML">Refresh</button>
+  {% endif %}
+  {% if index.error %}<span class="basis-full text-right text-amber-800">{{ index.error }}</span>{% endif %}
+</div>

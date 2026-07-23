@@ -1,0 +1,10 @@
+<div class="rounded-2xl border {{ 'border-amber-300 bg-amber-50' if target_state == 'ARCHIVED' else 'border-brand-blue/40 bg-brand-white' }} p-4 shadow-sm" role="alert">
+  <p class="eyebrow {{ 'text-amber-800' if target_state == 'ARCHIVED' else 'text-brand-blueink' }}">Confirm state change</p>
+  <p class="mt-2 text-sm text-brand-black"><strong>{{ course.name }}</strong> ({{ course.id }}) will change from {{ course.state_label }} to {{ target_state | title }}.</p>
+  {% if target_state == "ARCHIVED" %}<p class="mt-1 text-sm text-amber-900">Students and teachers will no longer see it as an active class. GamGUI does not permanently delete courses.</p>{% endif %}
+  <form class="mt-3" hx-post="/classroom/course/{{ course.id | urlencode }}/state" hx-target="#classroom-detail" hx-swap="innerHTML">
+    <input type="hidden" name="target_state" value="{{ target_state }}" />
+    <input type="hidden" name="confirmed" value="yes" />
+    <button type="submit" class="rounded-lg {{ 'bg-amber-700 hover:bg-amber-800' if target_state == 'ARCHIVED' else 'bg-brand-blueink hover:bg-brand-black' }} px-3.5 py-2 text-sm font-medium text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Confirm {{ target_state | lower }}</button>
+  </form>
+</div>

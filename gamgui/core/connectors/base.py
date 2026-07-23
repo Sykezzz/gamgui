@@ -29,6 +29,7 @@ class Capability(enum.Enum):
     DIRECTORY = "directory"
     GROUPS = "groups"
     MAIL = "mail"
+    CLASSROOM = "classroom"
     MDM = "mdm"
     TELEPHONY = "telephony"
 

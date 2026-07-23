@@ -1,0 +1,96 @@
+{% set field = "w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30 disabled:bg-brand-gray/10 disabled:text-brand-gray" %}
+<article class="space-y-5 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
+  <header class="border-b border-brand-gray/30 pb-4">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div class="min-w-0">
+        <p class="eyebrow text-brand-blueink">Selected course</p>
+        <h2 class="mt-1 break-words font-serif text-2xl text-brand-black">{{ course.name or "(untitled course)" }}</h2>
+        <p class="mt-1 font-mono text-xs tabular-nums text-brand-blueink">{{ course.id }}</p>
+      </div>
+      <span class="inline-flex rounded-full border border-brand-gray/50 px-2.5 py-1 text-xs font-medium text-brand-blueink">{{ course.state_label }}</span>
+    </div>
+    {% if course.owner_email %}
+    <p class="mt-2 text-xs text-brand-blueink">Owner <span class="text-brand-black">{{ course.owner_email }}</span></p>
+    {% endif %}
+    {% if course.aliases %}
+    <p class="mt-1 text-xs text-brand-blueink">Aliases: <span class="font-mono">{{ course.aliases | join(", ") }}</span></p>
+    {% endif %}
+    {% if course.alternate_link %}
+    <a class="mt-2 inline-flex text-sm font-medium text-brand-blueink hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+       href="{{ course.alternate_link }}" target="_blank" rel="noreferrer">Open in Google Classroom ↗</a>
+    {% endif %}
+  </header>
+
+  {% if notice %}<div class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800" role="status">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="alert">{{ error }}</div>{% endif %}
+
+  <section aria-labelledby="classroom-metadata-heading">
+    <h3 id="classroom-metadata-heading" class="eyebrow text-brand-blueink">Course details</h3>
+    {% if course.read_only %}
+    <p class="mt-2 rounded-lg border border-amber-300/70 bg-amber-50 px-3 py-2 text-sm text-amber-900">{{ course.state_label }} courses are read-only in GamGUI.</p>
+    {% endif %}
+    <form class="mt-3 space-y-3" hx-post="/classroom/course/{{ course.id | urlencode }}/metadata" hx-target="#classroom-detail" hx-swap="innerHTML">
+      <label class="block text-sm font-medium text-brand-black">Name
+        <input class="{{ field }} mt-1" name="name" value="{{ course.name }}" required maxlength="750" {% if course.read_only %}disabled{% endif %} />
+      </label>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <label class="block text-sm font-medium text-brand-black">Section
+          <input class="{{ field }} mt-1" name="section" value="{{ course.section }}" {% if course.read_only %}disabled{% endif %} />
+        </label>
+        <label class="block text-sm font-medium text-brand-black">Room
+          <input class="{{ field }} mt-1" name="room" value="{{ course.room }}" {% if course.read_only %}disabled{% endif %} />
+        </label>
+      </div>
+      <label class="block text-sm font-medium text-brand-black">Description heading
+        <input class="{{ field }} mt-1" name="description_heading" value="{{ course.description_heading }}" {% if course.read_only %}disabled{% endif %} />
+      </label>
+      <label class="block text-sm font-medium text-brand-black">Description
+        <textarea class="{{ field }} mt-1 min-h-24" name="description" {% if course.read_only %}disabled{% endif %}>{{ course.description }}</textarea>
+      </label>
+      {% if not course.read_only %}
+      <button type="submit" class="rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Save course details</button>
+      {% endif %}
+    </form>
+  </section>
+
+  <section class="border-t border-brand-gray/30 pt-4" aria-labelledby="classroom-rosters-heading">
+    <h3 id="classroom-rosters-heading" class="eyebrow text-brand-blueink">Rosters</h3>
+    <p class="mt-1 text-xs text-brand-blueink">Teachers and students load only when selected.</p>
+    <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Load course roster">
+      <button type="button" class="rounded-lg border border-brand-blue/60 px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-get="/classroom/course/{{ course.id | urlencode }}/roster?role=teachers" hx-target="#classroom-roster" hx-swap="innerHTML" aria-controls="classroom-roster">Teachers</button>
+      <button type="button" class="rounded-lg border border-brand-blue/60 px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-get="/classroom/course/{{ course.id | urlencode }}/roster?role=students" hx-target="#classroom-roster" hx-swap="innerHTML" aria-controls="classroom-roster">Students</button>
+    </div>
+    <div id="classroom-roster" class="mt-4" aria-live="polite"></div>
+  </section>
+
+  {% if not course.read_only %}
+  <section class="border-t border-brand-gray/30 pt-4" aria-labelledby="classroom-lifecycle-heading">
+    <h3 id="classroom-lifecycle-heading" class="eyebrow text-brand-blueink">Lifecycle</h3>
+    <div class="mt-3 flex flex-wrap gap-2">
+      {% if course.course_state == "PROVISIONED" %}
+      <button type="button" class="rounded-lg bg-brand-blueink px-3 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-post="/classroom/course/{{ course.id | urlencode }}/state/preview" hx-vals='{"target_state":"ACTIVE"}' hx-target="#classroom-action" hx-swap="innerHTML">Activate course…</button>
+      {% elif course.course_state == "ACTIVE" %}
+      <button type="button" class="rounded-lg border border-amber-400 px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
+              hx-post="/classroom/course/{{ course.id | urlencode }}/state/preview" hx-vals='{"target_state":"ARCHIVED"}' hx-target="#classroom-action" hx-swap="innerHTML">Archive course…</button>
+      {% elif course.course_state == "ARCHIVED" %}
+      <button type="button" class="rounded-lg bg-brand-blueink px-3 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-post="/classroom/course/{{ course.id | urlencode }}/state/preview" hx-vals='{"target_state":"ACTIVE"}' hx-target="#classroom-action" hx-swap="innerHTML">Reactivate course…</button>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="border-t border-brand-gray/30 pt-4" aria-labelledby="classroom-owner-heading">
+    <h3 id="classroom-owner-heading" class="eyebrow text-brand-blueink">Course owner</h3>
+    <p class="mt-1 text-xs text-brand-blueink">The destination must be an active user in the connected directory. GAM may first add them as a co-teacher.</p>
+    <form class="mt-3 flex flex-wrap gap-2" hx-post="/classroom/course/{{ course.id | urlencode }}/owner/preview" hx-target="#classroom-action" hx-swap="innerHTML">
+      <label class="min-w-0 flex-1 text-sm font-medium text-brand-black">New owner email
+        <input class="{{ field }} mt-1" type="email" name="target_email" required autocomplete="off" />
+      </label>
+      <button type="submit" class="self-end rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500">Review transfer…</button>
+    </form>
+  </section>
+  {% endif %}
+</article>

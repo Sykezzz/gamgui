@@ -1,0 +1,23 @@
+<section class="space-y-4" aria-labelledby="user-classroom-heading">
+  <div>
+    <h3 id="user-classroom-heading" class="eyebrow text-brand-blueink">Classroom</h3>
+    <p class="mt-1 text-sm text-brand-blueink">{{ email }}</p>
+  </div>
+  <div class="grid gap-4 lg:grid-cols-2">
+    <div class="rounded-xl border border-brand-gray/30 bg-paper/60 p-4">
+      <h4 class="font-serif text-lg text-brand-black">Teaching</h4>
+      <p class="text-xs text-brand-blueink">{{ teaching | length }} course{{ "" if teaching | length == 1 else "s" }} shown</p>
+      {% if teaching %}
+      <ul class="mt-3 max-h-64 divide-y divide-brand-gray/20 overflow-y-auto">{% for course in teaching %}<li class="py-2"><a class="text-sm font-medium text-brand-blueink hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue" href="/classroom?q={{ course.id | urlencode }}">{{ course.name or course.id }}</a><p class="font-mono text-xs text-brand-blueink">{{ course.id }} · {{ course.state_label }}</p></li>{% endfor %}</ul>
+      {% else %}<p class="mt-3 text-sm text-brand-blueink">No teaching courses found.</p>{% endif %}
+    </div>
+    <div class="rounded-xl border border-brand-gray/30 bg-paper/60 p-4">
+      <h4 class="font-serif text-lg text-brand-black">Enrolled</h4>
+      <p class="text-xs text-brand-blueink">{{ enrolled | length }} course{{ "" if enrolled | length == 1 else "s" }} shown</p>
+      {% if enrolled %}
+      <ul class="mt-3 max-h-64 divide-y divide-brand-gray/20 overflow-y-auto">{% for course in enrolled %}<li class="py-2"><a class="text-sm font-medium text-brand-blueink hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue" href="/classroom?q={{ course.id | urlencode }}">{{ course.name or course.id }}</a><p class="font-mono text-xs text-brand-blueink">{{ course.id }} · {{ course.state_label }}</p></li>{% endfor %}</ul>
+      {% else %}<p class="mt-3 text-sm text-brand-blueink">No enrolled courses found.</p>{% endif %}
+    </div>
+  </div>
+  {% if teaching | length >= 50 or enrolled | length >= 50 %}<p class="text-xs text-brand-blueink">Showing the first 50 results in each role. Use the Classroom course search for a specific course.</p>{% endif %}
+</section>
