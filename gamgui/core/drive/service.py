@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from typing import Awaitable, Callable, Optional, Protocol
 from ..audit import AuditLog
 from ..gam.commands import GAMCommands
 from ..gam.runner import GAMRunner
+from ..processes import current_process_identity
 from .client import DriveAPIClient, MAX_PREVIEW_BYTES
 from .models import (
     DriveFile,
@@ -128,6 +130,8 @@ class DriveService:
         self.audit = audit or AuditLog()
         self.resolver = resolver
         self.operations = operations or DriveOperationStore()
+        self._operation_owner = f"{os.getpid()}:{secrets.token_urlsafe(12)}"
+        self._operation_identity = current_process_identity()
 
     async def list_owned_files(
         self,
@@ -172,6 +176,20 @@ class DriveService:
             )
         if principal_type == "user" and not principal.active:
             raise DriveSafetyError("The destination user is suspended.")
+        return principal
+
+    async def _internal_source_user(self, email: str) -> InternalPrincipal:
+        """Resolve an existing internal owner without requiring the source to be active."""
+
+        if self.resolver is None:
+            raise DriveSafetyError(
+                "Directory verification is unavailable; reconnect the domain."
+            )
+        principal = await self.resolver.resolve(email.strip(), "user")
+        if principal is None:
+            raise DriveSafetyError(
+                "The source owner was not found in the Workspace directory."
+            )
         return principal
 
     async def update_metadata(
@@ -438,7 +456,30 @@ class DriveService:
                 destination=destination_user.email,
                 detail=str(exc),
             )
-        verified = await self.client.get_file(destination_user.email, live.id)
+        try:
+            verified = await self.client.get_file(destination_user.email, live.id)
+        except Exception:
+            detail = (
+                "GAM completed, but ownership verification was unavailable. "
+                "Review the file in Drive before retrying."
+            )
+            self.audit.record(
+                "drive_transfer_ownership",
+                target=live.id,
+                argv=argv,
+                ok=False,
+                actor=source,
+                extra={
+                    "destination": destination_user.email,
+                    "error": "Verification unavailable after GAM success.",
+                },
+            )
+            return TransferResult(
+                ok=False,
+                file_id=live.id,
+                destination=destination_user.email,
+                detail=detail,
+            )
         if verified.owner_email.lower() != destination_user.email.lower():
             detail = "GAM completed, but the new owner could not be verified."
             self.audit.record(
@@ -499,6 +540,11 @@ class DriveService:
                     cursor=cursor,
                     page_size=50,
                 )
+                if page.incomplete_search:
+                    raise DriveSafetyError(
+                        "Drive returned an incomplete folder listing. "
+                        "No ownership manifest was created; retry after Drive finishes indexing."
+                    )
                 for item in page.items:
                     if item.id in seen:
                         continue
@@ -618,7 +664,7 @@ class DriveService:
         return manifest
 
     async def _claim_one(self, target: OperationTarget, teacher: str) -> TransferResult:
-        owner = await self._internal(target.source_owner, "user")
+        owner = await self._internal_source_user(target.source_owner)
         live = await self.client.get_file(teacher, target.file_id)
         if live.is_shared_drive:
             raise DriveSafetyError("Shared Drive content cannot be claimed.")
@@ -643,8 +689,42 @@ class DriveService:
                 extra={"previous_owner": owner.email, "error": str(exc)},
             )
             return TransferResult(False, live.id, teacher, detail=str(exc))
-        verified = await self.client.get_file(teacher, live.id)
+        try:
+            verified = await self.client.get_file(teacher, live.id)
+        except Exception:
+            detail = (
+                "GAM completed, but teacher ownership verification was unavailable. "
+                "Review the file in Drive before retrying."
+            )
+            self.audit.record(
+                "drive_claim_ownership",
+                target=live.id,
+                argv=argv,
+                ok=False,
+                actor=teacher,
+                extra={
+                    "previous_owner": owner.email,
+                    "error": "Verification unavailable after GAM success.",
+                },
+            )
+            return TransferResult(
+                False,
+                live.id,
+                teacher,
+                detail=detail,
+            )
         if verified.owner_email.lower() != teacher.lower():
+            self.audit.record(
+                "drive_claim_ownership",
+                target=live.id,
+                argv=argv,
+                ok=False,
+                actor=teacher,
+                extra={
+                    "previous_owner": owner.email,
+                    "error": "Post-transfer ownership verification failed.",
+                },
+            )
             return TransferResult(
                 False,
                 live.id,
@@ -668,15 +748,14 @@ class DriveService:
             residual_access=residual,
         )
 
-    async def apply_manifest(
+    def claim_manifest(
         self,
         operation_id: str,
         *,
         confirmation: str,
-        progress: Optional[
-            Callable[[int, int, OperationTarget], Awaitable[None]]
-        ] = None,
     ) -> OperationManifest:
+        """Validate and atomically claim a manifest before any background task is created."""
+
         manifest = self.operations.get(operation_id, self.domain)
         if manifest is None:
             raise DriveSafetyError(
@@ -688,14 +767,97 @@ class DriveService:
             )
         if len(manifest.targets) > MANIFEST_CAP:
             raise DriveSafetyError("The manifest exceeds the 500-file safety cap.")
+        if manifest.status == "running":
+            raise DriveSafetyError("That ownership manifest is already running.")
+        if not any(target.status != "succeeded" for target in manifest.targets):
+            self.operations.set_operation_status(
+                operation_id,
+                self.domain,
+                "completed",
+                owner_id=self._operation_owner,
+            )
+            return self.operations.get(operation_id, self.domain)
+        if not self.operations.claim_operation(
+            operation_id,
+            self.domain,
+            owner_id=self._operation_owner,
+            owner_pid=os.getpid(),
+            owner_identity=self._operation_identity,
+        ):
+            current = self.operations.get(operation_id, self.domain)
+            if current is not None and current.status == "running":
+                raise DriveSafetyError(
+                    "That ownership manifest is already running."
+                )
+            raise DriveSafetyError(
+                "That ownership manifest is not eligible to run. Refresh and review it again."
+            )
+        return self.operations.get(operation_id, self.domain)
+
+    def interrupt_manifest_claim(self, operation_id: str) -> None:
+        """Release this service's claim when task creation fails before execution starts."""
+
+        self.operations.set_operation_status(
+            operation_id,
+            self.domain,
+            "interrupted",
+            owner_id=self._operation_owner,
+        )
+
+    async def apply_manifest(
+        self,
+        operation_id: str,
+        *,
+        confirmation: str,
+        claimed: bool = False,
+        progress: Optional[
+            Callable[[int, int, OperationTarget], Awaitable[None]]
+        ] = None,
+    ) -> OperationManifest:
+        if claimed:
+            manifest = self.operations.get(operation_id, self.domain)
+            if (
+                manifest is None
+                or manifest.status != "running"
+                or not self.operations.owns_claim(
+                    operation_id,
+                    self.domain,
+                    self._operation_owner,
+                )
+            ):
+                raise DriveSafetyError(
+                    "That ownership manifest does not have an active execution claim."
+                )
+            if confirmation.strip().lower() != manifest.destination.lower():
+                raise DriveSafetyError(
+                    "Type the exact destination email to confirm this manifest."
+                )
+            if len(manifest.targets) > MANIFEST_CAP:
+                raise DriveSafetyError("The manifest exceeds the 500-file safety cap.")
+        else:
+            manifest = self.claim_manifest(
+                operation_id,
+                confirmation=confirmation,
+            )
         pending = [t for t in manifest.targets if t.status != "succeeded"]
         if not pending:
             return manifest
-        self.operations.set_operation_status(operation_id, self.domain, "running")
         try:
             for index, target in enumerate(pending, start=1):
+                if not self.operations.owns_claim(
+                    operation_id,
+                    self.domain,
+                    self._operation_owner,
+                ):
+                    raise DriveSafetyError(
+                        "The Drive operation lease was lost; no further files were changed."
+                    )
                 self.operations.set_target_status(
-                    operation_id, self.domain, target.file_id, "running"
+                    operation_id,
+                    self.domain,
+                    target.file_id,
+                    "running",
+                    owner_id=self._operation_owner,
                 )
                 try:
                     if manifest.kind == "folder_transfer":
@@ -717,6 +879,7 @@ class DriveService:
                         status,
                         error="" if result.ok else result.detail,
                         residual_access=result.residual_access,
+                        owner_id=self._operation_owner,
                     )
                 except asyncio.CancelledError:
                     self.operations.set_target_status(
@@ -725,6 +888,7 @@ class DriveService:
                         target.file_id,
                         "interrupted",
                         error="Application stopped before this file completed.",
+                        owner_id=self._operation_owner,
                     )
                     raise
                 except Exception as exc:
@@ -734,6 +898,7 @@ class DriveService:
                         target.file_id,
                         "failed",
                         error=str(exc),
+                        owner_id=self._operation_owner,
                     )
                 if progress is not None:
                     current = self.operations.get(operation_id, self.domain)
@@ -744,7 +909,10 @@ class DriveService:
                     await progress(index, len(pending), refreshed)
         except asyncio.CancelledError:
             self.operations.set_operation_status(
-                operation_id, self.domain, "interrupted"
+                operation_id,
+                self.domain,
+                "interrupted",
+                owner_id=self._operation_owner,
             )
             raise
         final = self.operations.get(operation_id, self.domain)
@@ -753,5 +921,10 @@ class DriveService:
             if final is not None and all(t.status == "succeeded" for t in final.targets)
             else "partial"
         )
-        self.operations.set_operation_status(operation_id, self.domain, status)
+        self.operations.set_operation_status(
+            operation_id,
+            self.domain,
+            status,
+            owner_id=self._operation_owner,
+        )
         return self.operations.get(operation_id, self.domain)

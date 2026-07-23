@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from typing import Dict, List, Optional, Sequence
 
@@ -106,6 +107,14 @@ class FakeClassroomConnector:
         if student:
             return values if student in {"student1@example.com", "student2@example.com"} else []
         return values
+
+    async def refresh_course_index(self, index) -> int:
+        self.calls.append(("refresh_course_index",))
+        return await asyncio.to_thread(
+            index.replace_all,
+            self.domain,
+            self.courses.values(),
+        )
 
     async def get_course(self, course_id: str) -> CourseDetail:
         self.calls.append(("get_course", course_id))

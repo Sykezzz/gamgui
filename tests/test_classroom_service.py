@@ -28,6 +28,7 @@ def classroom(tmp_path):
 async def test_refresh_builds_index_and_search_does_not_call_gam(classroom):
     service, connector, _, _ = classroom
     assert await service.refresh_index() == 1
+    assert connector.calls == [("refresh_course_index",)]
     connector.calls.clear()
 
     page = await service.search("English")
@@ -91,6 +92,26 @@ async def test_owner_transfer_requires_active_user_and_verifies_result(classroom
         await service.prepare_owner_transfer("123", "newowner@example.com")
 
 
+async def test_owner_transfer_fails_closed_when_live_owner_is_missing(classroom):
+    service, connector, _, _ = classroom
+    original = connector.transfer_course_owner
+
+    async def transfer_without_verifiable_owner(course_id, target_email):
+        result = await original(course_id, target_email)
+        connector.courses[course_id] = replace(
+            connector.courses[course_id],
+            owner_email="",
+            owner_id="",
+        )
+        return result
+
+    connector.transfer_course_owner = transfer_without_verifiable_owner
+    result, current = await service.transfer_owner("123", "newowner@example.com")
+    assert not result.ok
+    assert current.owner_email == ""
+    assert "did not show the new owner" in result.detail
+
+
 async def test_owner_teacher_cannot_be_removed(classroom):
     service, connector, _, _ = classroom
     with pytest.raises(ClassroomValidationError, match="owner cannot be removed"):
@@ -106,6 +127,34 @@ async def test_owner_removal_guard_falls_back_to_owner_id(classroom):
     with pytest.raises(ClassroomValidationError, match="owner cannot be removed"):
         await service.remove_member("123", "teachers", "teacher@example.com")
     assert not any(call[0] == "remove_course_participant" for call in connector.calls)
+
+
+@pytest.mark.parametrize(
+    "tampered_value",
+    [
+        "owner-1",
+        "not-a-member@example.com",
+        "$(touch nope)",
+    ],
+)
+async def test_remove_member_requires_exact_live_roster_email(
+    classroom,
+    tampered_value,
+):
+    service, connector, _, _ = classroom
+    with pytest.raises(
+        ClassroomValidationError,
+        match="current roster member|not a current member",
+    ):
+        await service.remove_member(
+            "123",
+            "teachers",
+            tampered_value,
+        )
+    assert not any(
+        call[0] == "remove_course_participant"
+        for call in connector.calls
+    )
 
 
 async def test_exact_roster_plan_persists_diff_and_enforces_cap(classroom):
@@ -179,6 +228,57 @@ async def test_partial_apply_records_residual_drift(classroom):
     assert result.status == "partial"
     assert result.failed_count == 1
     assert result.residual == ("remove:student1@example.com",)
+
+
+async def test_failed_addition_prevents_all_roster_removals(classroom):
+    service, connector, _, _ = classroom
+    connector.fail_for.add("student3@example.com")
+    manifest = await service.plan_roster(
+        "123",
+        "students",
+        ["student2@example.com", "student3@example.com"],
+    )
+    result = await service.apply_manifest(manifest.id)
+    assert result.status == "partial"
+    assert not any(
+        call[0] == "remove_course_participant"
+        for call in connector.calls
+    )
+    skipped = next(
+        target
+        for target in result.targets
+        if target.action == "remove"
+    )
+    assert skipped.status == "failed"
+    assert "No removals were attempted" in skipped.detail
+    assert {
+        member.email
+        for member in connector.rosters[("123", "students")]
+    } == {"student1@example.com", "student2@example.com"}
+
+
+async def test_post_apply_verification_failure_never_leaves_manifest_running(classroom):
+    service, connector, _, manifests = classroom
+    manifest = await service.plan_roster(
+        "123",
+        "students",
+        ["student2@example.com", "student3@example.com"],
+    )
+    original = connector.list_course_participants
+    calls = 0
+
+    async def fail_verification(course_id, role):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await original(course_id, role)
+        raise RuntimeError("verification unavailable")
+
+    connector.list_course_participants = fail_verification
+    result = await service.apply_manifest(manifest.id)
+    assert result.status == "failed"
+    assert "Post-operation verification failed" in result.error
+    assert manifests.get(manifest.id).status == "failed"
 
 
 async def test_suspended_and_archived_courses_block_roster_changes(classroom):

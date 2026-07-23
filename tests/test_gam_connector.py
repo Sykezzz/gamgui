@@ -95,12 +95,25 @@ async def test_get_signature(connector):
     assert "Best," in sig
 
 
-async def test_usage_report(connector):
+async def test_usage_report_is_bounded_and_reduced_off_event_loop(
+    connector, monkeypatch
+):
+    import gamgui.core.connectors.gam_connector as connector_module
     from gamgui.core.reports import USAGE_PARAMS
 
-    data = await connector.usage_report(USAGE_PARAMS)
-    assert data["rows"]  # mock returns rows for the first date tried
-    assert "bob@example.com" in {r.get("email") for r in data["rows"]}
+    caller_thread = threading.get_ident()
+    worker_threads = []
+    real_reduce = connector_module._bounded_usage_rows
+
+    def tracked_reduce(path, limit):
+        worker_threads.append(threading.get_ident())
+        return real_reduce(path, limit)
+
+    monkeypatch.setattr(connector_module, "_bounded_usage_rows", tracked_reduce)
+    data = await connector.usage_report(USAGE_PARAMS, limit=1)
+    assert len(data["rows"]) == 1  # reducer retains only the bounded working set
+    assert data["rows"][0].get("email") == "bob@example.com"
+    assert worker_threads and all(thread_id != caller_thread for thread_id in worker_threads)
 
 
 async def test_list_user_groups(connector):

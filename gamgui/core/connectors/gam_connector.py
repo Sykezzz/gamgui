@@ -8,12 +8,18 @@ The rest of the app talks to this object and never sees GAM syntax.
 from __future__ import annotations
 
 import asyncio
+import csv
+import heapq
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Sequence
+from pathlib import Path
+from typing import Iterator, List, Optional, Sequence, Set, Tuple
 
 from ..audit import AuditLog
-from ..directory_index import DirectoryIndex
-from ..gam.commands import GAMCommands, build_user_query
+from ..classroom.index import CourseIndex
+from ..classroom.models import CourseDetail, CourseParticipant, CourseSummary
+from ..directory_index import DirectoryIndex, Page
+from ..gam.commands import GAMCommands, SIGNATURE_USER_FIELDS, build_user_query
 from ..gam.errors import GAMErrorKind
 from ..gam.models import (
     CalendarACL,
@@ -25,7 +31,6 @@ from ..gam.models import (
     UserCalendar,
     Vacation,
 )
-from ..classroom.models import CourseDetail, CourseParticipant, CourseSummary
 from ..calendar_index import IndexedCalendar
 from ..gam.parser import iter_records_file, parse_one, parse_records
 from ..gam.runner import GAMRunner
@@ -40,15 +45,6 @@ from .base import (
     RiskLevel,
 )
 from .person import ConnectorAccount, Person
-
-
-def _csv_from(out: str) -> str:
-    """Drop GAM progress lines before the CSV header (`gam report` prints status text first)."""
-    lines = (out or "").splitlines()
-    for i, ln in enumerate(lines):
-        if ln.lstrip().lower().startswith("email,"):
-            return "\n".join(lines[i:])
-    return out or ""
 
 
 def _parse_signature(text: str) -> str:
@@ -71,6 +67,170 @@ def _parse_signature(text: str) -> str:
     return "" if sig in ("", "None") else sig
 
 
+def _usage_quota(row: dict) -> int:
+    try:
+        return int(float(row.get("accounts:used_quota_in_mb") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded_usage_rows(path: Path, limit: int) -> List[dict]:
+    """Read only the largest usage rows from a GAM CSV spool.
+
+    ``gam report`` can print progress text before its CSV header, so scan to the allowlisted
+    ``email`` header first. The heap keeps memory proportional to the UI bound, not tenant size.
+    """
+
+    cap = max(1, min(int(limit), 100))
+    with Path(path).open("r", encoding="utf-8", errors="replace", newline="") as source:
+        header = ""
+        for line in source:
+            if line.lstrip().lower().startswith("email,"):
+                header = line
+                break
+        if not header:
+            return []
+        fieldnames = next(csv.reader([header]))
+        rows = csv.DictReader(source, fieldnames=fieldnames)
+        return heapq.nlargest(cap, rows, key=_usage_quota)
+
+
+_GROUP_MEMBER_FIELDS = ("email", "role", "type", "status")
+_GROUP_MEMBER_PAGE_SIZE = 50
+_SIGNATURE_LARGE_SCOPES = {"company", "group", "ou", "department", "location"}
+
+
+class _CourseRefreshCancelled(RuntimeError):
+    """Internal signal used to roll back an in-flight streamed index refresh."""
+
+
+def _course_summaries_from_spool(
+    path: Path,
+    cancelled: threading.Event,
+) -> Iterator[CourseSummary]:
+    for record in iter_records_file(path):
+        if cancelled.is_set():
+            raise _CourseRefreshCancelled
+        yield CourseSummary.from_json(record)
+    if cancelled.is_set():
+        raise _CourseRefreshCancelled
+
+
+def _replace_course_index_from_spool(
+    index: CourseIndex,
+    domain: str,
+    path: Path,
+    cancelled: threading.Event,
+) -> int:
+    return index.replace_all(
+        domain,
+        _course_summaries_from_spool(path, cancelled),
+    )
+
+
+def _bounded_text(value: object, limit: int) -> str:
+    return str(value or "").strip()[: max(0, int(limit))]
+
+
+def _safe_email(value: object) -> str:
+    email = str(value or "").strip()
+    if len(email) > 254 or "@" not in email or any(ch.isspace() for ch in email):
+        return ""
+    return email
+
+
+def _bounded_group_member(record: dict) -> Optional[GroupMember]:
+    member = GroupMember.from_json(record)
+    email = _safe_email(member.email)
+    if not email:
+        return None
+    return GroupMember(
+        email=email,
+        role=_bounded_text(member.role, 32).upper() or "MEMBER",
+        member_type=_bounded_text(member.member_type, 32).upper() or "USER",
+        status=_bounded_text(member.status, 64),
+    )
+
+
+def _read_group_member_spool(
+    path: Path,
+    limit: Optional[int],
+) -> Tuple[List[GroupMember], int]:
+    """Reduce a private GAM spool to bounded, display-safe membership summaries."""
+
+    cap = None if limit is None else max(1, min(int(limit), _GROUP_MEMBER_PAGE_SIZE))
+    items: List[GroupMember] = []
+    total = 0
+    for record in iter_records_file(path):
+        member = _bounded_group_member(record)
+        if member is None:
+            continue
+        total += 1
+        if cap is None or len(items) < cap:
+            items.append(member)
+    return items, total
+
+
+def _read_group_member_emails(path: Path) -> Set[str]:
+    emails: Set[str] = set()
+    for record in iter_records_file(path):
+        member = _bounded_group_member(record)
+        if member is not None:
+            emails.add(member.email.casefold())
+    return emails
+
+
+def _bounded_signature_user(record: dict) -> Optional[GAMUser]:
+    user = GAMUser.from_json(record)
+    email = _safe_email(user.primary_email)
+    if not email:
+        return None
+    # Drop ``raw`` and clamp every variable-bearing field. The source spool is already projected to
+    # SIGNATURE_USER_FIELDS; these response/application bounds keep one malformed directory profile
+    # from producing an oversized preview or mutation.
+    return GAMUser(
+        primary_email=email,
+        given_name=_bounded_text(user.given_name, 100),
+        family_name=_bounded_text(user.family_name, 100),
+        suspended=bool(user.suspended),
+        org_unit_path=_bounded_text(user.org_unit_path or "/", 512) or "/",
+        title=_bounded_text(user.title, 128),
+        department=_bounded_text(user.department, 128),
+        location=_bounded_text(user.location, 256),
+        phone=_bounded_text(user.phone, 64),
+    )
+
+
+def _read_signature_user_spool(
+    path: Path,
+    scope_type: str,
+    scope_value: str,
+    group_emails: Optional[Set[str]] = None,
+) -> List[GAMUser]:
+    value = (scope_value or "").strip()
+    folded = value.casefold()
+    ou_prefix = value.rstrip("/") + "/"
+    membership = group_emails or set()
+    users: List[GAMUser] = []
+    for record in iter_records_file(path):
+        user = _bounded_signature_user(record)
+        if user is None or user.suspended:
+            continue
+        if scope_type == "group":
+            matches = user.primary_email.casefold() in membership
+        elif scope_type == "ou":
+            matches = user.org_unit_path == value or user.org_unit_path.startswith(ou_prefix)
+        elif scope_type == "department":
+            matches = user.department.strip().casefold() == folded
+        elif scope_type == "location":
+            matches = user.location.strip().casefold() == folded
+        else:
+            matches = scope_type == "company"
+        if matches:
+            users.append(user)
+    return users
+
+
 class GAMConnector(Connector):
     id = ConnectorID.GOOGLE_WORKSPACE
     capabilities = {
@@ -78,6 +238,7 @@ class GAMConnector(Connector):
         Capability.GROUPS,
         Capability.MAIL,
         Capability.CLASSROOM,
+        Capability.DRIVE,
     }
 
     def __init__(self, runner: GAMRunner, domain: str, audit: Optional[AuditLog] = None) -> None:
@@ -115,9 +276,11 @@ class GAMConnector(Connector):
 
     async def refresh_directory_users(self, index: DirectoryIndex) -> int:
         """Spool a full user export and atomically replace the local summary index."""
+        from ..gam.commands import DIRECTORY_INDEX_FIELDS
+
         if index.domain != self.domain.strip().lower():
             raise ValueError("directory index domain does not match connector domain")
-        argv = GAMCommands.print_users()
+        argv = GAMCommands.print_users(fields=DIRECTORY_INDEX_FIELDS)
         async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
             return await asyncio.to_thread(
                 index.replace_users,
@@ -141,9 +304,87 @@ class GAMConnector(Connector):
             )
 
     async def list_group_members(self, group: str) -> List[GroupMember]:
-        argv = GAMCommands.print_group_members(group)
-        stdout = await self.runner.run_authenticated(self.domain, argv)
-        return [GroupMember.from_json(r) for r in parse_records(stdout)]
+        """Return all members for non-UI workflows through a private streamed spool."""
+
+        argv = GAMCommands.print_group_members(group, fields=_GROUP_MEMBER_FIELDS)
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            members, _ = await asyncio.to_thread(
+                _read_group_member_spool,
+                result.path,
+                None,
+            )
+        return members
+
+    async def list_group_members_page(
+        self,
+        group: str,
+        limit: int = _GROUP_MEMBER_PAGE_SIZE,
+    ) -> Page[GroupMember]:
+        """Return only the first 50 members while counting the streamed source.
+
+        The entire GAM response goes to the runner's owner-only temporary spool, and parsing runs
+        off the event loop. Only bounded summaries survive cleanup or reach the template.
+        """
+
+        cap = max(1, min(int(limit), _GROUP_MEMBER_PAGE_SIZE))
+        argv = GAMCommands.print_group_members(group, fields=_GROUP_MEMBER_FIELDS)
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            members, total = await asyncio.to_thread(
+                _read_group_member_spool,
+                result.path,
+                cap,
+            )
+        return Page(
+            items=members,
+            next_cursor=None,
+            total=total,
+            snapshot_age_seconds=None,
+            refreshing=False,
+        )
+
+    async def list_signature_scope_users(
+        self,
+        scope_type: str,
+        scope_value: str = "",
+    ) -> List[GAMUser]:
+        """Resolve a non-single-user signature scope without buffering GAM stdout.
+
+        Exact users intentionally use :meth:`get_user` in the route. Tenant-scale scopes spool only
+        the fields the signature renderer consumes and perform all parsing/filtering in a worker
+        thread. Group scope first reduces a separately spooled membership export to email keys.
+        """
+
+        scope = (scope_type or "").strip().lower()
+        value = (scope_value or "").strip()
+        if scope not in _SIGNATURE_LARGE_SCOPES:
+            raise ValueError("unsupported signature scope")
+        if scope != "company" and not value:
+            raise ValueError("signature scope value is required")
+
+        group_emails: Optional[Set[str]] = None
+        if scope == "group":
+            member_argv = GAMCommands.print_group_members(value, fields=("email",))
+            async with self.runner.run_authenticated_to_file(
+                self.domain,
+                member_argv,
+            ) as member_result:
+                group_emails = await asyncio.to_thread(
+                    _read_group_member_emails,
+                    member_result.path,
+                )
+
+        user_argv = GAMCommands.print_users(fields=SIGNATURE_USER_FIELDS)
+        async with self.runner.run_authenticated_to_file(
+            self.domain,
+            user_argv,
+        ) as user_result:
+            return await asyncio.to_thread(
+                _read_signature_user_spool,
+                user_result.path,
+                scope,
+                value,
+                group_emails,
+            )
 
     async def list_delegates(self, email: str) -> List[str]:
         """Return the email addresses delegated access to ``email``'s mailbox."""
@@ -168,6 +409,45 @@ class GAMConnector(Connector):
         )
         stdout = await self.runner.run_authenticated(self.domain, argv)
         return [CourseDetail.from_json(record) for record in parse_records(stdout)]
+
+    async def refresh_course_index(self, index: CourseIndex) -> int:
+        """Stream the tenant-wide cheap course projection into ``index`` off-loop."""
+
+        argv = GAMCommands.print_courses()
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            cancelled = threading.Event()
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    _replace_course_index_from_spool,
+                    index,
+                    self.domain,
+                    result.path,
+                    cancelled,
+                )
+            )
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError as cancellation:
+                cancelled.set()
+                # Keep the runner's private spool alive until the worker closes it and SQLite has
+                # rolled back. Repeated cancellation must not race secure spool cleanup on Windows.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                    except Exception:
+                        # The result is consumed below after the worker has closed the spool.
+                        break
+                try:
+                    worker.result()
+                except _CourseRefreshCancelled:
+                    pass
+                except Exception:
+                    # Cancellation remains the public result; retrieving the exception prevents an
+                    # unobserved-task warning while the transactional index keeps its old snapshot.
+                    pass
+                raise cancellation
 
     async def get_course(self, course_id: str) -> CourseDetail:
         stdout = await self.runner.run_authenticated(
@@ -290,13 +570,27 @@ class GAMConnector(Connector):
         out = await self.runner.run_authenticated(self.domain, GAMCommands.print_groups_member(email))
         return [str(r.get("email")) for r in parse_records(out) if r.get("email") and "@" in str(r.get("email"))]
 
-    async def usage_report(self, params: Sequence[str], max_lookback: int = 6) -> dict:
-        """Per-user usage (storage/mail/drive). Usage lags ~2-3 days, so walk back to a date with data."""
+    async def usage_report(
+        self,
+        params: Sequence[str],
+        max_lookback: int = 6,
+        limit: int = 25,
+    ) -> dict:
+        """Return a bounded usage leaderboard from a private streamed GAM spool.
+
+        Usage data lags roughly 2â€“3 days, so walk backward to the first date with data. GAM still
+        produces a tenant report, but stdout is never buffered in the process and CSV reduction is
+        performed off the event loop while the runner owns secure spool cleanup.
+        """
+
         today = datetime.now(timezone.utc).date()
         for back in range(2, 2 + max_lookback):
             date = (today - timedelta(days=back)).isoformat()
-            out = await self.runner.run_authenticated(self.domain, GAMCommands.report_users(date, params))
-            rows = parse_records(_csv_from(out))
+            async with self.runner.run_authenticated_to_file(
+                self.domain,
+                GAMCommands.report_users(date, params),
+            ) as result:
+                rows = await asyncio.to_thread(_bounded_usage_rows, result.path, limit)
             if rows:
                 return {"date": date, "rows": rows}
         return {"date": "", "rows": []}

@@ -30,6 +30,7 @@ class Capability(enum.Enum):
     GROUPS = "groups"
     MAIL = "mail"
     CLASSROOM = "classroom"
+    DRIVE = "drive"
     MDM = "mdm"
     TELEPHONY = "telephony"
 

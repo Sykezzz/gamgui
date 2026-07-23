@@ -22,6 +22,14 @@
     </div>
   {% else %}
     <div class="border-t border-brand-gray/30 pt-4 space-y-3">
+      {% if result.missing_feature_scopes %}
+        <p class="text-sm text-brand-blueink/80">Add only these missing scopes to the existing delegation entry:</p>
+        <div class="copy-wrap flex items-start gap-2 rounded-lg bg-paper border border-brand-gray/40 p-2.5">
+          <code class="flex-1 overflow-x-auto whitespace-pre-wrap break-all text-[12px] text-ink">{{ result.missing_feature_scopes | join(",") }}</code>
+          <button type="button" onclick="copyEl(this)"
+                  class="copy-btn shrink-0 rounded-md border border-brand-gray/60 px-2.5 py-1 text-xs font-medium text-brand-blueink hover:bg-brand-gray/10 transition-colors">Copy</button>
+        </div>
+      {% endif %}
       {% if result.auth_url %}
         <p class="text-sm text-brand-blueink/80">Authorize the service account in the Admin Console, then verify again:</p>
         <a href="{{ result.auth_url }}" target="_blank" rel="noopener"

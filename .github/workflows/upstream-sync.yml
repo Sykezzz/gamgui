@@ -1,0 +1,101 @@
+name: Sync upstream GamGUI
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: district-maintenance
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: district-main
+          fetch-depth: 0
+      - name: Mirror upstream main without force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh repo sync "$GITHUB_REPOSITORY" -b main --source goetchstone/gamgui
+      - name: Build conflict-free integration candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main district-main
+          if git merge-base --is-ancestor origin/main origin/district-main; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPSTREAM_SHORT="$(git rev-parse --short=12 origin/main)"
+          DISTRICT_SHORT="$(git rev-parse --short=12 origin/district-main)"
+          BRANCH="automation/upstream-${UPSTREAM_SHORT}-${DISTRICT_SHORT}"
+          git checkout -B "$BRANCH" origin/district-main
+          if ! git merge --no-edit origin/main; then
+            git merge --abort
+            TITLE="Upstream sync blocked"
+            BODY="The upstream \`main\` commit \`$UPSTREAM_SHORT\` conflicts with \`district-main\`. No branch was advanced."
+            NUMBER="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
+            if [ -n "$NUMBER" ]; then
+              gh issue comment "$NUMBER" --body "$BODY"
+            else
+              gh issue create --title "$TITLE" --body "$BODY"
+            fi
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$BRANCH"
+          PR="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+          if [ -z "$PR" ]; then
+            PR="$(gh pr create --base district-main --head "$BRANCH" \
+              --title "chore: integrate upstream ${UPSTREAM_SHORT}" \
+              --body "Automated conflict-free integration of goetchstone/gamgui main. CI and exact-SHA post-merge validation remain mandatory.")"
+          fi
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh pr merge "$PR" --auto --merge --delete-branch
+          MERGED_SHA=""
+          for _ in $(seq 1 120); do
+            STATE="$(gh pr view "$PR" --json state --jq .state)"
+            if [ "$STATE" = "MERGED" ]; then
+              MERGED_SHA="$(gh pr view "$PR" --json mergeCommit --jq .mergeCommit.oid)"
+              break
+            fi
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "Integration PR closed without merging." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          if [ -z "$MERGED_SHA" ]; then
+            echo "Timed out waiting for required checks and auto-merge." >&2
+            exit 1
+          fi
+          gh workflow run post-merge-validation.yml --ref district-main -f sha="$MERGED_SHA"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+      - name: Report blocked upstream integration
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Upstream sync blocked"
+          BODY="The automated upstream integration failed before validated completion. Nothing was force-synced or installed. Run: $RUN_URL"
+          NUMBER="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$NUMBER" ]; then
+            gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi

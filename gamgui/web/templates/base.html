@@ -14,15 +14,16 @@
   <div id="busy" aria-live="polite"><span class="spinner"></span><span>Working…</span></div>
   <div class="min-h-full">
     <header class="border-b border-brand-gray/40 bg-brand-white/80 backdrop-blur">
-      <div class="mx-auto {{ self.container_class() }} px-6 py-4 flex items-center gap-4">
+      <div class="mx-auto {{ self.container_class() }} px-6 py-4 flex flex-wrap items-start gap-4">
         <a href="/" class="wordmark font-serif text-lg text-brand-black">GamGUI</a>
         <span class="h-4 w-px bg-brand-gray/60"></span>
         <span class="eyebrow text-brand-blueink">Console</span>
-        <nav class="ml-auto text-sm flex items-center gap-5 text-brand-blueink/80"
+        <nav class="basis-full text-sm flex flex-wrap items-center gap-x-4 gap-y-2 text-brand-blueink/80 sm:basis-auto sm:ml-auto sm:justify-end"
              hx-boost="true" hx-target="#app-main" hx-select="#app-main"
              hx-swap="outerHTML show:top" hx-push-url="true">
           <a class="hover:text-brand-black transition-colors" href="/">Home</a>
           <a class="hover:text-brand-black transition-colors" href="/users">Users</a>
+          <a class="hover:text-brand-black transition-colors" href="/classroom">Classroom</a>
           <a class="hover:text-brand-black transition-colors" href="/groups">Groups</a>
           <a class="hover:text-brand-black transition-colors" href="/signatures">Signatures</a>
           <a class="hover:text-brand-black transition-colors" href="/calendars">Calendars</a>
@@ -34,6 +35,12 @@
         </nav>
       </div>
     </header>
+    {% set update_notice = local_update_notice() %}
+    {% if update_notice %}
+      <div role="status" class="border-b border-amber-300 bg-amber-50 px-6 py-2 text-center text-sm text-amber-900">
+        {{ update_notice }}
+      </div>
+    {% endif %}
     <main id="app-main" tabindex="-1" class="mx-auto {% block container_class %}max-w-5xl{% endblock %} px-6 py-10">
       {% block content %}{% endblock %}
     </main>

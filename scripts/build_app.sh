@@ -21,8 +21,8 @@ if [ ! -x "gamgui/resources/gam7/gam" ]; then
   ./scripts/fetch_gam.sh
 fi
 
-echo "==> Installing PyInstaller (and the native window) into the venv..."
-"$PY" -m pip install -q --upgrade pyinstaller "pywebview>=5.1"
+echo "==> Verifying locked build dependencies..."
+"$PY" -c "import PyInstaller, webview"
 
 echo "==> Building..."
 "$PY" -m PyInstaller --noconfirm --clean gamgui.spec

@@ -22,8 +22,13 @@
       <input name="{{ slot.key }}" value="{{ val }}" autocomplete="off"
              placeholder="{{ slot.placeholder or ('group@domain' if slot.kind.value == 'group' else 'user@domain') }}"
              class="upick {{ fld }} border-dashed border-brand-blue/50"
-             data-kind="{{ 'groups' if slot.kind.value == 'group' else 'users' }}" />
-      <div class="upick-menu hidden absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"></div>
+             data-kind="{{ 'groups' if slot.kind.value == 'group' else 'users' }}"
+             role="combobox" aria-autocomplete="list" aria-expanded="false"
+             hx-get="/builder/pick?kind={{ 'groups' if slot.kind.value == 'group' else 'users' }}"
+             hx-trigger="input changed delay:300ms, focus"
+             hx-target="next .upick-menu" hx-swap="innerHTML" hx-sync="this:replace" />
+      <div class="upick-menu hidden absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"
+           role="listbox" aria-label="{{ slot.label }} suggestions"></div>
     </span>
     <span class="text-[11px] text-brand-gray">click and type a {{ 'group' if slot.kind.value == 'group' else 'user' }} — pick from the list</span>
     {% else %}
@@ -47,8 +52,13 @@
     <div class="mt-2 grid gap-2 sm:grid-cols-2">
       <span class="upick-wrap relative block">
         <input name="td_user" placeholder="owner email — whose Drive (blank = admin's)" autocomplete="off"
-               class="upick {{ fld }} border-dashed border-brand-blue/50" data-kind="users" />
-        <div class="upick-menu hidden absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"></div>
+               class="upick {{ fld }} border-dashed border-brand-blue/50" data-kind="users"
+               role="combobox" aria-autocomplete="list" aria-expanded="false"
+               hx-get="/builder/pick?kind=users"
+               hx-trigger="input changed delay:300ms, focus"
+               hx-target="next .upick-menu" hx-swap="innerHTML" hx-sync="this:replace" />
+        <div class="upick-menu hidden absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"
+             role="listbox" aria-label="Drive owner suggestions"></div>
       </span>
       <input name="td_title" placeholder="sheet name (optional)" autocomplete="off" class="{{ fld }}" />
     </div>

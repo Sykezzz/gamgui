@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -66,7 +70,20 @@ def test_curated_search_commands_build_safely():
     fargv = f.build({"email": "alice@example.com", "query": poison})
     assert fargv[:4] == ["user", "alice@example.com", "print", "filelist"]
     assert fargv.count(poison) == 1 and "formatjson" in fargv
+    assert fargv[fargv.index("maxfiles") + 1] == "50"
     assert any("'me' in owners" in s.hints for s in f.slots if s.key == "query")
+
+
+def test_curated_search_commands_reject_empty_queries():
+    cat = load_catalog()
+    cases = (
+        ("build.find_users", {"query": ""}),
+        ("build.find_cros", {"query": "   "}),
+        ("build.find_files", {"email": "alice@example.com", "query": ""}),
+    )
+    for command_id, slots in cases:
+        with pytest.raises(ValueError, match="required for an interactive search"):
+            cat.by_id(command_id).build(slots)
 
 
 def test_curated_search_commands_run(client):
@@ -78,6 +95,60 @@ def test_curated_search_commands_run(client):
     rf = client.post("/builder/run", data={"cid": "build.find_files",
                                            "email": "alice@example.com", "query": "trashed=false"})
     assert rf.status_code == 200 and "Q4 Budget" in rf.text       # a mock file name
+
+
+def test_interactive_reads_spool_off_loop_and_bound_response(client, tmp_path, monkeypatch):
+    spool = tmp_path / "builder-large.ndjson"
+    huge = "&" * 1_000
+    spool.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "primaryEmail": f"user{index:04d}@example.com",
+                    **{f"field{column}": huge for column in range(9)},
+                }
+            )
+            for index in range(150)
+        ),
+        encoding="utf-8",
+    )
+    runner = client.app.state.gamgui.connector.runner
+    calls = []
+
+    @asynccontextmanager
+    async def spooled(domain, argv, **kwargs):
+        calls.append((domain, list(argv)))
+        yield SimpleNamespace(path=spool, stdout_bytes=spool.stat().st_size)
+
+    async def buffered(*args, **kwargs):
+        raise AssertionError("interactive Builder reads must not buffer stdout")
+
+    monkeypatch.setattr(runner, "run_authenticated_to_file", spooled)
+    monkeypatch.setattr(runner, "run_authenticated", buffered)
+    from gamgui.web.routes import builder as builder_routes
+
+    real_reduce = builder_routes._read_bounded_spool
+
+    def guarded_reduce(path):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Builder spool parsing ran on the event loop")
+        return real_reduce(path)
+
+    monkeypatch.setattr(builder_routes, "_read_bounded_spool", guarded_reduce)
+    response = client.post(
+        "/builder/run",
+        data={"cid": "build.find_users", "query": "isSuspended=false"},
+    )
+
+    assert response.status_code == 200
+    assert calls and calls[0][1][:2] == ["print", "users"]
+    assert response.text.count("<tr") <= 51  # one header plus no more than 50 data rows
+    assert len(response.content) < 100_000
+    assert "Interactive results are capped at 50 rows" in response.text
 
 
 def test_export_offered_exactly_for_todrive_reads(client):

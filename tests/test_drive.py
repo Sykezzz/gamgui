@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gamgui.core.audit import AuditLog
+from gamgui.core.audit import AuditLog, read_records
 from gamgui.core.drive.client import (
     LIST_FIELDS,
     DriveAPIClient,
@@ -32,6 +36,7 @@ from gamgui.core.drive.service import (
     InternalPrincipal,
 )
 from gamgui.core.gam.commands import GAMCommands
+from gamgui.core.processes import ProcessProbe, ProcessState
 from gamgui.web.routes.drive import router as drive_router
 
 
@@ -467,16 +472,166 @@ def sample_manifest() -> OperationManifest:
 
 
 def test_operation_store_is_domain_isolated_and_recovers_running_targets(tmp_path):
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
     path = tmp_path / "ops.db"
     store = DriveOperationStore(path)
     store.create(sample_manifest())
     assert store.get("manifest-1", "other.example") is None
-    store.set_operation_status("manifest-1", "example.com", "running")
-    store.set_target_status("manifest-1", "example.com", "file-1", "running")
+    assert store.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="dead-executor",
+        owner_pid=child.pid,
+        owner_identity="dead-process",
+    )
+    store.set_target_status(
+        "manifest-1",
+        "example.com",
+        "file-1",
+        "running",
+        owner_id="dead-executor",
+    )
     recovered = DriveOperationStore(path)
     manifest = recovered.get("manifest-1", "example.com")
     assert manifest.status == "interrupted"
     assert manifest.targets[0].status == "interrupted"
+
+
+def test_legacy_drive_claim_without_pid_stays_fail_closed(tmp_path):
+    path = tmp_path / "ops.db"
+    first = DriveOperationStore(path)
+    first.create(sample_manifest())
+    assert first.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="legacy-executor",
+        owner_pid=0,
+        owner_identity="",
+    )
+
+    reopened = DriveOperationStore(path)
+
+    assert reopened.get("manifest-1", "example.com").status == "running"
+
+
+def test_second_store_preserves_a_live_operation_claim(tmp_path):
+    path = tmp_path / "ops.db"
+    first = DriveOperationStore(path)
+    first.create(sample_manifest())
+    assert first.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="live-executor",
+        owner_pid=os.getpid(),
+    )
+    first.set_target_status(
+        "manifest-1",
+        "example.com",
+        "file-1",
+        "running",
+        owner_id="live-executor",
+    )
+
+    second = DriveOperationStore(path)
+    manifest = second.get("manifest-1", "example.com")
+
+    assert manifest.status == "running"
+    assert manifest.targets[0].status == "running"
+    assert not second.claim_operation("manifest-1", "example.com")
+
+
+def test_unknown_process_probe_never_recovers_a_running_operation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "ops.db"
+    first = DriveOperationStore(path)
+    first.create(sample_manifest())
+    assert first.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="uncertain-executor",
+        owner_pid=424242,
+        owner_identity="known-start",
+    )
+    monkeypatch.setattr(
+        "gamgui.core.processes.probe_process",
+        lambda _pid: ProcessProbe(ProcessState.UNKNOWN),
+    )
+
+    reopened = DriveOperationStore(path)
+
+    assert reopened.get("manifest-1", "example.com").status == "running"
+
+
+def test_process_identity_mismatch_recovers_reused_pid(tmp_path, monkeypatch):
+    path = tmp_path / "ops.db"
+    first = DriveOperationStore(path)
+    first.create(sample_manifest())
+    assert first.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="old-executor",
+        owner_pid=12345,
+        owner_identity="old-start",
+    )
+    monkeypatch.setattr(
+        "gamgui.core.processes.probe_process",
+        lambda _pid: ProcessProbe(ProcessState.ALIVE, "new-start"),
+    )
+
+    reopened = DriveOperationStore(path)
+
+    assert reopened.get("manifest-1", "example.com").status == "interrupted"
+
+
+def test_dead_child_process_lease_is_recovered(tmp_path):
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    path = tmp_path / "ops.db"
+    first = DriveOperationStore(path)
+    first.create(sample_manifest())
+    assert first.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="dead-child",
+        owner_pid=child.pid,
+        owner_identity="child-start",
+    )
+
+    reopened = DriveOperationStore(path)
+
+    assert reopened.get("manifest-1", "example.com").status == "interrupted"
+
+
+def test_stale_drive_owner_cannot_write_target_or_terminal_status(tmp_path):
+    store = DriveOperationStore(tmp_path / "ops.db")
+    store.create(sample_manifest())
+    assert store.claim_operation(
+        "manifest-1",
+        "example.com",
+        owner_id="current-owner",
+    )
+
+    with pytest.raises(PermissionError, match="another executor"):
+        store.set_target_status(
+            "manifest-1",
+            "example.com",
+            "file-1",
+            "running",
+            owner_id="stale-owner",
+        )
+    with pytest.raises(PermissionError, match="another executor"):
+        store.set_operation_status(
+            "manifest-1",
+            "example.com",
+            "completed",
+            owner_id="stale-owner",
+        )
+
+    unchanged = store.get("manifest-1", "example.com")
+    assert unchanged.status == "running"
+    assert unchanged.targets[0].status == "pending"
 
 
 class TooLargeTreeClient(FakeDriveClient):
@@ -511,6 +666,27 @@ async def test_folder_manifest_hard_caps_at_500(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_manifest_rejects_incomplete_recursive_drive_listing(tmp_path):
+    class IncompleteTreeClient(FakeDriveClient):
+        def __init__(self):
+            super().__init__()
+            self.files[("alice@example.com", "file-1")] = DriveFile.from_api(
+                file_data(mimeType=GOOGLE_FOLDER_MIME)
+            )
+
+        async def list_children(self, subject, parent_id, **kwargs):
+            return DrivePage([], incomplete_search=True)
+
+    service = drive_service(tmp_path, client=IncompleteTreeClient())
+    with pytest.raises(DriveSafetyError, match="incomplete folder listing"):
+        await service.plan_folder_transfer(
+            "alice@example.com",
+            "file-1",
+            "bob@example.com",
+        )
+
+
+@pytest.mark.anyio
 async def test_manifest_apply_persists_per_file_completion(tmp_path):
     service = drive_service(tmp_path)
     manifest = service._create_manifest(
@@ -525,6 +701,186 @@ async def test_manifest_apply_persists_per_file_completion(tmp_path):
     assert result.targets[0].status == "succeeded"
     persisted = service.operations.get(manifest.id, "example.com")
     assert persisted.targets[0].status == "succeeded"
+
+
+@pytest.mark.anyio
+async def test_manifest_apply_atomically_rejects_concurrent_executor(tmp_path):
+    service = drive_service(tmp_path)
+    manifest = service._create_manifest(
+        kind="folder_transfer",
+        subject="alice@example.com",
+        destination="bob@example.com",
+        root_id="file-1",
+        targets=[OperationTarget("file-1", "District plan.pdf", "alice@example.com")],
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_transfer(source, file_id, destination, *, confirmation):
+        calls.append((source, file_id, destination, confirmation))
+        started.set()
+        await release.wait()
+        return TransferResult(True, file_id, destination, "transferred")
+
+    service.transfer_file_ownership = slow_transfer
+    first = asyncio.create_task(
+        service.apply_manifest(manifest.id, confirmation="bob@example.com")
+    )
+    await started.wait()
+    try:
+        with pytest.raises(DriveSafetyError, match="already running"):
+            await service.apply_manifest(
+                manifest.id,
+                confirmation="bob@example.com",
+            )
+    finally:
+        release.set()
+    result = await first
+    assert result.status == "completed"
+    assert result.targets[0].status == "succeeded"
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_classroom_claim_allows_suspended_internal_source_owner(tmp_path):
+    class SourceAwareResolver:
+        calls = []
+
+        async def resolve(self, email, principal_type):
+            self.calls.append((email, principal_type))
+            return InternalPrincipal(
+                email=email.lower(),
+                type=principal_type,
+                active=not email.startswith("suspended"),
+            )
+
+    class ClaimClient(FakeDriveClient):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        async def get_file(self, subject, file_id):
+            self.reads += 1
+            owner = (
+                "suspended-student@example.com"
+                if self.reads == 1
+                else "teacher@example.com"
+            )
+            return DriveFile.from_api(
+                file_data(
+                    id=file_id,
+                    owners=[{"emailAddress": owner}],
+                )
+            )
+
+    resolver = SourceAwareResolver()
+    service = drive_service(
+        tmp_path,
+        client=ClaimClient(),
+        resolver=resolver,
+    )
+    result = await service._claim_one(
+        OperationTarget(
+            "file-1",
+            "Student work",
+            "suspended-student@example.com",
+        ),
+        "teacher@example.com",
+    )
+    assert result.ok
+    assert (
+        "suspended-student@example.com",
+        "user",
+    ) in resolver.calls
+    assert service.runner.calls
+
+
+@pytest.mark.anyio
+async def test_failed_claim_post_verification_is_audited(tmp_path):
+    class UnchangedOwnerClient(FakeDriveClient):
+        async def get_file(self, subject, file_id):
+            return DriveFile.from_api(
+                file_data(
+                    id=file_id,
+                    owners=[{"emailAddress": "student@example.com"}],
+                )
+            )
+
+    service = drive_service(tmp_path, client=UnchangedOwnerClient())
+    result = await service._claim_one(
+        OperationTarget(
+            "file-1",
+            "Student work",
+            "student@example.com",
+        ),
+        "teacher@example.com",
+    )
+    assert not result.ok
+    record = read_records(service.audit.path)[-1]
+    assert record["action"] == "drive_claim_ownership"
+    assert record["ok"] is False
+    assert "verification failed" in record["extra"]["error"].lower()
+
+
+@pytest.mark.anyio
+async def test_single_transfer_audits_unavailable_verification_after_gam(tmp_path):
+    class VerificationUnavailableClient(FakeDriveClient):
+        async def get_file(self, subject, file_id):
+            if subject == "bob@example.com":
+                raise RuntimeError("private upstream response")
+            return await super().get_file(subject, file_id)
+
+    service = drive_service(tmp_path, client=VerificationUnavailableClient())
+    result = await service.transfer_file_ownership(
+        "alice@example.com",
+        "file-1",
+        "bob@example.com",
+        confirmation="bob@example.com",
+    )
+    assert not result.ok
+    assert "verification was unavailable" in result.detail
+    record = read_records(service.audit.path)[-1]
+    assert record["action"] == "drive_transfer_ownership"
+    assert record["ok"] is False
+    assert record["extra"]["error"] == "Verification unavailable after GAM success."
+    assert "private upstream response" not in str(record)
+
+
+@pytest.mark.anyio
+async def test_claim_audits_unavailable_verification_after_gam(tmp_path):
+    class VerificationUnavailableClient(FakeDriveClient):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        async def get_file(self, subject, file_id):
+            self.reads += 1
+            if self.reads > 1:
+                raise RuntimeError("private upstream response")
+            return DriveFile.from_api(
+                file_data(
+                    id=file_id,
+                    owners=[{"emailAddress": "student@example.com"}],
+                )
+            )
+
+    service = drive_service(tmp_path, client=VerificationUnavailableClient())
+    result = await service._claim_one(
+        OperationTarget(
+            "file-1",
+            "Student work",
+            "student@example.com",
+        ),
+        "teacher@example.com",
+    )
+    assert not result.ok
+    assert "verification was unavailable" in result.detail
+    record = read_records(service.audit.path)[-1]
+    assert record["action"] == "drive_claim_ownership"
+    assert record["ok"] is False
+    assert record["extra"]["error"] == "Verification unavailable after GAM success."
+    assert "private upstream response" not in str(record)
 
 
 class FakeWebService:
@@ -595,6 +951,35 @@ class FakeWebService:
         return TransferResult(
             True, file_id, destination, detail="Ownership transferred."
         )
+
+    def claim_manifest(self, operation_id, *, confirmation):
+        manifest = self.operations.get(operation_id, self.domain)
+        if manifest is None:
+            raise DriveSafetyError("That ownership manifest was not found.")
+        if confirmation != manifest.destination:
+            raise DriveSafetyError("Type the exact destination email to confirm.")
+        if manifest.remaining == 0:
+            self.operations.set_operation_status(
+                operation_id,
+                self.domain,
+                "completed",
+            )
+            return self.operations.get(operation_id, self.domain)
+        if not self.operations.claim_operation(operation_id, self.domain):
+            raise DriveSafetyError("That ownership manifest is already running.")
+        return self.operations.get(operation_id, self.domain)
+
+    async def apply_manifest(
+        self,
+        operation_id,
+        *,
+        confirmation,
+        claimed=False,
+        progress=None,
+    ):
+        assert claimed
+        self.operations.set_operation_status(operation_id, self.domain, "completed")
+        return self.operations.get(operation_id, self.domain)
 
 
 @pytest.fixture
@@ -756,6 +1141,50 @@ def test_drive_ownership_preview_and_apply_are_typed(drive_web_client):
         },
     )
     assert "Ownership transferred" in applied.text
+
+
+def test_manifest_apply_rejects_an_already_running_submission(drive_web_client):
+    client, service = drive_web_client
+    manifest = sample_manifest()
+    service.operations.create(manifest)
+    assert service.operations.claim_operation(
+        manifest.id,
+        service.domain,
+    )
+
+    response = client.post(
+        "/drive/manifest/apply",
+        data={
+            "manifest_id": manifest.id,
+            "confirmation": manifest.destination,
+        },
+    )
+    assert response.status_code == 200
+    assert "already running" in response.text
+    assert not client.app.state.gamgui.jobs
+
+
+def test_manifest_apply_returns_completed_without_starting_empty_job(
+    drive_web_client,
+):
+    client, service = drive_web_client
+    manifest = sample_manifest()
+    manifest.status = "interrupted"
+    for target in manifest.targets:
+        target.status = "succeeded"
+    service.operations.create(manifest)
+
+    response = client.post(
+        "/drive/manifest/apply",
+        data={
+            "manifest_id": manifest.id,
+            "confirmation": manifest.destination,
+        },
+    )
+    assert response.status_code == 200
+    assert "completed" in response.text
+    assert not client.app.state.gamgui.jobs
+    assert service.operations.get(manifest.id, service.domain).status == "completed"
 
 
 def test_open_in_drive_uses_system_browser(drive_web_client, monkeypatch):

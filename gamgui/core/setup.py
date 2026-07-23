@@ -44,6 +44,12 @@ def _wipe_file(path: Path) -> None:
 
 ADMIN_CONSOLE_DWD_URL = "https://admin.google.com/ac/owl/domainwidedelegation"
 _REQUIRED = ("oauth2service", "oauth2")
+DISTRICT_FEATURE_DWD_SCOPES = (
+    "https://www.googleapis.com/auth/classroom.courses",
+    "https://www.googleapis.com/auth/classroom.rosters",
+    "https://www.googleapis.com/auth/classroom.profile.emails",
+    "https://www.googleapis.com/auth/drive",
+)
 
 
 @dataclass
@@ -68,6 +74,7 @@ class VerifyResult:
     lines: List[Tuple[str, str]] = field(default_factory=list)   # (label, status)
     raw: str = ""
     auth_url: str = ""   # GAM-provided link to authorize Domain-Wide Delegation, if it failed
+    missing_feature_scopes: List[str] = field(default_factory=list)
 
 
 class SetupService:
@@ -176,7 +183,11 @@ class SetupService:
                 client_id = str(json.loads(raw).get("client_id", ""))
             except ValueError:
                 client_id = ""
-        return {"client_id": client_id, "admin_console_url": ADMIN_CONSOLE_DWD_URL}
+        return {
+            "client_id": client_id,
+            "admin_console_url": ADMIN_CONSOLE_DWD_URL,
+            "feature_scopes": ",".join(DISTRICT_FEATURE_DWD_SCOPES),
+        }
 
     # --- fresh-setup guidance ----------------------------------------------------------
     def setup_commands(self, admin: str, cfgdir: Optional[Path] = None) -> Dict[str, object]:
@@ -206,17 +217,50 @@ class SetupService:
         lines = _parse_check(out)
         up = out.upper()
         failed = ("FAILED" in up) or ("DISABLED!" in up) or any(s == "FAIL" for _, s in lines)
-        ok = bool(lines) and not failed
+        if failed or not lines:
+            return VerifyResult(
+                ok=False,
+                summary=(
+                    "Domain-Wide Delegation isn't authorized yet — use the link below, "
+                    "then verify again."
+                ),
+                lines=lines,
+                raw=out,
+                auth_url=_extract_auth_url(out),
+            )
+        try:
+            feature_out = await self.runner.run_authenticated(
+                domain,
+                GAMCommands.check_svcacct(admin, DISTRICT_FEATURE_DWD_SCOPES),
+            )
+        except GAMError as exc:
+            return VerifyResult(ok=False, summary=exc.message, raw=exc.stderr)
+        feature_lines = _parse_check(feature_out)
+        feature_up = feature_out.upper()
+        feature_failed = (
+            ("FAILED" in feature_up)
+            or ("DISABLED!" in feature_up)
+            or any(status == "FAIL" for _, status in feature_lines)
+            or not feature_lines
+        )
+        missing = [
+            label
+            for label, status in feature_lines
+            if status == "FAIL" and label.startswith("https://")
+        ]
+        combined_lines = lines + [item for item in feature_lines if item not in lines]
+        combined_raw = "\n".join(part for part in (out, feature_out) if part)
         return VerifyResult(
-            ok=ok,
+            ok=not feature_failed,
             summary=(
-                "All scopes authorized."
-                if ok
-                else "Domain-Wide Delegation isn't authorized yet — use the link below, then verify again."
+                "All required scopes authorized."
+                if not feature_failed
+                else "Drive or Classroom delegation is missing required access."
             ),
-            lines=lines,
-            raw=out,
-            auth_url=("" if ok else _extract_auth_url(out)),
+            lines=combined_lines,
+            raw=combined_raw,
+            auth_url=("" if not feature_failed else _extract_auth_url(feature_out)),
+            missing_feature_scopes=missing,
         )
 
 

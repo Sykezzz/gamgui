@@ -2,13 +2,26 @@
 <p class="text-sm text-brand-gray">Pick a group, then drag people in from the right. Drag a member out to remove.</p>
 {% else %}
 {% if error %}<div class="mb-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ error }}</div>{% endif %}
-<p class="text-xs text-brand-gray mb-2">{{ members | length }} member{{ "s" if members | length != 1 }} in {{ group }}</p>
+{% set members = page.items if page else [] %}
+{% if page %}
+  {% if page.total > members | length %}
+  <div id="group-members-partial" role="status"
+       class="mb-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+    Partial view: showing the first {{ members | length }} of {{ page.total }} members in {{ group }}.
+    The display is hard-limited to 50; add and remove actions still apply to the selected group.
+  </div>
+  {% else %}
+  <p class="mb-2 text-xs text-brand-gray">
+    Showing all {{ page.total }} member{{ "s" if page.total != 1 }} in {{ group }}.
+  </p>
+  {% endif %}
+{% endif %}
 <ul class="flex flex-wrap gap-2">
   {% for m in members %}
   <li class="inline-flex items-center gap-1.5 rounded-full bg-paper border border-brand-gray/40 pl-3 pr-1.5 py-1 text-sm cursor-grab"
       draggable="true" ondragstart="gqDrag(event, {{ m.email | tojson }}, 'remove')">
     <a href="/users/detail?email={{ m.email | urlencode }}" class="text-brand-black hover:underline">{{ m.email }}</a>
-    <button class="text-brand-gray hover:text-red-700 text-base leading-none" aria-label="Remove {{ m.email }}"
+    <button type="button" class="text-brand-gray hover:text-red-700 text-base leading-none" aria-label="Remove {{ m.email }}"
             hx-post="/groups/members" hx-target="#members" hx-swap="innerHTML"
             hx-vals='{"group": {{ group | tojson }}, "email": {{ m.email | tojson }}, "op": "remove"}'>&times;</button>
   </li>

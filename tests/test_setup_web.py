@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -56,6 +57,29 @@ def test_verify_activates_connector(ctx):
     assert r.status_code == 200
     assert "connected" in r.text.lower()
     assert state.connector is not None and state.audit_domain == "ex.com"
+
+
+def test_verify_refuses_reconnect_before_remote_check_when_admin_job_is_active(
+    ctx, monkeypatch
+):
+    client, _, _, state = ctx
+    state.jobs["active"] = SimpleNamespace(finished=False)
+
+    async def unexpected_verify(*args, **kwargs):
+        pytest.fail("setup verification must not run during an active admin job")
+
+    monkeypatch.setattr(
+        "gamgui.web.routes.setup.SetupService.verify",
+        unexpected_verify,
+    )
+    response = client.post(
+        "/setup/verify",
+        data={"domain": "ex.com", "admin": "a@ex.com"},
+    )
+
+    assert response.status_code == 200
+    assert "active administrative operation" in response.text
+    assert state.connector is None
 
 
 def test_fresh_shows_commands(ctx):

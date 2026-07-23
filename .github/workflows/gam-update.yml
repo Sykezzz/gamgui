@@ -1,0 +1,109 @@
+name: Update GAM7 pin
+
+on:
+  schedule:
+    - cron: "43 12 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: district-maintenance
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: district-main
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.7"
+      - name: Compare releases
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PIN="$(python3 -c "from gamgui.core.gam.commands import EXPECTED_GAM_VERSION; print(EXPECTED_GAM_VERSION)")"
+          LATEST="$(gh api repos/GAM-team/GAM/releases/latest --jq .tag_name)"
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "v$PIN" = "$LATEST" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Refresh pin, checksum, catalog, tests, mock, and docs
+        if: steps.release.outputs.needed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          uv sync --frozen --python "$(which python)" --extra dev
+          .venv/bin/python scripts/bump_gam.py --tag "$TAG"
+          .venv/bin/pytest -q tests/test_command_contract.py tests/test_bump_gam.py
+      - name: Open auto-merge pull request
+        if: steps.release.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          DISTRICT_SHORT="$(git rev-parse --short=12 origin/district-main)"
+          BRANCH="automation/gam-${TAG}-${DISTRICT_SHORT}"
+          git checkout -b "$BRANCH"
+          git add README.md scripts/fetch_gam.sh scripts/gam_checksums.txt \
+            scripts/bump_gam.py gamgui/core/gam/commands.py \
+            gamgui/resources/gam7/VERSION gamgui/resources/gam7/command_catalog.json \
+            tests/fixtures/mock_gam.sh tests/test_bump_gam.py
+          git commit -m "chore: bump GAM7 to ${TAG}"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          PR="$(gh pr create --base district-main --head "$BRANCH" \
+            --title "chore: bump GAM7 to ${TAG}" \
+            --body "Automated GAM7 pin, checksum, catalog, mock, tests, and documentation update. Expanded CI and exact-SHA post-merge validation remain mandatory.")"
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh pr merge "$PR" --auto --merge --delete-branch
+          MERGED_SHA=""
+          for _ in $(seq 1 120); do
+            STATE="$(gh pr view "$PR" --json state --jq .state)"
+            if [ "$STATE" = "MERGED" ]; then
+              MERGED_SHA="$(gh pr view "$PR" --json mergeCommit --jq .mergeCommit.oid)"
+              break
+            fi
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "GAM update PR closed without merging." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          if [ -z "$MERGED_SHA" ]; then
+            echo "Timed out waiting for required checks and auto-merge." >&2
+            exit 1
+          fi
+          gh workflow run post-merge-validation.yml --ref district-main -f sha="$MERGED_SHA"
+      - name: Report failed automatic bump
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="GAM7 automatic update blocked"
+          BODY="The automatic bump for \`$TAG\` failed. No update was merged. Run: $RUN_URL"
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$NUMBER" ]; then
+            gh issue comment "$NUMBER" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi

@@ -2,6 +2,9 @@
 
 VENV := .venv
 PY := $(VENV)/bin/python
+UV := uv
+UV_VERSION := 0.11.7
+PYTHON ?= python3
 
 help:
 	@echo "make setup   - create venv and install (dev + native window)"
@@ -12,9 +15,9 @@ help:
 	@echo "make clean   - remove venv and build artifacts"
 
 setup:
-	python3 -m venv $(VENV)
-	$(PY) -m pip install -U pip
-	$(PY) -m pip install -e ".[dev,desktop]"
+	@test "$$($(UV) --version | awk '{print $$1 " " $$2}')" = "uv $(UV_VERSION)" || \
+		(echo "GamGUI requires uv $(UV_VERSION); install that exact version before setup." >&2; exit 1)
+	$(UV) sync --frozen --python "$(PYTHON)" --extra dev --extra desktop --extra build
 
 gam:
 	./scripts/fetch_gam.sh $(if $(TAG),--tag $(TAG))

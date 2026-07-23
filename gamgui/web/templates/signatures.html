@@ -17,7 +17,6 @@
   </div>
   {% if error %}<div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm text-amber-800">{{ error }}</div>{% endif %}
 
-  <!-- saved templates: load a starter into the editor, or save the current editor content as a named template -->
   <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
     <h2 class="eyebrow text-brand-gray">Saved templates</h2>
     <p class="mt-1 text-xs text-brand-gray">Load a starter into the editor, tweak it, then save your own for next time.</p>
@@ -27,26 +26,36 @@
   </div>
 
   <div class="grid gap-5 lg:grid-cols-2">
-    <!-- editor -->
     <form id="sig-form" class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm space-y-4">
-      <div class="grid grid-cols-2 gap-3">
-        <label class="block">
-          <span class="text-sm text-brand-blueink">Scope</span>
-          <select name="scope_type" id="scope_type" onchange="sigPopulate()"
-                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm focus:border-brand-blue focus:outline-none">
-            <option value="company">Whole company</option>
-            <option value="user">Specific user (test)</option>
-            <option value="group">Group</option>
-            <option value="ou">Org unit</option>
-            <option value="department">Department</option>
-            <option value="location">Location</option>
-          </select>
-        </label>
-        <label class="block">
-          <span class="text-sm text-brand-blueink">Which</span>
-          <select name="scope_value" id="scope_value"
-                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm focus:border-brand-blue focus:outline-none"></select>
-        </label>
+      <label class="block">
+        <span class="text-sm text-brand-blueink">Scope</span>
+        <select name="scope_type" id="scope_type" onchange="sigScopeChanged()"
+                class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">
+          <option value="company">Whole company</option>
+          <option value="user">Specific user (test)</option>
+          <option value="group">Group</option>
+          <option value="ou">Org unit</option>
+          <option value="department">Department</option>
+          <option value="location">Location</option>
+        </select>
+      </label>
+
+      <div id="sig-scope-field" class="hidden">
+        <label for="sig-scope-search" id="sig-scope-label" class="block text-sm text-brand-blueink">Which</label>
+        <input type="search" id="sig-scope-search" name="q" autocomplete="off"
+               aria-controls="sig-scope-options" aria-describedby="sig-scope-help"
+               maxlength="512"
+               oninput="sigScopeTyped(this)"
+               hx-get="/signatures/scopes" hx-include="#scope_type"
+               hx-target="#sig-scope-options" hx-swap="innerHTML"
+               hx-trigger="input changed delay:300ms, focus, search"
+               hx-sync="this:replace"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        <input type="hidden" name="scope_value" id="scope_value" value="" />
+        <p id="sig-scope-help" class="mt-1 text-xs text-brand-gray">
+          Required for every scope except Whole company. Preview and apply reject empty or invalid values.
+        </p>
+        <div id="sig-scope-options" class="mt-2 max-h-48 overflow-y-auto" aria-live="polite"></div>
       </div>
 
       <label class="block">
@@ -62,11 +71,10 @@
       <p class="text-xs text-brand-gray">Wrap a part in <code class="rounded bg-paper border border-brand-gray/40 px-1 py-0.5">[[ … ]]</code> to drop it when a variable inside is empty — e.g. <code class="rounded bg-paper border border-brand-gray/40 px-1 py-0.5">[[{title} · ]]</code> disappears for users with no title.</p>
 
       <button type="button" id="sig-preview-btn"
-              class="inline-flex items-center rounded-lg bg-brand-blue px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-blueink transition-colors"
+              class="inline-flex items-center rounded-lg bg-brand-blue px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-blueink transition-colors focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
               hx-post="/signatures/preview" hx-include="#sig-form" hx-target="#sig-preview" hx-swap="innerHTML">Preview</button>
     </form>
 
-    <!-- preview -->
     <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
       <h2 class="eyebrow text-brand-gray">Preview</h2>
       <div id="sig-preview" class="mt-3 max-h-[26rem] overflow-y-auto">
@@ -77,38 +85,59 @@
 </div>
 
 <script>
-  var SIG_OUS = {{ options.ous | tojson }};
-  var SIG_DEPTS = {{ options.departments | tojson }};
-  var SIG_GROUPS = {{ groups | tojson }};
-  var SIG_USERS = {{ options.users | tojson }};
-  var SIG_LOCATIONS = {{ options.locations | tojson }};
-  function sigPopulate() {
-    var t = document.getElementById("scope_type").value;
-    var sel = document.getElementById("scope_value");
-    var list = t === "ou" ? SIG_OUS : (t === "department" ? SIG_DEPTS : (t === "location" ? SIG_LOCATIONS : (t === "group" ? SIG_GROUPS : (t === "user" ? SIG_USERS : []))));
-    // Build options via the DOM (value + textContent), never innerHTML string-concat: OU paths,
-    // departments and locations come from Google and may contain <, > or " — string concat would let
-    // them break out of the markup / inject an attribute. createElement escapes them safely.
-    sel.replaceChildren();
-    list.forEach(function (v) {
-      var o = document.createElement("option");
-      o.value = v;
-      o.textContent = v;
-      sel.appendChild(o);
-    });
-    sel.disabled = list.length === 0;
-    sel.style.visibility = list.length ? "visible" : "hidden";
-  }
-  sigPopulate();
+  var SIG_SCOPE_COPY = {
+    user: ["Find a user", "Name or user email"],
+    group: ["Find a group", "Name or group email"],
+    ou: ["Find an org unit", "Exact OU path"],
+    department: ["Find a department", "Department name"],
+    location: ["Enter a location", "Exact directory location"]
+  };
 
-  // Load a saved template into the editor WITHOUT a round trip: the HTML is carried in the button's
-  // data-body (Jinja attribute-escaped, so it's inert text here — never innerHTML'd), dropped straight
-  // into the textarea value, then the existing Preview button is clicked to refresh the preview.
-  function sigLoadTemplate(btn) {
-    var ta = document.querySelector("#sig-form textarea[name=template]");
-    if (!ta) return;
-    ta.value = btn.dataset.body || "";
-    ta.focus();
+  function sigScopeTyped(input) {
+    var value = document.getElementById("scope_value");
+    if (value) value.value = input.value.trim();
+  }
+
+  function sigChooseScope(button) {
+    var input = document.getElementById("sig-scope-search");
+    var value = document.getElementById("scope_value");
+    if (!input || !value) return;
+    input.value = button.dataset.value || "";
+    value.value = input.value;
+    document.getElementById("sig-scope-options").replaceChildren();
+    input.focus();
+  }
+
+  function sigScopeChanged() {
+    var type = document.getElementById("scope_type").value;
+    var field = document.getElementById("sig-scope-field");
+    var input = document.getElementById("sig-scope-search");
+    var value = document.getElementById("scope_value");
+    var options = document.getElementById("sig-scope-options");
+    input.value = "";
+    input.required = type !== "company";
+    input.setAttribute("aria-required", type === "company" ? "false" : "true");
+    input.maxLength = type === "ou" ? 512 : (type === "user" || type === "group" ? 254 : 256);
+    value.value = "";
+    options.replaceChildren();
+    if (type === "company") {
+      field.classList.add("hidden");
+      return;
+    }
+    field.classList.remove("hidden");
+    var copy = SIG_SCOPE_COPY[type] || ["Which", "Exact value"];
+    document.getElementById("sig-scope-label").textContent = copy[0];
+    input.placeholder = copy[1];
+    htmx.trigger(input, "search");
+  }
+
+  sigScopeChanged();
+
+  function sigLoadTemplate(button) {
+    var textarea = document.querySelector("#sig-form textarea[name=template]");
+    if (!textarea) return;
+    textarea.value = button.dataset.body || "";
+    textarea.focus();
     var preview = document.getElementById("sig-preview-btn");
     if (preview) preview.click();
   }

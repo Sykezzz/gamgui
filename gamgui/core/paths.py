@@ -13,10 +13,14 @@ import sys
 from pathlib import Path
 
 APP_NAME = "GamGUI"
+APP_DATA_ENV = "GAMGUI_APP_DATA_DIR"
 
 
 def app_data_dir() -> Path:
     """The base directory for GamGUI's local data on this OS (not created here)."""
+    override = os.environ.get(APP_DATA_ENV)
+    if override:
+        return Path(override).expanduser()
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
     elif sys.platform == "win32":

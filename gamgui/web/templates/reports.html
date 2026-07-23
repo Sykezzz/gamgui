@@ -15,6 +15,13 @@
       <p class="eyebrow text-brand-blue">Insights</p>
       <h1 class="font-serif text-2xl text-brand-black tracking-tight">Reports</h1>
       <p class="text-brand-blueink/80 text-sm">Across {{ total }} accounts — the gaps the Admin Console doesn't surface at a glance.</p>
+      <p class="mt-1 text-xs text-brand-gray">
+        Counts come from the local directory snapshot
+        {% if refreshing is defined and refreshing %}· refreshing now
+        {% elif snapshot_age_seconds is defined and snapshot_age_seconds is not none %}· {{ ((snapshot_age_seconds / 60) | round(0, "floor") | int) }}m old
+        {% endif %}.
+        Recovery email, phone, and location stay live on each user profile and are not copied into this index.
+      </p>
     </div>
 
     {% if error %}
@@ -30,7 +37,9 @@
           <span class="font-serif text-2xl {{ 'text-brand-black' if r.count else 'text-brand-gray' }}">{{ r.count }}</span>
         </div>
         <p class="text-xs text-brand-blueink/70 mt-1">{{ r.description }}</p>
-        {% if r.users %}
+        {# Compatibility for callers that intentionally render a small in-memory Report. The
+           live route passes count-only ReportSummary objects and never reaches this branch. #}
+        {% if r.users is defined and r.users %}
         <details class="mt-3">
           <summary class="text-sm text-brand-blueink cursor-pointer hover:text-brand-black">View {{ r.count }}</summary>
           <ul class="mt-2 space-y-1 max-h-56 overflow-auto">
@@ -48,19 +57,45 @@
             {% endfor %}
           </ul>
         </details>
+        {% elif r.count %}
+        <button type="button"
+                class="mt-3 rounded-lg border border-brand-gray/50 px-3 py-1.5 text-sm font-medium text-brand-blueink hover:border-brand-blue hover:text-brand-black focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+                hx-get="/reports/bucket?key={{ r.key | urlencode }}"
+                hx-target="#report-results"
+                hx-swap="innerHTML"
+                hx-sync="#report-results:replace"
+                aria-controls="report-results">
+          View users
+        </button>
         {% else %}
-        <p class="mt-3 text-sm text-emerald-700">None — all clear.</p>
+        <p class="mt-3 text-sm text-emerald-700" role="status">None — all clear.</p>
         {% endif %}
       </div>
       {% endfor %}
     </div>
 
-    <div>
-      <h2 class="eyebrow text-brand-gray">Storage &amp; mail usage</h2>
-      <div id="usage" class="mt-3" hx-get="/reports/usage" hx-trigger="load">
-        <p class="text-sm text-brand-gray flex items-center gap-2"><span class="spinner"></span> Loading usage…</p>
+    <section aria-labelledby="report-results-heading">
+      <h2 id="report-results-heading" class="eyebrow text-brand-gray">Selected finding</h2>
+      <div id="report-results" class="mt-3" aria-live="polite">
+        <p class="rounded-2xl border border-dashed border-brand-gray/50 bg-brand-white px-5 py-6 text-sm text-brand-gray">
+          Choose a report above to load its first 50 users.
+        </p>
       </div>
-    </div>
+    </section>
+
+    <section aria-labelledby="usage-heading">
+      <h2 id="usage-heading" class="eyebrow text-brand-gray">Storage &amp; mail usage</h2>
+      <div id="usage" class="mt-3">
+        <button type="button"
+                class="rounded-lg border border-brand-gray/50 px-3 py-1.5 text-sm font-medium text-brand-blueink hover:border-brand-blue hover:text-brand-black focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+                hx-get="/reports/usage"
+                hx-target="#usage"
+                hx-swap="innerHTML"
+                hx-sync="#usage:replace">
+          Load usage report
+        </button>
+      </div>
+    </section>
     </div>
   </div>
 {% endif %}

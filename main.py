@@ -8,4 +8,4 @@ rest of the app keeps its normal relative imports.
 from gamgui.app import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

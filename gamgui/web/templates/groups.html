@@ -14,36 +14,39 @@
     <p class="eyebrow text-brand-blue">Membership</p>
     <h1 class="font-serif text-2xl text-brand-black tracking-tight">Groups</h1>
     <p class="text-brand-blueink/80 mt-1 text-sm">Pick a group, then <strong>drag people in</strong> from the right to add — drag a member onto the people list (or hit ×) to remove.</p>
+    <p class="mt-1 text-xs text-brand-gray">Member detail is a bounded operational view: at most 50 members are displayed, with a clear partial-view notice when the group is larger.</p>
   </div>
   {% if error %}<div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm text-amber-800">{{ error }}</div>{% endif %}
 
   <div class="grid gap-5 sm:grid-cols-2">
-    <!-- group panel: drop a person here to ADD -->
     <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
-      <select id="group-select" name="group" hx-get="/groups/members" hx-target="#members" hx-trigger="change" hx-include="this"
-              class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none">
-        <option value="">Select a group…</option>
-        {% for g in groups %}<option value="{{ g.email }}">{{ g.name or g.email }} ({{ g.email }})</option>{% endfor %}
-      </select>
+      <label for="group-search" class="block text-sm font-medium text-brand-blueink">Find a group</label>
+      <input type="search" id="group-search" name="q" placeholder="Name or group email"
+             autocomplete="off" aria-controls="group-options"
+             hx-get="/groups/search/groups" hx-target="#group-options" hx-swap="innerHTML"
+             hx-trigger="input changed delay:300ms, search" hx-sync="this:replace"
+             class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <input type="hidden" id="group-select" name="group" value="" />
+      <p id="selected-group" class="mt-2 min-h-5 text-sm text-brand-blueink" aria-live="polite">No group selected.</p>
+      <div id="group-options" class="mt-2 max-h-48 overflow-y-auto">
+        {% with page=groups_page %}{% include "_group_search_options.html" %}{% endwith %}
+      </div>
+
       <div id="members" class="mt-4 max-h-80 min-h-[8rem] overflow-y-auto rounded-xl border-2 border-dashed border-brand-gray/40 p-3"
            ondragover="gqAllow(event)" ondrop="gqDropAdd(event)">
         <p class="text-sm text-brand-gray">Pick a group, then drag people in.</p>
       </div>
     </div>
 
-    <!-- people pool: source to drag from; drop a member here to REMOVE -->
     <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" ondragover="gqAllow(event)" ondrop="gqDropRemove(event)">
-      <input type="search" id="people-filter" placeholder="Filter people…" oninput="gqFilter()"
-             class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none" />
-      <div id="people" class="mt-3 max-h-80 overflow-auto space-y-1">
-        {% for u in users %}
-        <div class="ucard flex items-center justify-between rounded-lg border border-brand-gray/30 px-3 py-1.5 text-sm cursor-grab hover:bg-paper"
-             draggable="true" ondragstart="gqDrag(event, {{ u.primary_email | tojson }}, 'add')"
-             data-search="{{ (u.full_name ~ ' ' ~ u.primary_email) | lower }}">
-          <span class="text-brand-black">{{ u.full_name }}</span>
-          <span class="text-brand-gray text-xs">{{ u.primary_email }}</span>
-        </div>
-        {% endfor %}
+      <label for="people-search" class="block text-sm font-medium text-brand-blueink">Find an active user</label>
+      <input type="search" id="people-search" name="q" placeholder="Name or user email"
+             autocomplete="off" aria-controls="people"
+             hx-get="/groups/search/users" hx-target="#people" hx-swap="innerHTML"
+             hx-trigger="input changed delay:300ms, search" hx-sync="this:replace"
+             class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <div id="people" class="mt-3 max-h-80 overflow-auto">
+        {% with page=people_page %}{% include "_people_search_results.html" %}{% endwith %}
       </div>
     </div>
   </div>
@@ -55,20 +58,42 @@
     ev.dataTransfer.effectAllowed = "move";
   }
   function gqAllow(ev) { ev.preventDefault(); }
-  function gqPayload(ev) { try { return JSON.parse(ev.dataTransfer.getData("text/plain")); } catch (e) { return null; } }
-  function gqGroup() { var s = document.getElementById("group-select"); return s ? s.value : ""; }
-  function gqMutate(email, op) {
-    var g = gqGroup();
-    if (!g) { return; }
-    htmx.ajax("POST", "/groups/members", { values: { group: g, email: email, op: op }, target: "#members", swap: "innerHTML" });
+  function gqPayload(ev) {
+    try { return JSON.parse(ev.dataTransfer.getData("text/plain")); }
+    catch (e) { return null; }
   }
-  function gqDropAdd(ev) { ev.preventDefault(); var p = gqPayload(ev); if (p && p.op === "add") { gqMutate(p.email, "add"); } }
-  function gqDropRemove(ev) { ev.preventDefault(); var p = gqPayload(ev); if (p && p.op === "remove") { gqMutate(p.email, "remove"); } }
-  function gqFilter() {
-    var q = (document.getElementById("people-filter").value || "").toLowerCase();
-    document.querySelectorAll("#people .ucard").forEach(function (c) {
-      c.style.display = c.dataset.search.includes(q) ? "" : "none";
+  function gqGroup() {
+    var selected = document.getElementById("group-select");
+    return selected ? selected.value : "";
+  }
+  function gqSelectGroup(button) {
+    var selected = document.getElementById("group-select");
+    var label = document.getElementById("selected-group");
+    if (selected) selected.value = button.dataset.group || "";
+    if (label) {
+      label.textContent = button.dataset.label
+        ? "Selected: " + button.dataset.label + " (" + button.dataset.group + ")"
+        : "No group selected.";
+    }
+  }
+  function gqMutate(email, op) {
+    var group = gqGroup();
+    if (!group) return;
+    htmx.ajax("POST", "/groups/members", {
+      values: { group: group, email: email, op: op },
+      target: "#members",
+      swap: "innerHTML"
     });
+  }
+  function gqDropAdd(ev) {
+    ev.preventDefault();
+    var payload = gqPayload(ev);
+    if (payload && payload.op === "add") gqMutate(payload.email, "add");
+  }
+  function gqDropRemove(ev) {
+    ev.preventDefault();
+    var payload = gqPayload(ev);
+    if (payload && payload.op === "remove") gqMutate(payload.email, "remove");
   }
 </script>
 {% endif %}

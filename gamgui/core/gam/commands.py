@@ -29,6 +29,26 @@ GROUP_ROLES = ("member", "manager", "owner")
 # `gam print users` returns ONLY primaryEmail unless fields are requested — these populate the list.
 # `organizations` carries the job title (the practical "role" for automations).
 USER_LIST_FIELDS = ("primaryEmail", "name", "suspended", "orgUnitPath", "organizations")
+# Signature rendering needs profile identity plus only the variables exposed by the editor.
+# Keep this separate from the detail/cache projections so a company-wide signature preview does
+# not spool aliases, recovery data, admin flags, or other fields that never reach the template.
+SIGNATURE_USER_FIELDS = (
+    "primaryEmail",
+    "name",
+    "suspended",
+    "orgUnitPath",
+    "organizations",
+    "locations",
+    "phones",
+)
+# Minimal persisted summary projection used by DirectoryIndex and count-first reports. Detail-only
+# recovery, phone, location, alias, and content fields intentionally remain live-only.
+DIRECTORY_INDEX_FIELDS = USER_LIST_FIELDS + (
+    "isAdmin",
+    "isDelegatedAdmin",
+    "isEnrolledIn2Sv",
+    "lastLoginTime",
+)
 # Fields for the detail view: identity + role/automation signals + security flags.
 USER_DETAIL_FIELDS = (
     "primaryEmail", "name", "suspended", "orgUnitPath", "isAdmin", "isDelegatedAdmin",
@@ -82,10 +102,15 @@ class GAMCommands:
         return ["create", "svcacct", admin]
 
     @staticmethod
-    def check_svcacct(admin: str) -> List[str]:
+    def check_svcacct(
+        admin: str, scopes: Optional[Sequence[str]] = None
+    ) -> List[str]:
         # Verifies domain-wide delegation scopes. NOTE: the noun is `serviceaccount`
         # here (GAM uses `create svcacct` but `check serviceaccount` — not symmetric).
-        return ["user", admin, "check", "serviceaccount"]
+        argv = ["user", admin, "check", "serviceaccount"]
+        if scopes:
+            argv += ["scopes", ",".join(scopes)]
+        return argv
 
     # --- users (read) -----------------------------------------------------------------
     @staticmethod
@@ -108,12 +133,22 @@ class GAMCommands:
         return argv
 
     @staticmethod
-    def print_filelist(email: str, query: str = "", fields: Optional[Sequence[str]] = None) -> List[str]:
+    def print_filelist(
+        email: str,
+        query: str = "",
+        fields: Optional[Sequence[str]] = None,
+        max_files: Optional[int] = None,
+    ) -> List[str]:
         """Search a user's Drive files by a Drive v3 query (read-only). `query` rides as one argv
         element (never shell-spliced)."""
         argv = ["user", email, "print", "filelist"]
         if query:
             argv += ["query", query]
+        if max_files is not None:
+            limit = int(max_files)
+            if not 1 <= limit <= 1000:
+                raise ValueError("max_files must be between 1 and 1000")
+            argv += ["maxfiles", str(limit)]
         argv += ["fields", ",".join(fields or FILE_LIST_FIELDS), "formatjson"]
         return argv
 
@@ -616,8 +651,14 @@ class GAMCommands:
         return argv
 
     @staticmethod
-    def print_group_members(group: str) -> List[str]:
-        return ["print", "group-members", "group", group, "formatjson"]
+    def print_group_members(
+        group: str,
+        fields: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        argv = ["print", "group-members", "group", group]
+        if fields:
+            argv += ["fields", ",".join(fields)]
+        return argv + ["formatjson"]
 
     @staticmethod
     def print_groups_member(email: str) -> List[str]:

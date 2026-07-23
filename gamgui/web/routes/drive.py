@@ -507,7 +507,10 @@ async def _run_manifest_job(job, service, manifest_id: str, confirmation: str) -
 
     try:
         await service.apply_manifest(
-            manifest_id, confirmation=confirmation, progress=progress
+            manifest_id,
+            confirmation=confirmation,
+            claimed=True,
+            progress=progress,
         )
     except Exception as exc:
         job.error = str(exc)
@@ -525,22 +528,34 @@ async def manifest_apply(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
-    manifest = service.operations.get(manifest_id.strip(), service.domain)
-    if manifest is None:
-        return _error(request, "That ownership manifest was not found for this domain.")
-    if confirmation.strip().lower() != manifest.destination.lower():
+    try:
+        manifest = service.claim_manifest(
+            manifest_id.strip(),
+            confirmation=confirmation.strip(),
+        )
+    except Exception as exc:
+        manifest = service.operations.get(manifest_id.strip(), service.domain)
+        if manifest is None:
+            return _error(request, _friendly(exc))
         return TEMPLATES.TemplateResponse(
             request,
             "_drive_manifest.html",
-            {
-                "manifest": manifest,
-                "error": "Type the exact destination email to confirm.",
-            },
+            {"manifest": manifest, "error": _friendly(exc)},
+        )
+    if manifest.status == "completed" or manifest.remaining == 0:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_drive_job.html",
+            {"job": None, "manifest": manifest},
         )
     job = start_job(request.app.state.gamgui.jobs, manifest.remaining)
-    job.task = asyncio.create_task(
-        _run_manifest_job(job, service, manifest.id, confirmation.strip())
-    )
+    try:
+        job.task = asyncio.create_task(
+            _run_manifest_job(job, service, manifest.id, confirmation.strip())
+        )
+    except Exception:
+        service.interrupt_manifest_claim(manifest.id)
+        raise
     return TEMPLATES.TemplateResponse(
         request, "_drive_job.html", {"job": job, "manifest": manifest}
     )

@@ -97,39 +97,40 @@
   // in WKWebView (plain DOM, no <datalist>) and scales — /builder/pick returns only the top matches
   // from the cached directory. Document-level delegation so it works on HTMX-injected forms.
   (function () {
-    var timer;
-    function menuOf(inp) { var w = inp.closest(".upick-wrap"); return w ? w.querySelector(".upick-menu") : null; }
-    function closeAll() { document.querySelectorAll(".upick-menu").forEach(function (m) { m.classList.add("hidden"); }); }
-    function search(inp) {
-      var menu = menuOf(inp);
-      if (!menu) return;
-      var kind = inp.dataset.kind || "users";
-      fetch("/builder/pick?kind=" + encodeURIComponent(kind) + "&q=" + encodeURIComponent(inp.value.trim()))
-        .then(function (r) { return r.text(); })
-        .then(function (html) { menu.innerHTML = html; menu.classList.remove("hidden"); })
-        .catch(function () {});
+    function closeAll() {
+      document.querySelectorAll(".upick-menu").forEach(function (menu) {
+        menu.classList.add("hidden");
+        var input = menu.closest(".upick-wrap").querySelector(".upick");
+        if (input) input.setAttribute("aria-expanded", "false");
+      });
     }
-    document.addEventListener("input", function (e) {
-      if (!e.target.classList || !e.target.classList.contains("upick")) return;
-      clearTimeout(timer);
-      timer = setTimeout(function () { search(e.target); }, 180);
+    document.addEventListener("htmx:afterSwap", function (e) {
+      if (!e.target.classList || !e.target.classList.contains("upick-menu")) return;
+      e.target.classList.remove("hidden");
+      var input = e.target.closest(".upick-wrap").querySelector(".upick");
+      if (input) input.setAttribute("aria-expanded", "true");
     });
-    document.addEventListener("focusin", function (e) {
-      if (e.target.classList && e.target.classList.contains("upick")) search(e.target);
-    });
+    function choose(option) {
+      var input = option.closest(".upick-wrap").querySelector(".upick");
+      input.value = option.dataset.val;
+      closeAll();
+      input.focus();
+    }
     // mousedown (not click) so the pick registers before the input's blur hides the menu.
     document.addEventListener("mousedown", function (e) {
       var opt = e.target.closest ? e.target.closest(".upick-opt") : null;
       if (opt) {
         e.preventDefault();
-        var inp = opt.closest(".upick-wrap").querySelector(".upick");
-        inp.value = opt.dataset.val;
-        closeAll();
+        choose(opt);
         return;
       }
       var onInput = e.target.classList && e.target.classList.contains("upick");
       var inMenu = e.target.closest && e.target.closest(".upick-menu");
       if (!onInput && !inMenu) closeAll();
+    });
+    document.addEventListener("click", function (e) {
+      var opt = e.target.closest ? e.target.closest(".upick-opt") : null;
+      if (opt) choose(opt);
     });
   })();
 

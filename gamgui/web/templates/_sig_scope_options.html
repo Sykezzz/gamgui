@@ -1,0 +1,23 @@
+{% if error %}
+<p class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">{{ error }}</p>
+{% elif free_text %}
+<p class="px-1 py-2 text-xs text-brand-gray">Enter the exact value used in the directory.</p>
+{% elif items %}
+<div class="overflow-hidden rounded-lg border border-brand-gray/40 bg-brand-white shadow-sm" role="listbox" aria-label="Matching signature scopes">
+  {% for value, label, detail in items %}
+  <button type="button"
+          class="sig-scope-option block w-full border-b border-brand-gray/20 px-3 py-2 text-left last:border-b-0 hover:bg-paper focus:outline-none focus:ring-2 focus:ring-inset focus:ring-brand-blue/30"
+          role="option"
+          data-value="{{ value }}"
+          onclick="sigChooseScope(this)">
+    <span class="block truncate text-sm font-medium text-brand-black">{{ label }}</span>
+    {% if detail and detail != label %}<span class="block truncate text-xs text-brand-gray">{{ detail }}</span>{% endif %}
+  </button>
+  {% endfor %}
+</div>
+{% if more %}
+<p class="px-1 py-1 text-[11px] text-brand-gray">Showing the first {{ items | length }} matches — keep typing to narrow.</p>
+{% endif %}
+{% else %}
+<p class="px-1 py-2 text-sm text-brand-gray">No matches. You can still enter an exact scope value.</p>
+{% endif %}

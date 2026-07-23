@@ -1,22 +1,30 @@
 """Audit Viewer routes (read-only).
 
-Reads the local JSONL audit log (see ``core/audit.py``) — no gam calls at all. Every guarded
-mutation elsewhere in the app appends a line to that log; this screen just surfaces it, including
-the ok:false failures that otherwise sit silent in a file.
+Reads the local JSONL audit log through its incremental SQLite index (see ``core/audit.py``) — no
+gam calls at all. Every guarded mutation elsewhere in the app appends a line to that log; this
+screen just surfaces it, including the ok:false failures that otherwise sit silent in a file.
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterator
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
-from ...core.audit import default_audit_path, read_records
+from ...core.audit import (
+    AUDIT_PAGE_SIZE,
+    MAX_AUDIT_QUERY_CHARS,
+    MIN_AUDIT_QUERY_CHARS,
+    AuditPage,
+    default_audit_path,
+    get_audit_index,
+    validate_audit_query,
+)
 from ..server import TEMPLATES
 
 # Cells starting with these can be interpreted as a formula if the CSV is opened in Excel/Sheets;
@@ -30,7 +38,7 @@ def _csv_safe(value: Any) -> str:
 
 router = APIRouter(prefix="/audit")
 
-PAGE_SIZE = 25
+PAGE_SIZE = AUDIT_PAGE_SIZE
 
 _AUDIT_PAGE = "audit.html"
 _AUDIT_ROWS = "_audit_rows.html"
@@ -51,72 +59,119 @@ def _audit_path(request: Request) -> Path:
     return path if path is not None else default_audit_path()
 
 
-def _matches(record: Dict[str, Any], q: str) -> bool:
-    q = q.lower()
-    haystack = [
-        str(record.get("action") or ""),
-        str(record.get("target") or ""),
-        str(record.get("extra", {}).get("error") or "") if isinstance(record.get("extra"), dict) else "",
-        " ".join(str(a) for a in (record.get("argv") or [])),
-    ]
-    return any(q in h.lower() for h in haystack)
-
-
-def _filter_records(records: List[Dict[str, Any]], q: str, failed: bool) -> List[Dict[str, Any]]:
-    out = records
-    if failed:
-        out = [r for r in out if r.get("ok") is False]
-    q = (q or "").strip()
-    if q:
-        out = [r for r in out if _matches(r, q)]
-    return out
-
-
-def _rows_context(records: List[Dict[str, Any]], q: str = "", failed: bool = False, page: int = 1) -> dict:
-    filtered = _filter_records(records, q, failed)
-    total = len(filtered)
-    pages = max(1, math.ceil(total / PAGE_SIZE))
-    page = max(1, min(page, pages))
-    start = (page - 1) * PAGE_SIZE
+def _display_row(record: dict) -> dict:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    error = str((extra or {}).get("error") or "")
+    argv = record.get("argv") if isinstance(record.get("argv"), list) else []
+    detail = error or " ".join(str(arg) for arg in argv)
     return {
-        "rows": filtered[start:start + PAGE_SIZE],
-        "q": q, "failed": failed, "page": page, "pages": pages, "total": total,
+        "ts": str(record.get("ts") or "")[:64],
+        "action": str(record.get("action") or "")[:96],
+        "target": str(record.get("target") or "")[:320],
+        "ok": record.get("ok"),
+        "detail": detail[:160],
+        "detail_truncated": len(detail) > 160,
+    }
+
+
+def _indexed_rows_context(result: AuditPage, q: str, failed: bool) -> dict:
+    return {
+        "rows": [_display_row(record) for record in result.rows],
+        "q": q,
+        "failed": failed,
+        "page": result.page,
+        "pages": result.pages,
+        "total": result.total,
     }
 
 
 @router.get("", response_class=HTMLResponse)
 async def audit_page(request: Request) -> HTMLResponse:
-    records = read_records(_audit_path(request))
-    total = len(records)
-    failures = sum(1 for r in records if r.get("ok") is False)
-    ctx = {"total": total, "failures": failures}
-    ctx.update(_rows_context(records))
+    index = await asyncio.to_thread(get_audit_index, _audit_path(request))
+
+    def load():
+        return index.summary(), index.page(page_size=PAGE_SIZE)
+
+    summary, result = await asyncio.to_thread(load)
+    ctx = {
+        "total": summary.total,
+        "failures": summary.failures,
+        "query_min": MIN_AUDIT_QUERY_CHARS,
+        "query_max": MAX_AUDIT_QUERY_CHARS,
+    }
+    ctx.update(_indexed_rows_context(result, "", False))
     return TEMPLATES.TemplateResponse(request, _AUDIT_PAGE, ctx)
 
 
 @router.get("/rows", response_class=HTMLResponse)
 async def audit_rows(request: Request, q: str = "", failed: int = 0, page: int = 1) -> HTMLResponse:
-    records = read_records(_audit_path(request))
-    ctx = _rows_context(records, q, bool(failed), page)
+    failed_only = bool(failed)
+    try:
+        query = validate_audit_query(q)
+    except ValueError as exc:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _AUDIT_ROWS,
+            {
+                "rows": [],
+                "q": q.strip()[:MAX_AUDIT_QUERY_CHARS],
+                "failed": failed_only,
+                "page": 1,
+                "pages": 1,
+                "total": 0,
+                "query_error": str(exc),
+            },
+            status_code=400,
+        )
+    index = await asyncio.to_thread(get_audit_index, _audit_path(request))
+    result = await asyncio.to_thread(
+        index.page,
+        q=query,
+        failed=failed_only,
+        page=page,
+        page_size=PAGE_SIZE,
+    )
+    ctx = _indexed_rows_context(result, query, failed_only)
     return TEMPLATES.TemplateResponse(request, _AUDIT_ROWS, ctx)
 
 
 @router.get("/export.csv")
-async def audit_export(request: Request, q: str = "", failed: int = 0) -> Response:
-    records = read_records(_audit_path(request))
-    filtered = _filter_records(records, q, bool(failed))
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["ts", "action", "target", "ok", "exit_code", "error", "argv"])
-    for r in filtered:
-        extra = r.get("extra") if isinstance(r.get("extra"), dict) else {}
-        error = (extra or {}).get("error", "")
-        argv = " ".join(str(a) for a in (r.get("argv") or []))
-        writer.writerow([_csv_safe(c) for c in
-                         (r.get("ts", ""), r.get("action", ""), r.get("target", ""),
-                          r.get("ok"), r.get("exit_code"), error, argv)])
-    return Response(
-        content=buf.getvalue(),
+async def audit_export(request: Request, q: str = "", failed: int = 0):
+    try:
+        query = validate_audit_query(q)
+    except ValueError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    index = await asyncio.to_thread(get_audit_index, _audit_path(request))
+
+    def rows() -> Iterator[str]:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["ts", "action", "target", "ok", "exit_code", "error", "argv"])
+        yield buf.getvalue()
+        for record in index.iter_filtered(q=query, failed=bool(failed)):
+            buf.seek(0)
+            buf.truncate(0)
+            extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+            error = (extra or {}).get("error", "")
+            argv = " ".join(str(arg) for arg in (record.get("argv") or []))
+            writer.writerow(
+                [
+                    _csv_safe(cell)
+                    for cell in (
+                        record.get("ts", ""),
+                        record.get("action", ""),
+                        record.get("target", ""),
+                        record.get("ok"),
+                        record.get("exit_code"),
+                        error,
+                        argv,
+                    )
+                ]
+            )
+            yield buf.getvalue()
+
+    return StreamingResponse(
+        rows(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=audit-export.csv"},
     )

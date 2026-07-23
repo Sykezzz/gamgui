@@ -33,6 +33,7 @@ _SUBCAT_FORWARDING = "Gmail - Forwarding"
 _SUBCAT_MESSAGES = "Gmail - Messages"
 FORWARD_ACTIONS = list(GAMCommands.FORWARD_ACTIONS)
 MESSAGE_DETAIL = list(GAMCommands.MESSAGE_DETAIL)
+INTERACTIVE_FILE_LIMIT = 50
 
 # Group the ~53 grammar categories into a short, browsable set of areas (display order below).
 # Anything unmapped falls through to "Other".
@@ -84,6 +85,19 @@ def _cmd(cid, category, subcategory, name, risk, slots, build, raw, desc="") -> 
         verb=name.split()[0].lower(), risk=risk, buildable=True, slots=slots, build=build,
         description=desc,
     )
+
+
+def _required_search(slots, label: str, build):
+    """Build a curated search only when its narrowing query is present.
+
+    The generic catalog still exposes explicit export commands for administrators who intentionally
+    need a complete tenant snapshot.  These three friendly search cards are interactive surfaces,
+    so a missing query must never silently turn them into full-directory/Drive reads.
+    """
+    query = (slots.get("query") or "").strip()
+    if not query:
+        raise ValueError(f"{label} is required for an interactive search.")
+    return build(query)
 
 
 def _curated() -> List[CatalogCommand]:
@@ -155,7 +169,9 @@ def _curated() -> List[CatalogCommand]:
              [_slot("query", "User search", SlotKind.TEXT,
                     placeholder="isSuspended=true · orgUnitPath=/Sales · isEnrolledIn2Sv=false",
                     hints=USER_QUERY_HINTS, hint_note=USER_QUERY_NOTE)],
-             lambda s: GAMCommands.print_users(query=s.get("query") or None),
+             lambda s: _required_search(
+                 s, "User search", lambda query: GAMCommands.print_users(query=query)
+             ),
              "gam print users query <QueryUser>",
              "Search the directory for users by an Admin-SDK query — suspended, admins, by OU, "
              "2-step status, department, manager, name…"),
@@ -163,7 +179,9 @@ def _curated() -> List[CatalogCommand]:
              [_slot("query", "Device search", SlotKind.TEXT,
                     placeholder="status:provisioned · asset_id:… · user:…",
                     hints=CROS_QUERY_HINTS, hint_note=CROS_QUERY_NOTE)],
-             lambda s: GAMCommands.print_cros(query=s.get("query", "")),
+             lambda s: _required_search(
+                 s, "Device search", lambda query: GAMCommands.print_cros(query=query)
+             ),
              "gam print cros query <QueryCrOS>",
              "Search the managed ChromeOS fleet — by status, asset ID, assigned user, location, "
              "last-sync/AUE date, or model…"),
@@ -172,8 +190,14 @@ def _curated() -> List[CatalogCommand]:
               _slot("query", "Drive search", SlotKind.TEXT,
                     placeholder="'me' in owners and trashed=false",
                     hints=DRIVE_QUERY_HINTS, hint_note=DRIVE_QUERY_NOTE)],
-             lambda s: GAMCommands.print_filelist(s["email"], s.get("query", "")),
-             "gam user <email> print filelist query <QueryDriveFile>",
+             lambda s: _required_search(
+                 s,
+                 "Drive search",
+                 lambda query: GAMCommands.print_filelist(
+                     s["email"], query, max_files=INTERACTIVE_FILE_LIMIT
+                 ),
+             ),
+             "gam user <email> print filelist query <QueryDriveFile> maxfiles 50",
              "Search a user's Drive by a Drive query — by name, type, owner, sharing, or modified date…"),
         _cmd("build.print_forwarding", "Users", _SUBCAT_FORWARDING, "List forwarding addresses", RiskLevel.READ_ONLY,
              [_slot("email", "User", U)],

@@ -157,6 +157,10 @@ class GAMRunner:
             proc.kill()
             await proc.wait()
             raise GAMError(GAMErrorKind.TIMEOUT, exit_code=None, stderr="command timed out", argv=list(argv))
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
         return RunResult(
             stdout=(out or b"").decode("utf-8", "replace"),
             stderr=(err or b"").decode("utf-8", "replace"),

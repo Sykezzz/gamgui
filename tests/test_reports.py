@@ -56,3 +56,17 @@ def test_parse_usage_sorts_by_storage_and_converts_gb():
     assert u[0].email == "big@e.com" and u[0].storage_gb == 1024.0
     assert u[1].email == "small@e.com" and u[1].storage_gb == 2.0
     assert u[1].received == 40 and u[1].sent == 3
+
+
+def test_parse_usage_keeps_a_bounded_top_set_from_an_iterator():
+    rows = (
+        {
+            "email": f"user{i}@example.com",
+            "accounts:used_quota_in_mb": str(i),
+        }
+        for i in range(10_000)
+    )
+    usage = parse_usage(rows, limit=25)
+    assert len(usage) == 25
+    assert usage[0].quota_mb == 9_999
+    assert usage[-1].quota_mb == 9_975

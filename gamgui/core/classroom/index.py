@@ -12,7 +12,7 @@ import time
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from ..paths import app_data_dir
 from .models import CourseSummary
@@ -89,6 +89,23 @@ class CourseIndex:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS courses_stage (
+                    domain TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    room TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    course_state TEXT NOT NULL,
+                    creation_time TEXT NOT NULL,
+                    update_time TEXT NOT NULL,
+                    alternate_link TEXT NOT NULL,
+                    PRIMARY KEY (domain, id)
+                )
+                """
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS courses_domain_state_name "
                 "ON courses(domain, course_state, name COLLATE NOCASE)"
             )
@@ -130,39 +147,70 @@ class CourseIndex:
             except OSError:
                 pass
 
-    def replace_all(self, domain: str, courses: Sequence[CourseSummary]) -> int:
+    def replace_all(self, domain: str, courses: Iterable[CourseSummary]) -> int:
+        """Atomically replace one domain from a streaming course-summary iterable."""
         scoped_domain = _normalize_domain(domain)
-        rows = [_course_row(scoped_domain, course) for course in courses if course.id]
         with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "DELETE FROM courses_stage WHERE domain = ?",
+                (scoped_domain,),
+            )
+            for course in courses:
+                if not course.id:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO courses_stage (
+                        domain, id, name, section, room, owner_id, course_state,
+                        creation_time, update_time, alternate_link
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _course_row(scoped_domain, course),
+                )
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM courses_stage WHERE domain = ?",
+                    (scoped_domain,),
+                ).fetchone()[0]
+            )
             conn.execute("DELETE FROM courses WHERE domain = ?", (scoped_domain,))
-            conn.executemany(
+            conn.execute(
                 """
                 INSERT INTO courses (
                     domain, id, name, section, room, owner_id, course_state,
                     creation_time, update_time, alternate_link
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                )
+                SELECT
+                    domain, id, name, section, room, owner_id, course_state,
+                    creation_time, update_time, alternate_link
+                FROM courses_stage
+                WHERE domain = ?
                 """,
-                rows,
+                (scoped_domain,),
             )
             if self._fts_enabled:
                 conn.execute("DELETE FROM courses_fts WHERE domain = ?", (scoped_domain,))
-                conn.executemany(
+                conn.execute(
                     """
                     INSERT INTO courses_fts (
                         domain, course_id, name, section, room, owner_identifier
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    )
+                    SELECT domain, id, name, section, room, owner_id
+                    FROM courses_stage
+                    WHERE domain = ?
                     """,
-                    [
-                        (row[0], row[1], row[2], row[3], row[4], row[5])
-                        for row in rows
-                    ],
+                    (scoped_domain,),
                 )
             conn.execute(
                 "INSERT OR REPLACE INTO course_snapshots(domain, updated_at) VALUES (?, ?)",
                 (scoped_domain, time.time()),
             )
+            conn.execute(
+                "DELETE FROM courses_stage WHERE domain = ?",
+                (scoped_domain,),
+            )
         self._restrict_perms()
-        return len(rows)
+        return count
 
     def upsert(self, domain: str, course: CourseSummary) -> None:
         if not course.id:

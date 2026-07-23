@@ -90,9 +90,10 @@ if [ -n "$EXPECTED" ]; then
   fi
   echo "==> Checksum verified against committed pin (scripts/gam_checksums.txt)."
 else
-  echo "WARNING: no pinned checksum for '$ASSET_NAME' — installing trust-on-first-use." >&2
-  echo "         Verify the download, then add this line to scripts/gam_checksums.txt:" >&2
-  echo "           $SHA  $ASSET_NAME" >&2
+  echo "ERROR: no committed checksum for '$ASSET_NAME'." >&2
+  echo "  Refusing to install an unpinned GAM binary on this architecture." >&2
+  echo "  The automated bump must record every supported macOS architecture first." >&2
+  exit 1
 fi
 
 echo "==> Extracting..."

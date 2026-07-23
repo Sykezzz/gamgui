@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Optional
 
 from ..paths import app_data_dir
+from ..processes import current_process_identity, process_lease_is_dead
 from .models import OperationManifest, OperationTarget
+
+CLAIMABLE_OPERATION_STATUSES = ("planned", "interrupted", "partial")
 
 
 def _now() -> str:
@@ -66,7 +69,10 @@ class DriveOperationStore:
                     target_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    run_owner TEXT NOT NULL DEFAULT '',
+                    run_pid INTEGER NOT NULL DEFAULT 0,
+                    run_identity TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS drive_operation_targets (
                     operation_id TEXT NOT NULL REFERENCES drive_operations(id) ON DELETE CASCADE,
@@ -84,6 +90,25 @@ class DriveOperationStore:
                     ON drive_operations(domain, status, updated_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(drive_operations)")
+            }
+            if "run_owner" not in columns:
+                conn.execute(
+                    "ALTER TABLE drive_operations "
+                    "ADD COLUMN run_owner TEXT NOT NULL DEFAULT ''"
+                )
+            if "run_pid" not in columns:
+                conn.execute(
+                    "ALTER TABLE drive_operations "
+                    "ADD COLUMN run_pid INTEGER NOT NULL DEFAULT 0"
+                )
+            if "run_identity" not in columns:
+                conn.execute(
+                    "ALTER TABLE drive_operations "
+                    "ADD COLUMN run_identity TEXT NOT NULL DEFAULT ''"
+                )
         self._secure_files()
         self.recover_interrupted()
 
@@ -172,15 +197,101 @@ class DriveOperationStore:
             status=row["status"],
         )
 
-    def set_operation_status(self, operation_id: str, domain: str, status: str) -> None:
+    def set_operation_status(
+        self,
+        operation_id: str,
+        domain: str,
+        status: str,
+        *,
+        owner_id: str = "",
+    ) -> None:
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with self._connect() as conn:
-            conn.execute(
+            if status == "running":
+                raise ValueError(
+                    "Running Drive operations must be acquired with claim_operation()."
+                )
+            result = conn.execute(
                 """
-                UPDATE drive_operations SET status = ?, updated_at = ?
+                UPDATE drive_operations
+                SET status = ?, updated_at = ?, run_owner = '', run_pid = 0,
+                    run_identity = ''
                 WHERE id = ? AND domain = ?
+                  AND (status != 'running' OR run_owner = ?)
                 """,
-                (status, _now(), operation_id, domain),
+                (status, _now(), operation_id, domain, owner),
             )
+            if result.rowcount != 1:
+                exists = conn.execute(
+                    "SELECT 1 FROM drive_operations WHERE id = ? AND domain = ?",
+                    (operation_id, domain),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError("Drive operation not found for the active domain.")
+                raise PermissionError(
+                    "The Drive operation lease is owned by another executor."
+                )
+
+    def claim_operation(
+        self,
+        operation_id: str,
+        domain: str,
+        *,
+        owner_id: str = "",
+        owner_pid: Optional[int] = None,
+        owner_identity: Optional[str] = None,
+    ) -> bool:
+        """Atomically claim one resumable manifest for a single executor."""
+
+        pid = os.getpid() if owner_pid is None else int(owner_pid)
+        owner = owner_id.strip() or f"pid:{pid}"
+        identity = (
+            current_process_identity()
+            if owner_identity is None
+            else owner_identity
+        )
+        placeholders = ",".join("?" for _ in CLAIMABLE_OPERATION_STATUSES)
+        with self._connect() as conn:
+            result = conn.execute(
+                f"""
+                UPDATE drive_operations
+                SET status = 'running', updated_at = ?, run_owner = ?, run_pid = ?,
+                    run_identity = ?
+                WHERE id = ? AND domain = ? AND status IN ({placeholders})
+                """,
+                (
+                    _now(),
+                    owner,
+                    pid,
+                    identity,
+                    operation_id,
+                    domain,
+                    *CLAIMABLE_OPERATION_STATUSES,
+                ),
+            )
+        return result.rowcount == 1
+
+    def owns_claim(self, operation_id: str, domain: str, owner_id: str) -> bool:
+        """Return whether the exact executor token still owns the running lease."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM drive_operations
+                WHERE id = ? AND domain = ? AND status = 'running'
+                  AND run_owner = ?
+                """,
+                (operation_id, domain, owner_id),
+            ).fetchone()
+        return row is not None
+
+    def has_active_jobs(self) -> bool:
+        """Return whether an ownership operation is currently executing."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM drive_operations WHERE status = 'running' LIMIT 1"
+            ).fetchone()
+        return row is not None
 
     def set_target_status(
         self,
@@ -191,7 +302,9 @@ class DriveOperationStore:
         *,
         error: str = "",
         residual_access: str = "",
+        owner_id: str = "",
     ) -> None:
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with self._connect() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM drive_operations WHERE id = ? AND domain = ?",
@@ -199,30 +312,83 @@ class DriveOperationStore:
             ).fetchone()
             if exists is None:
                 raise KeyError("Drive operation not found for the active domain.")
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE drive_operation_targets
                 SET status = ?, error = ?, residual_access = ?
                 WHERE operation_id = ? AND file_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM drive_operations
+                      WHERE id = ? AND domain = ? AND status = 'running'
+                        AND run_owner = ?
+                  )
                 """,
-                (status, error, residual_access, operation_id, file_id),
+                (
+                    status,
+                    error,
+                    residual_access,
+                    operation_id,
+                    file_id,
+                    operation_id,
+                    domain,
+                    owner,
+                ),
             )
-            conn.execute(
-                "UPDATE drive_operations SET updated_at = ? WHERE id = ?",
-                (_now(), operation_id),
+            if result.rowcount != 1:
+                raise PermissionError(
+                    "The Drive operation lease is owned by another executor."
+                )
+            updated = conn.execute(
+                """
+                UPDATE drive_operations SET updated_at = ?
+                WHERE id = ? AND domain = ? AND status = 'running'
+                  AND run_owner = ?
+                """,
+                (_now(), operation_id, domain, owner),
             )
+            if updated.rowcount != 1:
+                raise PermissionError(
+                    "The Drive operation lease is owned by another executor."
+                )
 
     def recover_interrupted(self) -> None:
-        """Crash recovery is fail-closed: running targets require an explicit resume."""
+        """Recover only operations whose owning process is no longer alive.
+
+        Constructing another store can happen during connector verification or in a second app
+        process. A live executor's claim must remain untouched; otherwise the new store could make
+        the same manifest claimable while the original task is still mutating Drive.
+        """
         now = _now()
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE drive_operation_targets SET status = 'interrupted' WHERE status = 'running'"
-            )
-            conn.execute(
+            running = conn.execute(
                 """
-                UPDATE drive_operations SET status = 'interrupted', updated_at = ?
+                SELECT id, run_owner, run_pid, run_identity
+                FROM drive_operations
                 WHERE status = 'running'
-                """,
-                (now,),
-            )
+                """
+            ).fetchall()
+            for operation in running:
+                pid = int(operation["run_pid"] or 0)
+                identity = str(operation["run_identity"] or "")
+                if not process_lease_is_dead(pid, identity):
+                    continue
+                owner = str(operation["run_owner"] or "")
+                result = conn.execute(
+                    """
+                    UPDATE drive_operations
+                    SET status = 'interrupted', updated_at = ?,
+                        run_owner = '', run_pid = 0, run_identity = ''
+                    WHERE id = ? AND status = 'running'
+                      AND run_owner = ? AND run_pid = ? AND run_identity = ?
+                    """,
+                    (now, operation["id"], owner, pid, identity),
+                )
+                if result.rowcount == 1:
+                    conn.execute(
+                        """
+                        UPDATE drive_operation_targets
+                        SET status = 'interrupted'
+                        WHERE operation_id = ? AND status = 'running'
+                        """,
+                        (operation["id"],),
+                    )

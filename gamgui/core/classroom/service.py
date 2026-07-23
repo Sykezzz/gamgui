@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from ..connectors.base import ChangeResult
+from ..processes import current_process_identity
 from .index import CourseIndex, CoursePage, MAX_PAGE_SIZE
 from .manifests import RosterManifest, RosterManifestStore
 from .models import (
@@ -51,13 +54,12 @@ class ClassroomService:
         self.course_index = course_index
         self.manifests = manifests
         self._refresh_lock = asyncio.Lock()
+        self._operation_owner = f"{os.getpid()}:{secrets.token_urlsafe(12)}"
+        self._operation_identity = current_process_identity()
 
     async def refresh_index(self) -> int:
         async with self._refresh_lock:
-            courses = await self.connector.list_courses()
-            return await asyncio.to_thread(
-                self.course_index.replace_all, self.domain, courses
-            )
+            return await self.connector.refresh_course_index(self.course_index)
 
     async def search(
         self,
@@ -162,7 +164,7 @@ class ClassroomService:
             preview.course.id, preview.target_email
         )
         current = await self._patch_after(result, preview.course.id)
-        if result.ok and current.owner_email and current.owner_email != preview.target_email:
+        if result.ok and current.owner_email != preview.target_email:
             return (
                 ChangeResult(
                     preview=result.preview,
@@ -205,17 +207,42 @@ class ClassroomService:
         course = await self._live_course(course_id)
         self._require_roster_writable(course)
         target = normalize_email(email)
-        if normalized_role == "teachers":
-            teachers = await self.connector.list_course_participants(
-                course.id, normalized_role
+        if not valid_email(target):
+            raise ClassroomValidationError(
+                "Choose a current roster member by email."
             )
-            owner_email = _owner_email(course, teachers)
-            if owner_email and target == owner_email:
+        members = await self.connector.list_course_participants(
+            course.id,
+            normalized_role,
+        )
+        selected = next(
+            (
+                member
+                for member in members
+                if normalize_email(member.email) == target
+            ),
+            None,
+        )
+        if selected is None:
+            raise ClassroomValidationError(
+                "That user is not a current member of this course roster."
+            )
+        canonical = normalize_email(selected.email)
+        if normalized_role == "teachers":
+            owner_email = _owner_email(course, members)
+            owner_id_matches = bool(
+                course.owner_id
+                and selected.user_id
+                and course.owner_id == selected.user_id
+            )
+            if owner_id_matches or (owner_email and canonical == owner_email):
                 raise ClassroomValidationError(
                     "The course owner cannot be removed from the teacher roster."
                 )
         result = await self.connector.remove_course_participant(
-            course.id, normalized_role, target
+            course.id,
+            normalized_role,
+            canonical,
         )
         return result, course
 
@@ -279,9 +306,29 @@ class ClassroomService:
                 "The live roster changed after this preview. Review a fresh diff before applying."
             )
 
-        await asyncio.to_thread(self.manifests.mark_running, manifest.id)
+        claimed = await asyncio.to_thread(
+            self.manifests.mark_running,
+            manifest.id,
+            owner_id=self._operation_owner,
+            owner_pid=os.getpid(),
+            owner_identity=self._operation_identity,
+        )
+        if not claimed:
+            raise ClassroomValidationError(
+                "This roster preview was already claimed. "
+                "Re-read the live roster and preview it again."
+            )
         try:
+            additions_succeeded = True
             for email in live_diff.adds:
+                if not await asyncio.to_thread(
+                    self.manifests.owns_claim,
+                    manifest.id,
+                    self._operation_owner,
+                ):
+                    raise ClassroomValidationError(
+                        "The roster operation lease was lost; no further members were changed."
+                    )
                 target = email
                 try:
                     target = await self._require_active_user(email)
@@ -295,10 +342,14 @@ class ClassroomService:
                         "add",
                         ok=result.ok,
                         detail=result.detail,
+                        owner_id=self._operation_owner,
                     )
+                    if not result.ok:
+                        additions_succeeded = False
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    additions_succeeded = False
                     await asyncio.to_thread(
                         self.manifests.mark_target,
                         manifest.id,
@@ -306,8 +357,31 @@ class ClassroomService:
                         "add",
                         ok=False,
                         detail=str(exc),
+                        owner_id=self._operation_owner,
                     )
             for email in live_diff.removes:
+                if not await asyncio.to_thread(
+                    self.manifests.owns_claim,
+                    manifest.id,
+                    self._operation_owner,
+                ):
+                    raise ClassroomValidationError(
+                        "The roster operation lease was lost; no further members were changed."
+                    )
+                if not additions_succeeded:
+                    await asyncio.to_thread(
+                        self.manifests.mark_target,
+                        manifest.id,
+                        email,
+                        "remove",
+                        ok=False,
+                        detail=(
+                            "Skipped because at least one required addition failed. "
+                            "No removals were attempted."
+                        ),
+                        owner_id=self._operation_owner,
+                    )
+                    continue
                 if (
                     manifest.role == "teachers"
                     and owner_email
@@ -320,6 +394,7 @@ class ClassroomService:
                         "remove",
                         ok=False,
                         detail="The course owner cannot be removed.",
+                        owner_id=self._operation_owner,
                     )
                     continue
                 try:
@@ -333,6 +408,7 @@ class ClassroomService:
                         "remove",
                         ok=result.ok,
                         detail=result.detail,
+                        owner_id=self._operation_owner,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -344,6 +420,7 @@ class ClassroomService:
                         "remove",
                         ok=False,
                         detail=str(exc),
+                        owner_id=self._operation_owner,
                     )
         except asyncio.CancelledError:
             await asyncio.to_thread(
@@ -351,6 +428,7 @@ class ClassroomService:
                 manifest.id,
                 status="interrupted",
                 error="The app stopped before this roster operation finished.",
+                owner_id=self._operation_owner,
             )
             raise
         except Exception as exc:
@@ -359,27 +437,47 @@ class ClassroomService:
                 manifest.id,
                 status="failed",
                 error=str(exc),
+                owner_id=self._operation_owner,
             )
             final = await asyncio.to_thread(self.manifests.get, manifest.id)
             if final is None:  # pragma: no cover
                 raise
             return final
 
-        _, after = await self.roster(course.id, manifest.role)
-        residual_diff = RosterDiff.compute(
-            manifest.role, manifest.desired, participant_emails(after)
-        )
-        residual = _residual_labels(residual_diff)
-        current_manifest = await asyncio.to_thread(self.manifests.get, manifest.id)
-        failed = current_manifest.failed_count if current_manifest else 0
-        status = "completed" if not residual and not failed else "partial"
-        await asyncio.to_thread(
-            self.manifests.finish,
-            manifest.id,
-            status=status,
-            residual=residual,
-            error="" if status == "completed" else "Some roster changes did not apply.",
-        )
+        try:
+            _, after = await self.roster(course.id, manifest.role)
+            residual_diff = RosterDiff.compute(
+                manifest.role, manifest.desired, participant_emails(after)
+            )
+            residual = _residual_labels(residual_diff)
+            current_manifest = await asyncio.to_thread(self.manifests.get, manifest.id)
+            failed = current_manifest.failed_count if current_manifest else 0
+            status = "completed" if not residual and not failed else "partial"
+            await asyncio.to_thread(
+                self.manifests.finish,
+                manifest.id,
+                status=status,
+                residual=residual,
+                error="" if status == "completed" else "Some roster changes did not apply.",
+                owner_id=self._operation_owner,
+            )
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self.manifests.finish,
+                manifest.id,
+                status="interrupted",
+                error="The app stopped before roster verification finished.",
+                owner_id=self._operation_owner,
+            )
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(
+                self.manifests.finish,
+                manifest.id,
+                status="failed",
+                error=f"Post-operation verification failed: {exc}",
+                owner_id=self._operation_owner,
+            )
         final = await asyncio.to_thread(self.manifests.get, manifest.id)
         if final is None:  # pragma: no cover
             raise RuntimeError("Roster operation result was not persisted.")

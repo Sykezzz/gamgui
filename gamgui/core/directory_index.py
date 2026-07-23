@@ -28,6 +28,11 @@ MAX_PAGE_SIZE = 50
 DEFAULT_STALE_SECONDS = 15 * 60
 _SCHEMA_VERSION = "1"
 _KINDS = {"users", "groups"}
+_MAX_EMAIL_CHARS = 254
+_MAX_NAME_CHARS = 100
+_MAX_ORG_UNIT_CHARS = 256
+_MAX_PROFILE_SUMMARY_CHARS = 128
+_MAX_TIMESTAMP_CHARS = 64
 
 
 def default_index_path() -> Path:
@@ -75,6 +80,12 @@ def _terms(*values: str) -> Set[str]:
         if "@" in phrase:
             terms.add(phrase.split("@", 1)[0])
     return terms
+
+
+def _summary_text(value: object, limit: int) -> str:
+    """Bound low-sensitivity list fields before they enter the persistent summary index."""
+
+    return str(value or "")[:limit]
 
 
 def _encode_cursor(offset: int) -> str:
@@ -231,17 +242,17 @@ class DirectoryIndex:
     def _user_row(domain: str, user: GAMUser) -> tuple:
         return (
             domain,
-            user.primary_email.strip().lower(),
-            user.given_name or "",
-            user.family_name or "",
+            _summary_text(user.primary_email, _MAX_EMAIL_CHARS).strip().lower(),
+            _summary_text(user.given_name, _MAX_NAME_CHARS),
+            _summary_text(user.family_name, _MAX_NAME_CHARS),
             int(bool(user.suspended)),
-            user.org_unit_path or "/",
-            user.title or "",
-            user.department or "",
+            _summary_text(user.org_unit_path or "/", _MAX_ORG_UNIT_CHARS),
+            _summary_text(user.title, _MAX_PROFILE_SUMMARY_CHARS),
+            _summary_text(user.department, _MAX_PROFILE_SUMMARY_CHARS),
             int(bool(user.is_admin)),
             int(bool(user.is_delegated_admin)),
             int(bool(user.enrolled_2sv)),
-            user.last_login_time,
+            _summary_text(user.last_login_time, _MAX_TIMESTAMP_CHARS) or None,
         )
 
     @staticmethod
@@ -274,12 +285,12 @@ class DirectoryIndex:
                         (self.domain, email, term)
                         for term in _terms(
                             email,
-                            user.given_name,
-                            user.family_name,
-                            user.full_name,
-                            user.title,
-                            user.department,
-                            user.org_unit_path,
+                            row[2],
+                            row[3],
+                            f"{row[2]} {row[3]}".strip(),
+                            row[6],
+                            row[7],
+                            row[5],
                         )
                     ],
                 )
@@ -359,12 +370,12 @@ class DirectoryIndex:
                     (self.domain, email, term)
                     for term in _terms(
                         email,
-                        user.given_name,
-                        user.family_name,
-                        user.full_name,
-                        user.title,
-                        user.department,
-                        user.org_unit_path,
+                        row[2],
+                        row[3],
+                        f"{row[2]} {row[3]}".strip(),
+                        row[6],
+                        row[7],
+                        row[5],
                     )
                 ],
             )
@@ -648,17 +659,20 @@ class DirectoryIndex:
     @staticmethod
     def _user_from_row(row: sqlite3.Row) -> GAMUser:
         return GAMUser(
-            primary_email=str(row["primary_email"]),
-            given_name=str(row["given_name"]),
-            family_name=str(row["family_name"]),
+            primary_email=_summary_text(row["primary_email"], _MAX_EMAIL_CHARS),
+            given_name=_summary_text(row["given_name"], _MAX_NAME_CHARS),
+            family_name=_summary_text(row["family_name"], _MAX_NAME_CHARS),
             suspended=bool(row["suspended"]),
-            org_unit_path=str(row["org_unit_path"]),
+            org_unit_path=_summary_text(row["org_unit_path"], _MAX_ORG_UNIT_CHARS),
             is_admin=bool(row["is_admin"]),
             is_delegated_admin=bool(row["is_delegated_admin"]),
             enrolled_2sv=bool(row["enrolled_2sv"]),
-            title=str(row["title"]),
-            department=str(row["department"]),
-            last_login_time=row["last_login_time"],
+            title=_summary_text(row["title"], _MAX_PROFILE_SUMMARY_CHARS),
+            department=_summary_text(row["department"], _MAX_PROFILE_SUMMARY_CHARS),
+            last_login_time=_summary_text(
+                row["last_login_time"], _MAX_TIMESTAMP_CHARS
+            )
+            or None,
         )
 
     @staticmethod

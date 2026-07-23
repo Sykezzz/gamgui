@@ -1,0 +1,28 @@
+{% if error %}
+<p class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">{{ error }}</p>
+{% elif page and page.items %}
+<p class="mb-2 text-xs text-brand-gray">
+  Showing {{ page.items | length }} of {{ page.total }} matching active user{{ "s" if page.total != 1 }}.
+  {% if page.total > page.items | length %}Keep typing to narrow the list.{% endif %}
+</p>
+<div class="space-y-1" role="list" aria-label="Matching people">
+  {% for user in page.items %}
+  <div class="ucard flex cursor-grab items-center justify-between gap-3 rounded-lg border border-brand-gray/30 px-3 py-1.5 text-sm hover:bg-paper"
+       role="listitem"
+       draggable="true"
+       data-email="{{ user.primary_email }}"
+       ondragstart="gqDrag(event, this.dataset.email, 'add')">
+    <span class="min-w-0">
+      <span class="block truncate text-brand-black">{{ user.full_name or user.primary_email }}</span>
+      <span class="block truncate text-xs text-brand-gray">{{ user.primary_email }}</span>
+    </span>
+    <button type="button"
+            class="shrink-0 rounded-md border border-brand-blue/50 px-2 py-1 text-xs font-medium text-brand-blueink hover:bg-brand-blue/5 focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+            onclick="gqMutate(this.closest('.ucard').dataset.email, 'add')"
+            aria-label="Add {{ user.primary_email }} to the selected group">Add</button>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="px-1 py-2 text-sm text-brand-gray">No matching active users.</p>
+{% endif %}

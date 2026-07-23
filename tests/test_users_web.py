@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,9 @@ def test_users_list(client):
     assert "alice@example.com" in r.text
     assert "bob@example.com" in r.text
     assert "Suspended" in r.text  # bob is suspended in the fixture
+    assert 'id="users-search"' in r.text
+    assert 'hx-trigger="input changed delay:300ms, search"' in r.text
+    assert r.text.count('hx-sync="#users-search:replace"') == 2
 
 
 def test_users_table_search_filters(client):
@@ -122,8 +126,9 @@ def test_user_detail_uses_one_direct_lookup_and_zero_hidden_panel_calls(
     assert response.status_code == 200
     assert calls == {"detail": 1, "hidden": 0}
     assert 'hx-trigger="load"' not in response.text
-    assert response.text.count(" data-user-detail-lazy hx-get=") == 5
-    assert response.text.count('hx-trigger="ud-load once"') == 5
+    assert response.text.count('hx-trigger="ud-load once"') == 7
+    assert "/classroom/user?email=" in response.text
+    assert "/drive/user?email=" in response.text
 
 
 def test_warm_user_table_is_bounded_and_does_not_call_gam(client, monkeypatch):
@@ -148,11 +153,19 @@ def test_warm_user_table_is_bounded_and_does_not_call_gam(client, monkeypatch):
         return 0
 
     monkeypatch.setattr(state.connector, "refresh_directory_users", refresh)
-    response = client.get("/users/table", params={"q": "user", "scope": "all"})
+    durations = []
+    response = None
+    for _ in range(20):
+        started = time.perf_counter()
+        response = client.get("/users/table", params={"q": "user", "scope": "all"})
+        durations.append(time.perf_counter() - started)
+
+    assert response is not None
     assert response.status_code == 200
     assert calls["refresh"] == 0
     assert response.text.count('href="/users/detail?email=') == PAGE_SIZE
     assert len(response.content) < 100_000
+    assert sorted(durations)[18] < 0.300
 
 
 def test_empty_user_index_refreshes_once_then_serves_snapshot(client, monkeypatch):
@@ -205,7 +218,10 @@ def test_reports_page_renders(client):
     r = client.get("/reports")
     assert r.status_code == 200
     assert "No 2-step verification" in r.text
-    assert "carol@example.com" in r.text  # carol: active, no 2SV
+    assert "carol@example.com" not in r.text  # count-first page does not embed every matching user
+    bucket = client.get("/reports/bucket", params={"key": "no_2sv"})
+    assert bucket.status_code == 200
+    assert "carol@example.com" in bucket.text  # loaded only after the operator opens the finding
 
 
 def test_reports_requires_connection(unconnected_client):

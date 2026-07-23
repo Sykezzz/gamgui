@@ -78,6 +78,23 @@ def test_course_index_replace_is_atomic_and_upsert_patches_one_row(tmp_path):
     assert result.items[0].course_state == "ARCHIVED"
 
 
+def test_streamed_course_index_replace_rolls_back_on_parse_failure(tmp_path):
+    index = CourseIndex(tmp_path / "courses.db")
+    index.replace_all("example.com", [_course(1, name="Stable")])
+    previous_updated_at = index.status("example.com").updated_at
+
+    def interrupted_stream():
+        yield _course(2, name="Uncommitted")
+        raise ValueError("malformed streamed record")
+
+    with pytest.raises(ValueError, match="malformed streamed record"):
+        index.replace_all("example.com", interrupted_stream())
+
+    page = index.search("example.com")
+    assert [item.name for item in page.items] == ["Stable"]
+    assert index.status("example.com").updated_at == previous_updated_at
+
+
 def test_course_index_like_wildcards_are_literal(tmp_path):
     index = CourseIndex(tmp_path / "courses.db")
     index.replace_all(

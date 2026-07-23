@@ -1,0 +1,30 @@
+{% if error %}
+<p class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">{{ error }}</p>
+{% elif page and page.items %}
+<p class="mb-2 text-xs text-brand-gray">
+  Showing {{ page.items | length }} of {{ page.total }} matching group{{ "s" if page.total != 1 }}.
+  {% if page.total > page.items | length %}Keep typing to narrow the list.{% endif %}
+</p>
+<ul class="space-y-1" role="listbox" aria-label="Matching groups">
+  {% for group in page.items %}
+  <li>
+    <button type="button"
+            class="w-full rounded-lg border border-brand-gray/30 px-3 py-2 text-left hover:bg-paper focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+            role="option"
+            data-group="{{ group.email }}"
+            data-label="{{ group.name or group.email }}"
+            onclick="gqSelectGroup(this)"
+            hx-get="/groups/members"
+            hx-vals='{"group": {{ group.email | tojson }}}'
+            hx-target="#members"
+            hx-swap="innerHTML"
+            hx-sync="#members:replace">
+      <span class="block truncate text-sm font-medium text-brand-black">{{ group.name or group.email }}</span>
+      {% if group.name %}<span class="block truncate text-xs text-brand-gray">{{ group.email }}</span>{% endif %}
+    </button>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="px-1 py-2 text-sm text-brand-gray">No matching groups.</p>
+{% endif %}

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ...core import signatures as sig
+from ...core.gam.commands import SIGNATURE_USER_FIELDS
 from ...core.gam.errors import GAMError
 from ...core.signatures import SignatureStore
 from ..server import TEMPLATES
@@ -21,6 +22,9 @@ _SIGNATURES_PAGE = "signatures.html"
 _PREVIEW_PARTIAL = "_sig_preview.html"
 _APPLY_PARTIAL = "_sig_apply.html"
 _TEMPLATES_PARTIAL = "_sig_templates.html"
+_SCOPE_OPTIONS_PARTIAL = "_sig_scope_options.html"
+_SCOPE_LIMIT = 50
+_SCOPE_TYPES = frozenset({"company", "user", "group", "ou", "department", "location"})
 
 
 def _store(request: Request) -> SignatureStore:
@@ -89,16 +93,61 @@ def _friendly(exc: Exception) -> str:
     return exc.remediation if isinstance(exc, GAMError) else "Something went wrong talking to GAM."
 
 
-async def _matched(st, users, scope_type: str, scope_value: str):
-    """Resolve the in-scope active users — group scope needs a GAM lookup, the rest is in-memory."""
-    if scope_type == "group" and scope_value:
-        try:
-            members = await st.connector.list_group_members(scope_value)
-        except Exception:
-            return []
-        emails = {m.email for m in members}
-        return [u for u in users if u.primary_email in emails and not u.suspended]
-    return sig.match_scope(users, scope_type, scope_value)
+def _validated_scope(scope_type: str, scope_value: str) -> tuple[str, str]:
+    """Normalize and validate every signature scope before any directory or GAM read."""
+
+    scope = (scope_type or "").strip().lower()
+    value = (scope_value or "").strip()
+    if scope not in _SCOPE_TYPES:
+        raise ValueError("Choose a supported signature scope.")
+    if scope == "company":
+        if value:
+            raise ValueError("Whole-company scope does not accept a scope value.")
+        return scope, ""
+    if not value:
+        noun = {
+            "user": "specific user",
+            "group": "group",
+            "ou": "org unit",
+            "department": "department",
+            "location": "location",
+        }[scope]
+        raise ValueError(
+            f"No active users match this scope. Choose a {noun} before previewing or applying."
+        )
+    if any(ord(char) < 32 for char in value):
+        raise ValueError("Signature scope values cannot contain control characters.")
+    if scope in {"user", "group"}:
+        local, separator, domain = value.partition("@")
+        if (
+            not separator
+            or not local
+            or not domain
+            or "@" in domain
+            or len(value) > 254
+            or any(char.isspace() for char in value)
+        ):
+            raise ValueError(
+                f"Enter a valid {scope} email address for this signature scope."
+            )
+    elif scope == "ou":
+        if not value.startswith("/") or len(value) > 512:
+            raise ValueError("Enter a valid org unit path beginning with /.")
+    elif len(value) > 256:
+        raise ValueError(f"{scope.title()} scope values must be 256 characters or fewer.")
+    return scope, value
+
+
+async def _matched(st, scope_type: str, scope_value: str):
+    """Resolve active users without touching the legacy tenant-wide AppState cache."""
+
+    if scope_type == "user":
+        user = await st.connector.get_user(
+            scope_value,
+            fields=SIGNATURE_USER_FIELDS,
+        )
+        return sig.match_scope([user], "user", scope_value)
+    return await st.connector.list_signature_scope_users(scope_type, scope_value)
 
 
 def _prune_jobs(st, keep: int = 10) -> None:
@@ -131,17 +180,91 @@ async def page(request: Request) -> HTMLResponse:
     st = request.app.state.gamgui
     if st.connector is None:
         return TEMPLATES.TemplateResponse(request, _SIGNATURES_PAGE, {"connected": False})
-    try:
-        users = await st.users()
-        groups = await st.connector.list_groups()
-    except Exception as exc:
-        return TEMPLATES.TemplateResponse(
-            request, _SIGNATURES_PAGE,
-            {"connected": True, "error": _friendly(exc), "options": {"ous": [], "departments": [], "locations": [], "users": []}, "groups": [], "variables": sig.VARIABLES},
-        )
     return TEMPLATES.TemplateResponse(
         request, _SIGNATURES_PAGE,
-        {"connected": True, "options": sig.scope_options(users), "groups": [g.email for g in groups], "variables": sig.VARIABLES},
+        {"connected": True, "variables": sig.VARIABLES},
+    )
+
+
+@router.get("/scopes", response_class=HTMLResponse)
+async def search_scopes(
+    request: Request,
+    scope_type: str = "user",
+    q: str = "",
+) -> HTMLResponse:
+    """Search one bounded page of directory-backed signature scope options."""
+    st = request.app.state.gamgui
+    if st.connector is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _SCOPE_OPTIONS_PARTIAL,
+            {"items": [], "error": "Not connected."},
+        )
+    scope_type = scope_type.strip().lower()
+    query = q.strip()
+    if scope_type not in _SCOPE_TYPES:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _SCOPE_OPTIONS_PARTIAL,
+            {"items": [], "error": "Choose a supported signature scope."},
+            status_code=400,
+        )
+    if scope_type == "company":
+        return TEMPLATES.TemplateResponse(
+            request,
+            _SCOPE_OPTIONS_PARTIAL,
+            {"items": [], "scope_type": scope_type},
+        )
+    if scope_type == "location":
+        return TEMPLATES.TemplateResponse(
+            request,
+            _SCOPE_OPTIONS_PARTIAL,
+            {"items": [], "free_text": True, "scope_type": scope_type},
+        )
+    try:
+        if scope_type == "group":
+            page = await st.directory_groups(query=query, limit=_SCOPE_LIMIT)
+            items = [
+                (group.email, group.name or group.email, group.email)
+                for group in page.items
+            ]
+        else:
+            page = await st.directory_users(
+                query=query,
+                scope="active",
+                limit=_SCOPE_LIMIT,
+            )
+            if scope_type == "user":
+                items = [
+                    (user.primary_email, user.full_name or user.primary_email, user.primary_email)
+                    for user in page.items
+                ]
+            else:
+                attr = "org_unit_path" if scope_type == "ou" else "department"
+                values = sorted(
+                    {
+                        str(getattr(user, attr, "") or "").strip()
+                        for user in page.items
+                        if str(getattr(user, attr, "") or "").strip()
+                    },
+                    key=str.casefold,
+                )
+                items = [(value, value, "") for value in values[:_SCOPE_LIMIT]]
+    except Exception as exc:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _SCOPE_OPTIONS_PARTIAL,
+            {"items": [], "error": _friendly(exc)},
+        )
+    return TEMPLATES.TemplateResponse(
+        request,
+        _SCOPE_OPTIONS_PARTIAL,
+        {
+            "items": items,
+            "more": page.total > len(page.items),
+            "total": page.total,
+            "scope_type": scope_type,
+        },
     )
 
 
@@ -156,10 +279,12 @@ async def preview(
     if st.connector is None:
         return TEMPLATES.TemplateResponse(request, _PREVIEW_PARTIAL, {"error": "Not connected."})
     try:
-        users = await st.users()
+        scope_type, scope_value = _validated_scope(scope_type, scope_value)
+        matched = await _matched(st, scope_type, scope_value)
+    except ValueError as exc:
+        return TEMPLATES.TemplateResponse(request, _PREVIEW_PARTIAL, {"error": str(exc)})
     except Exception as exc:
         return TEMPLATES.TemplateResponse(request, _PREVIEW_PARTIAL, {"error": _friendly(exc)})
-    matched = await _matched(st, users, scope_type, scope_value)
     sample = matched[0] if matched else None
     return TEMPLATES.TemplateResponse(
         request, _PREVIEW_PARTIAL,
@@ -179,10 +304,12 @@ async def apply(
     if st.connector is None:
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": "Not connected."})
     try:
-        users = await st.users()
+        scope_type, scope_value = _validated_scope(scope_type, scope_value)
+        matched = await _matched(st, scope_type, scope_value)
+    except ValueError as exc:
+        return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": str(exc)})
     except Exception as exc:
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": _friendly(exc)})
-    matched = await _matched(st, users, scope_type, scope_value)
     if not matched:
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": "No active users match this scope."})
 

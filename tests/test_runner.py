@@ -148,3 +148,45 @@ async def test_cancelling_spooled_command_stops_process_and_removes_files(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+async def test_cancelling_buffered_command_kills_and_reaps_process(
+    vault,
+    tmp_path,
+    monkeypatch,
+):
+    started = asyncio.Event()
+
+    class Process:
+        returncode = None
+        killed = False
+        waited = False
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            return self.returncode
+
+    process = Process()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    binary = tmp_path / "gam"
+    binary.write_text("mock", encoding="utf-8")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    runner = GAMRunner(vault=vault, gam_binary=binary, base_dir=tmp_path)
+    cfgdir = tmp_path / "cfg"
+    task = asyncio.create_task(runner._exec(["update", "user"], cfgdir, 30))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.killed and process.waited and process.returncode == -9

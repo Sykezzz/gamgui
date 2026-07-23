@@ -7,11 +7,13 @@ verify the Google Workspace connector is activated on the app state.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from ...core.canary import CanaryConfigStore
 from ...core.connectors.gam_connector import GAMConnector
 from ...core.setup import SetupService
 from ..server import TEMPLATES
@@ -93,10 +95,34 @@ async def verify(
             request, "_error.html", {"message": "Domain and super-admin email are required to verify."}
         )
     st = request.app.state.gamgui
+    if st.has_active_admin_jobs():
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {
+                "message": (
+                    "Finish or stop the active administrative operation "
+                    "before reconnecting."
+                )
+            },
+        )
     svc = _service(request)
     result = await svc.verify(domain, admin)
     if result.ok:
-        st.activate_connector(GAMConnector(runner=st.runner, domain=domain))
+        try:
+            st.activate_connector(GAMConnector(runner=st.runner, domain=domain))
+        except RuntimeError as exc:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": str(exc)},
+            )
+        config_path = (
+            Path(st.runner.base_dir) / "canary-config.json"
+            if st.runner.base_dir is not None
+            else None
+        )
+        CanaryConfigStore(config_path).save(domain, admin)
     return TEMPLATES.TemplateResponse(
         request, "_verify.html", {"result": result, "domain": domain, "admin": admin}
     )

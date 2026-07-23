@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from ..paths import app_data_dir
+from ..processes import current_process_identity, process_lease_is_dead
 from .models import RosterDiff
 
 
@@ -99,10 +100,32 @@ class RosterManifestStore:
                     residual_json TEXT NOT NULL,
                     error TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    run_owner TEXT NOT NULL DEFAULT '',
+                    run_pid INTEGER NOT NULL DEFAULT 0,
+                    run_identity TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(roster_manifests)")
+            }
+            if "run_owner" not in columns:
+                conn.execute(
+                    "ALTER TABLE roster_manifests "
+                    "ADD COLUMN run_owner TEXT NOT NULL DEFAULT ''"
+                )
+            if "run_pid" not in columns:
+                conn.execute(
+                    "ALTER TABLE roster_manifests "
+                    "ADD COLUMN run_pid INTEGER NOT NULL DEFAULT 0"
+                )
+            if "run_identity" not in columns:
+                conn.execute(
+                    "ALTER TABLE roster_manifests "
+                    "ADD COLUMN run_identity TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS roster_targets (
@@ -116,20 +139,40 @@ class RosterManifestStore:
                 )
                 """
             )
-            now = time.time()
-            conn.execute(
+            running = conn.execute(
                 """
-                UPDATE roster_manifests
-                SET status = 'interrupted',
-                    error = CASE
-                        WHEN error = '' THEN 'The app stopped before this roster operation finished.'
-                        ELSE error
-                    END,
-                    updated_at = ?
+                SELECT id, run_owner, run_pid, run_identity
+                FROM roster_manifests
                 WHERE status = 'running'
-                """,
-                (now,),
-            )
+                """
+            ).fetchall()
+            for manifest in running:
+                pid = int(manifest["run_pid"] or 0)
+                identity = str(manifest["run_identity"] or "")
+                if not process_lease_is_dead(pid, identity):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE roster_manifests
+                    SET status = 'interrupted',
+                        error = CASE
+                            WHEN error = ''
+                            THEN 'The app stopped before this roster operation finished.'
+                            ELSE error
+                        END,
+                        updated_at = ?, run_owner = '', run_pid = 0,
+                        run_identity = ''
+                    WHERE id = ? AND status = 'running'
+                      AND run_owner = ? AND run_pid = ? AND run_identity = ?
+                    """,
+                    (
+                        time.time(),
+                        manifest["id"],
+                        str(manifest["run_owner"] or ""),
+                        pid,
+                        identity,
+                    ),
+                )
 
     def _restrict_perms(self) -> None:
         try:
@@ -230,8 +273,57 @@ class RosterManifestStore:
             error=str(row["error"] or ""),
         )
 
-    def mark_running(self, manifest_id: str) -> None:
-        self._set_manifest(manifest_id, status="running", error="", residual=())
+    def mark_running(
+        self,
+        manifest_id: str,
+        *,
+        owner_id: str = "",
+        owner_pid: Optional[int] = None,
+        owner_identity: Optional[str] = None,
+    ) -> bool:
+        """Atomically claim one fresh roster preview for exactly one executor."""
+
+        pid = os.getpid() if owner_pid is None else int(owner_pid)
+        owner = owner_id.strip() or f"pid:{pid}"
+        identity = (
+            current_process_identity()
+            if owner_identity is None
+            else owner_identity
+        )
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE roster_manifests
+                SET status = 'running', residual_json = '[]', error = '',
+                    updated_at = ?, run_owner = ?, run_pid = ?,
+                    run_identity = ?
+                WHERE id = ? AND status = 'planned'
+                """,
+                (time.time(), owner, pid, identity, manifest_id),
+            )
+        self._restrict_perms()
+        return result.rowcount == 1
+
+    def owns_claim(self, manifest_id: str, owner_id: str) -> bool:
+        """Return whether the exact executor token still owns the running lease."""
+
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM roster_manifests
+                WHERE id = ? AND status = 'running' AND run_owner = ?
+                """,
+                (manifest_id, owner_id),
+            ).fetchone()
+        return row is not None
+
+    def has_active_jobs(self) -> bool:
+        """Return whether a roster mutation is currently executing."""
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM roster_manifests WHERE status = 'running' LIMIT 1"
+            ).fetchone()
+        return row is not None
 
     def mark_target(
         self,
@@ -241,20 +333,45 @@ class RosterManifestStore:
         *,
         ok: bool,
         detail: str = "",
+        owner_id: str = "",
     ) -> None:
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with closing(self._conn()) as conn, conn:
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE roster_targets
                 SET status = ?, detail = ?
                 WHERE manifest_id = ? AND email = ? AND action = ?
+                  AND EXISTS (
+                      SELECT 1 FROM roster_manifests
+                      WHERE id = ? AND status = 'running' AND run_owner = ?
+                  )
                 """,
-                ("applied" if ok else "failed", detail, manifest_id, email, action),
+                (
+                    "applied" if ok else "failed",
+                    detail,
+                    manifest_id,
+                    email,
+                    action,
+                    manifest_id,
+                    owner,
+                ),
             )
-            conn.execute(
-                "UPDATE roster_manifests SET updated_at = ? WHERE id = ?",
-                (time.time(), manifest_id),
+            if result.rowcount != 1:
+                raise PermissionError(
+                    "The Classroom roster lease is owned by another executor."
+                )
+            updated = conn.execute(
+                """
+                UPDATE roster_manifests SET updated_at = ?
+                WHERE id = ? AND status = 'running' AND run_owner = ?
+                """,
+                (time.time(), manifest_id, owner),
             )
+            if updated.rowcount != 1:
+                raise PermissionError(
+                    "The Classroom roster lease is owned by another executor."
+                )
 
     def finish(
         self,
@@ -263,10 +380,17 @@ class RosterManifestStore:
         status: str,
         residual: Sequence[str] = (),
         error: str = "",
+        owner_id: str = "",
     ) -> None:
         if status not in ("completed", "partial", "failed", "stale", "interrupted"):
             raise ValueError(f"invalid manifest terminal status: {status!r}")
-        self._set_manifest(manifest_id, status=status, error=error, residual=residual)
+        self._set_manifest(
+            manifest_id,
+            status=status,
+            error=error,
+            residual=residual,
+            owner_id=owner_id,
+        )
 
     def _set_manifest(
         self,
@@ -275,14 +399,35 @@ class RosterManifestStore:
         status: str,
         error: str,
         residual: Sequence[str],
+        owner_id: str = "",
     ) -> None:
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with closing(self._conn()) as conn, conn:
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE roster_manifests
-                SET status = ?, residual_json = ?, error = ?, updated_at = ?
+                SET status = ?, residual_json = ?, error = ?, updated_at = ?,
+                    run_owner = '', run_pid = 0, run_identity = ''
                 WHERE id = ?
+                  AND (status != 'running' OR run_owner = ?)
                 """,
-                (status, json.dumps(list(residual)), error, time.time(), manifest_id),
+                (
+                    status,
+                    json.dumps(list(residual)),
+                    error,
+                    time.time(),
+                    manifest_id,
+                    owner,
+                ),
             )
+            if result.rowcount != 1:
+                exists = conn.execute(
+                    "SELECT 1 FROM roster_manifests WHERE id = ?",
+                    (manifest_id,),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError("Roster manifest not found.")
+                raise PermissionError(
+                    "The Classroom roster lease is owned by another executor."
+                )
         self._restrict_perms()
