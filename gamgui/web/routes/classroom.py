@@ -283,7 +283,12 @@ async def _detail_response(
     error: str = "",
 ) -> HTMLResponse:
     try:
-        course = await service.connector.get_course(course_id)
+        course = await service.connector.get_course(
+            course_id,
+            include_owner_email=True,
+            include_aliases=True,
+            best_effort_enrichment=True,
+        )
     except Exception as exc:
         return _action(request, False, _friendly(exc))
     return TEMPLATES.TemplateResponse(

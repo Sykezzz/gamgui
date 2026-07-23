@@ -9,8 +9,8 @@
       </div>
       <span class="inline-flex rounded-full border border-brand-gray/50 px-2.5 py-1 text-xs font-medium text-brand-blueink">{{ course.state_label }}</span>
     </div>
-    {% if course.owner_email %}
-    <p class="mt-2 text-xs text-brand-blueink">Owner <span class="text-brand-black">{{ course.owner_email }}</span></p>
+    {% if course.owner_email or course.owner_id %}
+    <p class="mt-2 text-xs text-brand-blueink">Owner <span class="text-brand-black">{{ course.owner_email or course.owner_id }}</span></p>
     {% endif %}
     {% if course.aliases %}
     <p class="mt-1 text-xs text-brand-blueink">Aliases: <span class="font-mono">{{ course.aliases | join(", ") }}</span></p>

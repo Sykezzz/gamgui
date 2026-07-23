@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from gamgui.core.classroom.index import CourseIndex
 from gamgui.core.classroom.models import CourseSummary
 from gamgui.core.connectors.base import RiskLevel
 from gamgui.core.connectors.gam_connector import GAMConnector
+from gamgui.core.gam.errors import GAMError
 from gamgui.core.gam.commands import COURSE_INDEX_FIELDS
 
 pytestmark = pytest.mark.asyncio
@@ -31,10 +33,17 @@ class FakeRunner:
                 '{"id":"456","name":"Geometry","courseState":"ARCHIVED","ownerId":"u2"}'
             )
         if argv[:2] == ["info", "course"]:
-            return (
-                '{"id":"123","name":"English 1","courseState":"ACTIVE",'
-                '"ownerId":"u1","ownerEmail":"teacher@example.com","aliases":["d:Section_123"]}'
-            )
+            payload = {
+                "id": "123",
+                "name": "English 1",
+                "courseState": "ACTIVE",
+                "ownerId": "u1",
+            }
+            if "owneremail" in argv:
+                payload["ownerEmail"] = "teacher@example.com"
+            if "aliases" in argv:
+                payload["aliases"] = ["d:Section_123"]
+            return json.dumps(payload)
         if argv[:2] == ["print", "course-participants"]:
             return (
                 '{"courseId":"123","userId":"u1","profile":'
@@ -75,8 +84,18 @@ async def test_connector_classroom_reads_and_mutations_are_audited(tmp_path: Pat
     assert courses[0].name == "English 1"
 
     detail = await connector.get_course("123")
-    assert detail.owner_email == "teacher@example.com"
-    assert detail.aliases == ("d:Section_123",)
+    assert detail.owner_email == ""
+    assert detail.aliases == ()
+    assert "owneremail" not in runner.calls[-1][1]
+    assert "aliases" not in runner.calls[-1][1]
+
+    verified = await connector.get_course(
+        "123", include_owner_email=True, include_aliases=True
+    )
+    assert verified.owner_email == "teacher@example.com"
+    assert verified.aliases == ("d:Section_123",)
+    assert "owneremail" in runner.calls[-1][1]
+    assert "aliases" in runner.calls[-1][1]
 
     members = await connector.list_course_participants("123", "teachers")
     assert members[0].email == "teacher@example.com"
@@ -91,6 +110,50 @@ async def test_connector_classroom_reads_and_mutations_are_audited(tmp_path: Pat
     audit = connector.audit.tail()[-1]
     assert audit["action"] == "remove_course_participant"
     assert audit["target"] == "student@example.com"
+
+
+async def test_course_detail_best_effort_enrichment_tolerates_missing_owner(
+    tmp_path: Path,
+):
+    class OwnerLookupRejectingRunner(FakeRunner):
+        async def run_authenticated(self, domain, argv, serialize=False):
+            self.calls.append((domain, list(argv), serialize))
+            if argv[:2] == ["info", "course"]:
+                if "owneremail" in argv:
+                    raise GAMError.from_run(1, "404 resource not found", argv)
+                payload = {
+                    "id": "orphaned",
+                    "name": "History",
+                    "courseState": "ACTIVE",
+                    "ownerId": "deleted-owner",
+                }
+                if "aliases" in argv:
+                    payload["aliases"] = ["d:Section_orphaned"]
+                return json.dumps(payload)
+            return "ok"
+
+    runner = OwnerLookupRejectingRunner()
+    connector = GAMConnector(
+        runner=runner,
+        domain="example.com",
+        audit=AuditLog(tmp_path / "audit.jsonl"),
+    )
+
+    detail = await connector.get_course(
+        "orphaned",
+        include_owner_email=True,
+        include_aliases=True,
+        best_effort_enrichment=True,
+    )
+
+    assert detail.id == "orphaned"
+    assert detail.course_state == "ACTIVE"
+    assert detail.owner_email == ""
+    assert detail.aliases == ("d:Section_orphaned",)
+    assert "owneremail" in runner.calls[0][1]
+    assert "aliases" in runner.calls[0][1]
+    assert "owneremail" not in runner.calls[1][1]
+    assert "aliases" in runner.calls[1][1]
 
 
 async def test_course_refresh_streams_private_spool_off_event_loop(

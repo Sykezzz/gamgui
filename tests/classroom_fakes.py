@@ -116,9 +116,29 @@ class FakeClassroomConnector:
             self.courses.values(),
         )
 
-    async def get_course(self, course_id: str) -> CourseDetail:
-        self.calls.append(("get_course", course_id))
-        return self.courses[course_id]
+    async def get_course(
+        self,
+        course_id: str,
+        *,
+        include_owner_email: bool = False,
+        include_aliases: bool = False,
+        best_effort_enrichment: bool = False,
+    ) -> CourseDetail:
+        self.calls.append(
+            (
+                "get_course",
+                course_id,
+                include_owner_email,
+                include_aliases,
+                best_effort_enrichment,
+            )
+        )
+        current = self.courses[course_id]
+        return replace(
+            current,
+            owner_email=current.owner_email if include_owner_email else "",
+            aliases=current.aliases if include_aliases else (),
+        )
 
     async def get_user(
         self, email: str, fields: Optional[Sequence[str]] = None
@@ -129,6 +149,7 @@ class FakeClassroomConnector:
         return GAMUser(
             primary_email=email,
             suspended=email.startswith("suspended"),
+            raw={"id": f"id-{email}"},
         )
 
     async def list_course_participants(

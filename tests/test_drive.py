@@ -1013,6 +1013,24 @@ def test_drive_panel_fetches_one_bounded_page_and_defers_acl(drive_web_client):
     assert "/drive/permissions" not in response.text
 
 
+def test_drive_manage_exposes_and_focuses_visible_detail_region(drive_web_client):
+    client, _service = drive_web_client
+
+    response = client.get("/drive/user", params={"email": "alice@example.com"})
+
+    assert response.status_code == 200
+    assert 'aria-label="Selected file management"' in response.text
+    assert 'tabindex="-1"' in response.text
+    assert "Select Manage beside a file" in response.text
+    assert 'aria-controls="drive-detail"' in response.text
+    assert 'hx-swap="innerHTML show:#drive-detail:top"' in response.text
+    assert (
+        'hx-on::after-swap="if (event.detail.target === this) '
+        'this.focus({preventScroll:true})"'
+    ) in response.text
+    assert 'Manage<span class="sr-only"> District plan.pdf</span>' in response.text
+
+
 def test_drive_detail_loads_acl_only_after_file_selection(drive_web_client):
     client, service = drive_web_client
     response = client.get(

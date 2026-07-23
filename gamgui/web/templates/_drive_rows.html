@@ -33,8 +33,9 @@
           <td class="px-3 py-2 text-right">
             <button type="button"
                     class="rounded-md border border-brand-blue px-2.5 py-1.5 text-xs font-medium text-brand-blueink hover:bg-brand-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
-                    hx-get="/drive/file" hx-target="#drive-detail" hx-swap="innerHTML"
-                    hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>Manage</button>
+                    aria-controls="drive-detail"
+                    hx-get="/drive/file" hx-target="#drive-detail" hx-swap="innerHTML show:#drive-detail:top"
+                    hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>Manage<span class="sr-only"> {{ file.name or "(untitled)" }}</span></button>
           </td>
         </tr>
         {% endfor %}
