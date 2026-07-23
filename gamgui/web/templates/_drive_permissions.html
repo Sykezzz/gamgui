@@ -1,0 +1,61 @@
+<div class="space-y-3">
+  {% if error %}<p class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{{ notice }}</p>{% endif %}
+  {% if permissions %}
+  <ul class="max-h-64 space-y-2 overflow-y-auto" aria-label="File permissions">
+    {% for permission in permissions %}
+    <li class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-brand-gray/30 px-3 py-2 text-sm">
+      <div class="min-w-0">
+        <span class="block break-all font-medium text-brand-black">{{ permission.identity }}</span>
+        <span class="text-xs text-brand-blueink">{{ permission.type }} · {{ permission.role }}{% if permission.inherited %} · inherited{% endif %}{% if permission.expiration_time %} · expires {{ permission.expiration_time }}{% endif %}</span>
+      </div>
+      {% if permission.removable %}
+      <div class="flex items-center gap-2">
+        <form hx-post="/drive/permissions/update" hx-target="closest div.space-y-3" hx-swap="outerHTML">
+          <input type="hidden" name="email" value="{{ email }}" />
+          <input type="hidden" name="file_id" value="{{ file_id }}" />
+          <input type="hidden" name="permission_id" value="{{ permission.id }}" />
+          <label class="sr-only" for="drive-role-{{ permission.id }}">Access for {{ permission.identity }}</label>
+          <select id="drive-role-{{ permission.id }}" name="role" class="rounded-md border border-brand-blue px-2 py-1.5 text-xs focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30" onchange="this.form.requestSubmit()">
+            <option value="reader" {% if permission.role == "reader" %}selected{% endif %}>Viewer</option>
+            <option value="commenter" {% if permission.role == "commenter" %}selected{% endif %}>Commenter</option>
+            <option value="writer" {% if permission.role == "writer" %}selected{% endif %}>Editor</option>
+          </select>
+        </form>
+        <button type="button" class="rounded-md px-2 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600"
+                hx-post="/drive/permissions/remove" hx-target="closest div.space-y-3" hx-swap="outerHTML"
+                hx-confirm="Remove access for {{ permission.identity }}?"
+                hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file_id | tojson }}, "permission_id": {{ permission.id | tojson }}}'>Remove</button>
+      </div>
+      {% else %}
+      <span class="text-xs text-brand-blueink">{{ "Protected" if permission.role in ("owner", "organizer") else "Inherited" }}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="text-sm text-brand-blueink">No permissions were returned.</p>
+  {% endif %}
+
+  <form class="grid gap-2 rounded-lg bg-brand-blue/5 p-3 sm:grid-cols-[7rem_minmax(13rem,1fr)_8rem_auto]"
+        hx-post="/drive/permissions/add" hx-target="closest div.space-y-3" hx-swap="outerHTML">
+    <input type="hidden" name="email" value="{{ email }}" />
+    <input type="hidden" name="file_id" value="{{ file_id }}" />
+    <label class="sr-only" for="drive-principal-type-{{ file_id }}">Recipient type</label>
+    <select id="drive-principal-type-{{ file_id }}" name="principal_type" class="rounded-lg border border-brand-blue px-2 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30">
+      <option value="user">User</option>
+      <option value="group">Group</option>
+    </select>
+    <label class="sr-only" for="drive-share-target-{{ file_id }}">Internal recipient</label>
+    <input id="drive-share-target-{{ file_id }}" type="email" name="target" required placeholder="internal.user@domain.com"
+           class="rounded-lg border border-brand-blue px-3 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+    <label class="sr-only" for="drive-share-role-{{ file_id }}">Access level</label>
+    <select id="drive-share-role-{{ file_id }}" name="role" class="rounded-lg border border-brand-blue px-2 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30">
+      <option value="reader">Viewer</option>
+      <option value="commenter">Commenter</option>
+      <option value="writer">Editor</option>
+    </select>
+    <button type="submit" class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Share</button>
+  </form>
+  <p class="text-xs text-brand-blueink">New shares are limited to users and groups verified in the active Workspace directory.</p>
+</div>

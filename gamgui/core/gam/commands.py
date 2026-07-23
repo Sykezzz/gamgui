@@ -118,6 +118,27 @@ class GAMCommands:
         return argv
 
     @staticmethod
+    def transfer_drive_ownership(source: str, file_id: str, destination: str) -> List[str]:
+        """Transfer exactly one file; omitting ``norecursion`` could transfer an entire folder tree."""
+        return [
+            "user",
+            source,
+            "transfer",
+            "ownership",
+            f"id:{file_id}",
+            destination,
+            "norecursion",
+        ]
+
+    @staticmethod
+    def claim_drive_ownership(claimant: str, file_id: str, previous_owner: str) -> List[str]:
+        """Claim one non-folder file and request removal of the previous owner's retained role."""
+        argv = ["user", claimant, "claim", "ownership", f"id:{file_id}"]
+        if previous_owner:
+            argv += ["onlyusers", previous_owner]
+        return argv + ["retainrole", "none"]
+
+    @staticmethod
     def report_users(date: str, params: Sequence[str]) -> List[str]:
         # Admin SDK usage report (storage, mail, drive). Data lags ~2-3 days.
         return ["report", "users", "date", date, "parameters", ",".join(params)]

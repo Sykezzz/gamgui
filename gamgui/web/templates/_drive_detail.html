@@ -1,0 +1,100 @@
+<section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm space-y-5" aria-labelledby="drive-file-heading">
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div class="min-w-0">
+      <p class="eyebrow text-brand-blueink">Selected file</p>
+      <h3 id="drive-file-heading" class="truncate font-serif text-xl text-brand-black" title="{{ file.name }}">{{ file.name }}</h3>
+      <p class="mt-1 break-all font-mono text-xs text-brand-blueink">{{ file.id }}</p>
+    </div>
+    <div class="flex flex-wrap gap-2">
+      {% if file.can_download %}
+      <button type="button" class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-get="/drive/preview" hx-target="#drive-preview" hx-swap="innerHTML"
+              hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>Preview</button>
+      {% endif %}
+      {% if file.web_view_link %}
+      <form hx-post="/drive/open" hx-target="#drive-action" hx-swap="innerHTML">
+        <input type="hidden" name="email" value="{{ email }}" />
+        <input type="hidden" name="file_id" value="{{ file.id }}" />
+        <button type="submit" class="rounded-lg bg-brand-blueink px-3 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2">Open/Edit in Drive</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if notice %}
+  <p class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{{ notice }}</p>
+  {% endif %}
+  <div id="drive-action" aria-live="polite"></div>
+  <div id="drive-preview"></div>
+
+  <dl class="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+    <div><dt class="eyebrow text-brand-blueink">Owner</dt><dd class="mt-1 break-all text-brand-black">{{ file.owner_email or "Organization-owned" }}</dd></div>
+    <div><dt class="eyebrow text-brand-blueink">Created</dt><dd class="mt-1 font-mono text-xs tabular-nums text-brand-black">{{ file.created_time or "—" }}</dd></div>
+    <div><dt class="eyebrow text-brand-blueink">Modified</dt><dd class="mt-1 font-mono text-xs tabular-nums text-brand-black">{{ file.modified_time or "—" }}</dd></div>
+    <div><dt class="eyebrow text-brand-blueink">Location</dt><dd class="mt-1 text-brand-black">{{ "Shared Drive" if file.is_shared_drive else ("My Drive" if file.parents else "My Drive root or orphan") }}</dd></div>
+  </dl>
+
+  {% if file.can_edit %}
+  <form class="space-y-3 border-t border-brand-gray/20 pt-4" hx-post="/drive/metadata" hx-target="#drive-detail" hx-swap="innerHTML">
+    <input type="hidden" name="email" value="{{ email }}" />
+    <input type="hidden" name="file_id" value="{{ file.id }}" />
+    <h4 class="eyebrow text-brand-blueink">File details</h4>
+    <label class="block text-sm font-medium text-brand-black">Name
+      <input class="mt-1 w-full rounded-lg border border-brand-blue px-3 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30" name="name" value="{{ file.name }}" maxlength="255" required />
+    </label>
+    <label class="block text-sm font-medium text-brand-black">Description
+      <textarea class="mt-1 min-h-20 w-full rounded-lg border border-brand-blue px-3 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30" name="description" maxlength="5000">{{ file.description }}</textarea>
+    </label>
+    <label class="inline-flex items-center gap-2 text-sm text-brand-black">
+      <input class="rounded border-brand-blue text-brand-blueink focus:ring-brand-blue" type="checkbox" name="starred" {% if file.starred %}checked{% endif %} />
+      Starred
+    </label>
+    <div><button type="submit" class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Save details</button></div>
+  </form>
+  {% endif %}
+
+  <div class="border-t border-brand-gray/20 pt-4">
+    <h4 class="eyebrow text-brand-blueink">Sharing</h4>
+    <div class="mt-2" hx-get="/drive/permissions" hx-trigger="load" hx-target="this" hx-swap="innerHTML"
+         hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>
+      <p class="text-sm text-brand-blueink">Loading access list…</p>
+    </div>
+  </div>
+
+  {% if file.owned_by_me and not file.is_shared_drive %}
+  <div class="border-t border-red-200 pt-4">
+    <h4 class="eyebrow text-red-700">Ownership</h4>
+    <p class="mt-1 text-sm text-brand-blueink">Transfer ownership only to a live internal user. The previous owner may retain writer access; GamGUI attempts to remove it and reports any residual access.</p>
+    <form class="mt-3 flex flex-wrap gap-2" hx-post="/drive/ownership/preview" hx-target="#drive-ownership" hx-swap="innerHTML">
+      <input type="hidden" name="email" value="{{ email }}" />
+      <input type="hidden" name="file_id" value="{{ file.id }}" />
+      <label class="sr-only" for="drive-owner-{{ file.id }}">New owner email</label>
+      <input id="drive-owner-{{ file.id }}" class="min-w-[16rem] flex-1 rounded-lg border border-brand-blue px-3 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+             type="email" name="destination" placeholder="new.owner@domain.com" required />
+      <button type="submit" class="rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600">Review transfer</button>
+    </form>
+    <div id="drive-ownership" class="mt-3"></div>
+
+    {% if file.is_folder %}
+    <details class="mt-4">
+      <summary class="cursor-pointer text-sm font-medium text-red-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600">Build recursive folder-transfer manifest</summary>
+      <form class="mt-3 flex flex-wrap gap-2" hx-post="/drive/manifest/folder" hx-target="#drive-ownership" hx-swap="innerHTML">
+        <input type="hidden" name="email" value="{{ email }}" />
+        <input type="hidden" name="file_id" value="{{ file.id }}" />
+        <label class="sr-only" for="drive-tree-owner-{{ file.id }}">New owner for folder tree</label>
+        <input id="drive-tree-owner-{{ file.id }}" class="min-w-[16rem] flex-1 rounded-lg border border-brand-blue px-3 py-2 text-sm focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+               type="email" name="destination" placeholder="new.owner@domain.com" required />
+        <button type="submit" class="rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600">Enumerate exact files</button>
+      </form>
+      <form class="mt-3" hx-post="/drive/manifest/classroom" hx-target="#drive-ownership" hx-swap="innerHTML">
+        <input type="hidden" name="teacher" value="{{ email }}" />
+        <input type="hidden" name="folder_id" value="{{ file.id }}" />
+        <button type="submit" class="rounded-lg border border-amber-400 px-3 py-2 text-sm font-medium text-amber-800 hover:bg-amber-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-600">Find student-owned files to claim</button>
+      </form>
+    </details>
+    {% endif %}
+  </div>
+  {% elif file.is_shared_drive %}
+  <p class="border-t border-brand-gray/20 pt-4 text-sm text-brand-blueink">Shared Drive files are organization-owned; individual ownership transfer is unavailable.</p>
+  {% endif %}
+</section>

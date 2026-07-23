@@ -1,0 +1,17 @@
+<section class="rounded-xl border border-brand-gray/30 bg-brand-blue/5 p-3" aria-label="File preview">
+  <div class="mb-2 flex items-center justify-between gap-2">
+    <p class="text-sm font-medium text-brand-black">{{ file.name }}</p>
+    <button type="button" class="rounded-md px-2 py-1 text-xs text-brand-blueink hover:bg-brand-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+            onclick="this.closest('section').remove()">Close preview</button>
+  </div>
+  {% if file.mime_type in ("image/png", "image/jpeg", "image/webp") %}
+  <img class="mx-auto max-h-[32rem] max-w-full rounded-lg object-contain"
+       src="/drive/preview/content?email={{ email | urlencode }}&file_id={{ file.id | urlencode }}"
+       alt="Preview of {{ file.name }}" />
+  {% else %}
+  <iframe class="h-[32rem] w-full rounded-lg border border-brand-gray/30 bg-brand-white"
+          sandbox title="Preview of {{ file.name }}"
+          src="/drive/preview/content?email={{ email | urlencode }}&file_id={{ file.id | urlencode }}"></iframe>
+  {% endif %}
+  <p class="mt-2 text-xs text-brand-blueink">Preview content is streamed through the local app, limited to 10 MB, and never cached.</p>
+</section>

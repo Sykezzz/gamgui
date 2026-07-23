@@ -1,0 +1,57 @@
+{% set q = q | default("") %}
+{% set mime_type = mime_type | default("") %}
+{% set modified_after = modified_after | default("") %}
+{% if error %}
+  <div class="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800">{{ error }}</div>
+{% elif page %}
+  {% if page.incomplete_search %}
+  <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">Google marked this page incomplete. Narrow the search or retry.</p>
+  {% endif %}
+  {% if page.items %}
+  <div class="overflow-x-auto rounded-xl border border-brand-gray/30 bg-brand-white">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">Files owned by {{ email }}</caption>
+      <thead class="bg-brand-blue/5 text-xs uppercase tracking-wide text-brand-blueink">
+        <tr>
+          <th scope="col" class="px-3 py-2">Name</th>
+          <th scope="col" class="px-3 py-2">Type</th>
+          <th scope="col" class="px-3 py-2">Modified</th>
+          <th scope="col" class="px-3 py-2 text-right">Size</th>
+          <th scope="col" class="px-3 py-2"><span class="sr-only">Open details</span></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for file in page.items %}
+        <tr class="hover:bg-brand-blue/5">
+          <td class="max-w-[28rem] px-3 py-2">
+            <span class="block truncate font-medium text-brand-black" title="{{ file.name }}">{{ file.name or "(untitled)" }}</span>
+            {% if file.shared %}<span class="text-xs text-brand-blueink">Shared</span>{% endif %}
+          </td>
+          <td class="px-3 py-2 text-brand-blueink">{{ "Folder" if file.is_folder else file.mime_type }}</td>
+          <td class="whitespace-nowrap px-3 py-2 font-mono text-xs tabular-nums text-brand-blueink">{{ file.modified_time or "—" }}</td>
+          <td class="whitespace-nowrap px-3 py-2 text-right font-mono text-xs tabular-nums text-brand-blueink">{{ file.size if file.size is not none else "—" }}</td>
+          <td class="px-3 py-2 text-right">
+            <button type="button"
+                    class="rounded-md border border-brand-blue px-2.5 py-1.5 text-xs font-medium text-brand-blueink hover:bg-brand-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                    hx-get="/drive/file" hx-target="#drive-detail" hx-swap="innerHTML"
+                    hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>Manage</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="rounded-xl border border-dashed border-brand-gray/50 bg-brand-white p-6 text-center text-sm text-brand-blueink">No owned files match these filters.</div>
+  {% endif %}
+  {% if page.next_cursor %}
+  <div class="mt-3 flex justify-end">
+    <button type="button"
+            class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+            hx-get="/drive/files" hx-target="#drive-results" hx-swap="innerHTML"
+            hx-vals='{"email": {{ email | tojson }}, "q": {{ q | tojson }}, "mime_type": {{ mime_type | tojson }}, "modified_after": {{ modified_after | tojson }}, "cursor": {{ page.next_cursor | tojson }}}'>Next 50 files</button>
+  </div>
+  {% endif %}
+{% else %}
+  <div class="rounded-xl border border-dashed border-brand-gray/50 bg-brand-white p-6 text-center text-sm text-brand-blueink">Loading Drive files…</div>
+{% endif %}

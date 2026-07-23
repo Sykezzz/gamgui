@@ -1,0 +1,39 @@
+<section class="space-y-4" aria-labelledby="drive-heading">
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div>
+      <p class="eyebrow text-brand-blueink">Google Drive</p>
+      <h2 id="drive-heading" class="font-serif text-xl text-brand-black">Files owned by {{ email }}</h2>
+      <p class="mt-1 text-sm text-brand-blueink">Metadata is paged 50 files at a time. Permissions and content load only after you choose a file.</p>
+    </div>
+  </div>
+
+  {% set fld = "rounded-lg border border-brand-blue bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-blueink focus:border-brand-blueink focus:outline-none focus:ring-2 focus:ring-brand-blue/30" %}
+  <form class="grid gap-2 rounded-xl border border-brand-gray/30 bg-brand-white p-3 md:grid-cols-[minmax(12rem,1fr)_12rem_11rem_auto]"
+        hx-get="/drive/files" hx-target="#drive-results" hx-swap="innerHTML"
+        hx-trigger="submit, keyup changed delay:300ms from:input[type='search']"
+        hx-sync="this:replace">
+    <input type="hidden" name="email" value="{{ email }}" />
+    <label class="sr-only" for="drive-search-{{ email | replace('@', '-') }}">Search owned files</label>
+    <input id="drive-search-{{ email | replace('@', '-') }}" class="{{ fld }}" type="search" name="q"
+           placeholder="Search file names" autocomplete="off" />
+    <label class="sr-only" for="drive-type-{{ email | replace('@', '-') }}">File type</label>
+    <select id="drive-type-{{ email | replace('@', '-') }}" class="{{ fld }}" name="mime_type">
+      <option value="">All file types</option>
+      <option value="application/vnd.google-apps.folder">Folders</option>
+      <option value="application/vnd.google-apps.document">Google Docs</option>
+      <option value="application/vnd.google-apps.spreadsheet">Google Sheets</option>
+      <option value="application/vnd.google-apps.presentation">Google Slides</option>
+      <option value="application/pdf">PDF</option>
+      <option value="image/png">PNG images</option>
+      <option value="image/jpeg">JPEG images</option>
+    </select>
+    <label class="sr-only" for="drive-modified-{{ email | replace('@', '-') }}">Modified after</label>
+    <input id="drive-modified-{{ email | replace('@', '-') }}" class="{{ fld }}" type="date" name="modified_after" />
+    <button type="submit" class="rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2">Search</button>
+  </form>
+
+  <div id="drive-results" aria-live="polite">
+    {% include "_drive_rows.html" %}
+  </div>
+  <div id="drive-detail" aria-live="polite"></div>
+</section>

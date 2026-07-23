@@ -1,0 +1,14 @@
+<div class="rounded-xl border border-red-300 bg-red-50 p-4">
+  <h5 class="font-medium text-red-900">Transfer ownership of {{ file.name }}?</h5>
+  <p class="mt-1 text-sm text-red-800">Current owner: <b>{{ email }}</b><br />New owner: <b>{{ destination }}</b></p>
+  <p class="mt-2 text-sm text-red-800">This transfers only file ID <span class="break-all font-mono text-xs">{{ file.id }}</span>. Folder descendants are excluded by the mandatory <code>norecursion</code> command flag.</p>
+  <form class="mt-3 space-y-2" hx-post="/drive/ownership/apply" hx-target="#drive-ownership" hx-swap="innerHTML">
+    <input type="hidden" name="email" value="{{ email }}" />
+    <input type="hidden" name="file_id" value="{{ file.id }}" />
+    <input type="hidden" name="destination" value="{{ destination }}" />
+    <label class="block text-sm font-medium text-red-900">Type {{ destination }} to confirm
+      <input class="mt-1 w-full rounded-lg border border-red-300 bg-brand-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-600" type="email" name="confirmation" autocomplete="off" required />
+    </label>
+    <button type="submit" class="rounded-lg bg-red-700 px-3 py-2 text-sm font-medium text-white hover:bg-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-700 focus-visible:ring-offset-2">Transfer ownership</button>
+  </form>
+</div>

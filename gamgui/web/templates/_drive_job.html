@@ -1,0 +1,51 @@
+<section class="rounded-xl border border-brand-gray/40 bg-brand-white p-4"
+         {% if job and not job.finished %}hx-get="/drive/manifest/status?manifest_id={{ manifest.id | urlencode }}&job={{ job.id | urlencode }}" hx-trigger="every 1s" hx-target="this" hx-swap="outerHTML"{% endif %}>
+  <div class="flex items-center justify-between gap-3">
+    <h5 class="font-medium text-brand-black">Ownership operation</h5>
+    <span class="text-xs uppercase tracking-wide {{ 'text-emerald-700' if manifest.status == 'completed' else 'text-amber-700' }}">{{ manifest.status }}</span>
+  </div>
+  {% if job and not job.finished %}
+  <p class="mt-2 text-sm text-brand-blueink">Processed {{ job.done }} of {{ job.total }}. {{ job.current }}</p>
+  <div class="mt-2 h-2 overflow-hidden rounded-full bg-brand-gray/20" role="progressbar" aria-valuemin="0" aria-valuemax="{{ job.total }}" aria-valuenow="{{ job.done }}">
+    <div class="h-full bg-brand-blueink" style="width: {{ (job.done * 100 / job.total) if job.total else 0 }}%"></div>
+  </div>
+  {% elif job and job.error %}
+  <p class="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">{{ job.error }}</p>
+  {% endif %}
+
+  <dl class="mt-3 grid grid-cols-3 gap-2 text-center text-sm tabular-nums">
+    <div class="rounded-lg bg-brand-blue/5 p-2"><dt class="text-xs text-brand-blueink">Succeeded</dt><dd class="font-medium text-brand-black">{{ manifest.targets | selectattr("status", "equalto", "succeeded") | list | length }}</dd></div>
+    <div class="rounded-lg bg-amber-50 p-2"><dt class="text-xs text-amber-700">Remaining</dt><dd class="font-medium text-amber-900">{{ manifest.remaining }}</dd></div>
+    <div class="rounded-lg bg-red-50 p-2"><dt class="text-xs text-red-700">Residual access</dt><dd class="font-medium text-red-900">{{ manifest.residual_count }}</dd></div>
+  </dl>
+
+  {% set problems = manifest.targets | rejectattr("status", "equalto", "succeeded") | list %}
+  {% if problems and (not job or job.finished) %}
+  <ul class="mt-3 max-h-40 space-y-1 overflow-y-auto text-sm">
+    {% for target in problems %}
+    <li class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+      <span class="font-medium text-amber-900">{{ target.name or target.file_id }}</span>
+      <span class="block text-xs text-amber-800">{{ target.error or target.status }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  <form class="mt-3 space-y-2" hx-post="/drive/manifest/apply" hx-target="closest section" hx-swap="outerHTML">
+    <input type="hidden" name="manifest_id" value="{{ manifest.id }}" />
+    <label class="block text-sm font-medium text-brand-black">Type {{ manifest.destination }} to resume unfinished files
+      <input class="mt-1 w-full rounded-lg border border-brand-blue px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-blue" type="email" name="confirmation" required autocomplete="off" />
+    </label>
+    <button class="rounded-lg border border-amber-500 px-3 py-2 text-sm font-medium text-amber-800 hover:bg-amber-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-600" type="submit">Resume unfinished files</button>
+  </form>
+  {% endif %}
+
+  {% if manifest.residual_count %}
+  <div class="mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+    <p class="font-medium">Residual access needs review</p>
+    <ul class="mt-1 list-disc pl-5">
+      {% for target in manifest.targets if target.residual_access %}
+      <li>{{ target.name or target.file_id }}: {{ target.residual_access }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</section>
