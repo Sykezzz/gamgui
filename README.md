@@ -243,7 +243,7 @@ intentional dependency change, regenerate and review the lock with exactly `uv 0
 `uv lock --check` and the complete offline suite.
 
 The GAM7 binary is **not committed** (platform-specific, large) — `make gam` / `scripts/fetch_gam.sh`
-fetches the pinned version (`v7.46.11`) from the official releases and records its checksum.
+fetches the pinned version (`v7.47.00`) from the official releases and records its checksum.
 
 ### Build a standalone `.app` (macOS)
 

@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/gamgui/resources/gam7"
 CATALOG="$DEST/command_catalog.json"
 # Pinned for reproducible builds. Override with `--tag latest` to grab the newest release.
-TAG="v7.46.11"
+TAG="v7.47.00"
 
 while [ $# -gt 0 ]; do
   case "$1" in
