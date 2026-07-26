@@ -10,7 +10,13 @@ from gamgui.core import setup as setup_mod
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import FILENAMES, InMemoryBackend, SecretsVault
-from gamgui.core.setup import SetupService, _extract_auth_url, _parse_check
+from gamgui.core.setup import (
+    DISTRICT_FEATURE_DWD_SCOPES,
+    ONEROSTER_DWD_SCOPES,
+    SetupService,
+    _extract_auth_url,
+    _parse_check,
+)
 
 
 @pytest.fixture
@@ -408,10 +414,72 @@ async def test_engine_version_warning_on_mismatch(runner, vault, monkeypatch):
     assert "9.99.99" in warning and EXPECTED_GAM_VERSION in warning  # fail-soft: warns, never blocks
 
 
-async def test_verify_passes_with_mock(runner, vault, domain):
+class _SequentialRunner:
+    def __init__(self, *outputs: str) -> None:
+        self.outputs = iter(outputs)
+        self.calls = []
+
+    async def run_authenticated(self, domain, argv):
+        self.calls.append((domain, argv))
+        return next(self.outputs)
+
+
+def _base_verification_pass() -> str:
+    return (
+        "System time status: PASS\n"
+        "Service account private key authentication: PASS\n"
+    )
+
+
+def _scope_passes(scopes: tuple[str, ...]) -> str:
+    return "\n".join(f"{scope} PASS" for scope in scopes)
+
+
+async def test_verify_requires_explicit_pass_for_all_district_feature_scopes(
+    vault,
+    domain,
+):
+    runner = _SequentialRunner(
+        _base_verification_pass(),
+        _scope_passes(DISTRICT_FEATURE_DWD_SCOPES),
+    )
+
     result = await SetupService(vault, runner).verify(domain, "admin@example.com")
+
     assert result.ok is True
-    assert any(status == "PASS" for _, status in result.lines)
+    assert result.missing_feature_scopes == []
+    assert len(runner.calls) == 2
+
+
+async def test_verify_rejects_an_omitted_district_feature_scope(vault, domain):
+    omitted = DISTRICT_FEATURE_DWD_SCOPES[0]
+    runner = _SequentialRunner(
+        _base_verification_pass(),
+        _scope_passes(
+            tuple(scope for scope in DISTRICT_FEATURE_DWD_SCOPES if scope != omitted)
+        ),
+    )
+
+    result = await SetupService(vault, runner).verify(domain, "admin@example.com")
+
+    assert not result.ok
+    assert result.missing_feature_scopes == [omitted]
+
+
+async def test_verify_rejects_conflicting_pass_and_fail_for_feature_scope(
+    vault,
+    domain,
+):
+    conflicted = DISTRICT_FEATURE_DWD_SCOPES[-1]
+    runner = _SequentialRunner(
+        _base_verification_pass(),
+        f"{_scope_passes(DISTRICT_FEATURE_DWD_SCOPES)}\n{conflicted} FAIL",
+    )
+
+    result = await SetupService(vault, runner).verify(domain, "admin@example.com")
+
+    assert not result.ok
+    assert result.missing_feature_scopes == [conflicted]
 
 
 async def test_verify_without_credentials(runner):
@@ -419,3 +487,64 @@ async def test_verify_without_credentials(runner):
     result = await SetupService(empty, runner).verify("nope.com", "a@nope.com")
     assert result.ok is False
     assert "No credentials" in result.summary
+
+
+class _ScopeRunner:
+    def __init__(self, output: str) -> None:
+        self.output = output
+        self.calls = []
+
+    async def run_authenticated(self, domain, argv):
+        self.calls.append((domain, argv))
+        return self.output
+
+
+async def test_verify_scopes_requires_an_exact_pass_row_for_every_scope(vault):
+    output = "\n".join(f"{scope} PASS (4/4)" for scope in ONEROSTER_DWD_SCOPES)
+    runner = _ScopeRunner(output)
+
+    result = await SetupService(vault, runner).verify_scopes(
+        "example.com",
+        "admin@example.com",
+        ONEROSTER_DWD_SCOPES,
+    )
+
+    assert result.ok
+    assert result.missing_feature_scopes == []
+    assert len(runner.calls) == 1
+
+
+async def test_verify_scopes_rejects_unrelated_generic_pass_output(vault):
+    runner = _ScopeRunner(
+        "System time status: PASS\n"
+        "https://www.googleapis.com/auth/drive PASS\n"
+        "All scopes PASS\n"
+    )
+
+    result = await SetupService(vault, runner).verify_scopes(
+        "example.com",
+        "admin@example.com",
+        ONEROSTER_DWD_SCOPES,
+    )
+
+    assert not result.ok
+    assert result.missing_feature_scopes == list(ONEROSTER_DWD_SCOPES)
+
+
+async def test_verify_scopes_reports_requested_scope_without_exact_pass(vault):
+    omitted = ONEROSTER_DWD_SCOPES[-1]
+    output = "\n".join(
+        f"{scope} PASS"
+        for scope in ONEROSTER_DWD_SCOPES
+        if scope != omitted
+    )
+    runner = _ScopeRunner(output)
+
+    result = await SetupService(vault, runner).verify_scopes(
+        "example.com",
+        "admin@example.com",
+        ONEROSTER_DWD_SCOPES,
+    )
+
+    assert not result.ok
+    assert result.missing_feature_scopes == [omitted]

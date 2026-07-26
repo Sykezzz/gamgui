@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from gamgui.core import setup as setup_mod
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
-from gamgui.core.setup import SetupService, _root_is_sane
+from gamgui.core.setup import DISTRICT_FEATURE_DWD_SCOPES, SetupService, _root_is_sane
 from gamgui.web.server import AppState, create_app
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -43,7 +43,8 @@ def test_setup_page_renders(ctx):
     client = ctx[0]
     r = client.get("/setup")
     assert r.status_code == 200
-    assert "Connect Google Workspace" in r.text
+    assert "Choose optional features" in r.text
+    assert "Connect Google Workspace" not in r.text
 
 
 def test_import_shows_dwd_and_stores_creds(ctx):
@@ -57,6 +58,64 @@ def test_import_shows_dwd_and_stores_creds(ctx):
     assert "CID.apps" in r.text                 # DWD client id surfaced
     assert "copyEl(" in r.text                   # client id has a copy button
     assert vault.has_credentials("ex.com")
+
+
+def test_import_replacement_invalidates_oneroster_scope_proof(ctx):
+    client, base, _vault, state = ctx
+    cfg = base / "replacement"
+    cfg.mkdir()
+    (cfg / "oauth2.txt").write_text("replacement-token")
+    (cfg / "oauth2service.json").write_text(
+        json.dumps({"client_id": "REPLACEMENT.apps", "type": "service_account"})
+    )
+    invalidations: list[bool] = []
+    state.oneroster_service = SimpleNamespace(
+        invalidate_scope_readiness=lambda: invalidations.append(True)
+    )
+
+    response = client.post(
+        "/setup/import",
+        data={
+            "domain": "ex.com",
+            "admin": "a@ex.com",
+            "config_dir": str(cfg),
+        },
+    )
+
+    assert response.status_code == 200
+    assert invalidations == [True]
+
+
+def test_failed_import_still_invalidates_oneroster_scope_proof(
+    ctx,
+    monkeypatch,
+):
+    client, base, _vault, state = ctx
+    cfg = base / "broken-replacement"
+    cfg.mkdir()
+    invalidations: list[bool] = []
+    state.oneroster_service = SimpleNamespace(
+        invalidate_scope_readiness=lambda: invalidations.append(True)
+    )
+
+    def fail_import(*_args, **_kwargs):
+        raise RuntimeError("controlled import failure")
+
+    monkeypatch.setattr(
+        "gamgui.web.routes.setup.SetupService.import_dir",
+        fail_import,
+    )
+
+    with pytest.raises(RuntimeError, match="controlled import failure"):
+        client.post(
+            "/setup/import",
+            data={
+                "domain": "ex.com",
+                "admin": "a@ex.com",
+                "config_dir": str(cfg),
+            },
+        )
+    assert invalidations == [True]
 
 
 def test_import_requires_fields(ctx):
@@ -595,13 +654,40 @@ def test_out_of_bounds_message_is_truthful_about_gamcfgdir(ctx):
     assert "same terminal session" in msg and "Finder" in msg
 
 
-def test_verify_activates_connector(ctx):
+def test_verify_activates_connector_without_minting_oneroster_readiness(
+    ctx,
+    monkeypatch,
+):
     client, _, vault, state = ctx
     vault.set_all("ex.com", {"oauth2": "tok", "oauth2service": json.dumps({"client_id": "x"})})
+    readiness_marks: list[bool] = []
+    original_activate = state.activate_connector
+
+    def activate_with_readiness_spy(connector):
+        original_activate(connector)
+        state.oneroster_service = SimpleNamespace(
+            mark_scope_ready=lambda: readiness_marks.append(True)
+        )
+
+    async def authorized_check(_domain, argv):
+        if "scopes" in argv:
+            return "\n".join(
+                f"{scope} PASS" for scope in DISTRICT_FEATURE_DWD_SCOPES
+            )
+        return (
+            "System time status: PASS\n"
+            "Service account private key authentication: PASS\n"
+        )
+
+    monkeypatch.setattr(state, "activate_connector", activate_with_readiness_spy)
+    monkeypatch.setattr(state.runner, "run_authenticated", authorized_check)
+
     r = client.post("/setup/verify", data={"domain": "ex.com", "admin": "a@ex.com"})
+
     assert r.status_code == 200
     assert "connected" in r.text.lower()
     assert state.connector is not None and state.audit_domain == "ex.com"
+    assert readiness_marks == []
 
 
 def test_verify_refuses_reconnect_before_remote_check_when_admin_job_is_active(

@@ -1,0 +1,24 @@
+{% if history %}
+<div class="overflow-x-auto">
+  <table class="min-w-full text-left text-sm">
+    <caption class="sr-only">Retained OneRoster imports</caption>
+    <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
+      <tr><th class="px-3 py-2" scope="col">Import</th><th class="px-3 py-2" scope="col">State</th><th class="px-3 py-2" scope="col">Imported</th><th class="px-3 py-2" scope="col">Issues</th><th class="px-3 py-2" scope="col"><span class="sr-only">Action</span></th></tr>
+    </thead>
+    <tbody class="divide-y divide-brand-gray/20">
+      {% for item in history[:50] %}
+      <tr>
+        <td class="px-3 py-2"><p class="font-medium text-brand-black">{{ item.filename | default("OneRoster snapshot") }}</p><p class="font-mono text-xs text-brand-blueink">{{ item.id }}</p></td>
+        <td class="px-3 py-2 text-brand-blueink">{{ item.state | default("uploaded") | replace("_", " ") | title }}</td>
+        <td class="px-3 py-2 tabular-nums text-brand-blueink">{{ item.imported_at | default("—") }}</td>
+        <td class="px-3 py-2 tabular-nums text-brand-blueink">{{ item.issue_count | default(0) }}</td>
+        <td class="px-3 py-2 text-right"><button type="button" class="text-sm font-medium text-brand-blueink underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                hx-get="/classroom/imports/import/{{ item.id }}" hx-target="#oneroster-workspace" hx-swap="innerHTML show:#oneroster-workspace:top">Open</button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="rounded-xl border border-dashed border-brand-gray/60 px-4 py-6 text-center text-sm text-brand-blueink">No retained OneRoster imports.</p>
+{% endif %}

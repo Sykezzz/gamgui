@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 
 from ...core import lifecycle
 from ...core.gam.errors import GAMError
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..jobs import start_job
 from ..server import TEMPLATES
 
@@ -131,7 +132,7 @@ async def offboard_autoreply(
         request, "_offboard_autoreply.html", {"subject": ar_subject, "message": ar_message})
 
 
-async def _run_offboard(job, conn, steps) -> None:
+async def _run_offboard(job, conn, steps, lease=None) -> None:
     try:
         for step in steps:
             job.current = step.label
@@ -151,6 +152,8 @@ async def _run_offboard(job, conn, steps) -> None:
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 @router.post("/offboard/run", response_class=HTMLResponse)
@@ -171,8 +174,15 @@ async def offboard_run(
         user, manager, subject, message, _days(days), date.today(),
         notify=notify.strip(), employee_name=await _employee_name(st, user),
         manager_contact=await _manager_contact(st, manager))
-    job = start_job(st.jobs, len(steps))
-    job.task = asyncio.create_task(_run_offboard(job, conn, steps))
+    lease = try_acquire_admin_activity(st, "lifecycle-offboard")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        job = start_job(st.jobs, len(steps))
+        job.task = asyncio.create_task(_run_offboard(job, conn, steps, lease))
+    except Exception:
+        lease.release()
+        raise
     st.invalidate_users()  # password/org/etc. changed
     return TEMPLATES.TemplateResponse(request, "_offboard_run.html", {"job": job, "user": user})
 

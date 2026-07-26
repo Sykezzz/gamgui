@@ -7,7 +7,13 @@ from .manifests import (
     RosterManifestStore,
     default_roster_manifest_path,
 )
-from .models import CourseDetail, CourseParticipant, CourseSummary, RosterDiff
+from .models import (
+    CourseDetail,
+    CourseParticipant,
+    CourseRosterSnapshot,
+    CourseSummary,
+    RosterDiff,
+)
 from .service import ClassroomService, ClassroomValidationError
 
 __all__ = [
@@ -17,6 +23,7 @@ __all__ = [
     "CourseIndex",
     "CoursePage",
     "CourseParticipant",
+    "CourseRosterSnapshot",
     "CourseSnapshotStatus",
     "CourseSummary",
     "ManifestTarget",

@@ -17,6 +17,7 @@ from ...core.classroom.manifests import (
 from ...core.classroom.models import COURSE_STATES, parse_desired_roster
 from ...core.classroom.service import ClassroomService, ClassroomValidationError
 from ...core.gam.errors import GAMError
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/classroom")
@@ -120,6 +121,10 @@ def _schedule_refresh(request: Request, service: ClassroomService) -> None:
     existing = getattr(state, "classroom_refresh_task", None)
     if existing is not None and not existing.done():
         return
+    lease = try_acquire_admin_activity(state, "classroom-index-refresh")
+    if lease is None:
+        setattr(state, "classroom_refresh_error", ADMIN_ACTIVITY_BUSY_MESSAGE)
+        return
 
     async def run() -> None:
         setattr(state, "classroom_refresh_error", "")
@@ -127,8 +132,14 @@ def _schedule_refresh(request: Request, service: ClassroomService) -> None:
             await service.refresh_index()
         except Exception as exc:  # noqa: BLE001 - rendered in the status partial
             setattr(state, "classroom_refresh_error", _friendly(exc))
+        finally:
+            lease.release()
 
-    setattr(state, "classroom_refresh_task", asyncio.create_task(run()))
+    try:
+        setattr(state, "classroom_refresh_task", asyncio.create_task(run()))
+    except Exception:
+        lease.release()
+        raise
 
 
 def _index_context(request: Request, service: ClassroomService) -> dict:
@@ -252,6 +263,10 @@ async def create_course(
     service = _service(request)
     if service is None:
         return _action(request, False, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-course-create")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result = await service.create_course(
             name=name,
@@ -264,6 +279,8 @@ async def create_course(
         )
     except Exception as exc:
         return _action(request, False, _friendly(exc))
+    finally:
+        lease.release()
     if not result.ok:
         return _action(request, False, _friendly(RuntimeError(result.detail)))
     _schedule_refresh(request, service)
@@ -319,6 +336,10 @@ async def update_metadata(
     service = _service(request)
     if service is None:
         return _action(request, False, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-course-metadata")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result, _ = await service.update_metadata(
             course_id,
@@ -332,6 +353,8 @@ async def update_metadata(
         return await _detail_response(
             request, service, course_id, error=_friendly(exc)
         )
+    finally:
+        lease.release()
     return await _detail_response(
         request,
         service,
@@ -376,12 +399,18 @@ async def update_state(
         return _action(request, False, _NOT_CONNECTED)
     if confirmed != "yes":
         return _action(request, False, "Review the state change before applying it.")
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-course-state")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result, _ = await service.transition_state(course_id, target_state)
     except Exception as exc:
         return await _detail_response(
             request, service, course_id, error=_friendly(exc)
         )
+    finally:
+        lease.release()
     verb = "Archived" if target_state.strip().upper() == "ARCHIVED" else "Activated"
     return await _detail_response(
         request,
@@ -427,12 +456,18 @@ async def owner_transfer(
         return _action(
             request, False, "Type the exact destination email to confirm ownership transfer."
         )
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-course-owner")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result, _ = await service.transfer_owner(course_id, target_email)
     except Exception as exc:
         return await _detail_response(
             request, service, course_id, error=_friendly(exc)
         )
+    finally:
+        lease.release()
     return await _detail_response(
         request,
         service,
@@ -488,12 +523,18 @@ async def roster_add(
     service = _service(request)
     if service is None:
         return _action(request, False, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-roster-member")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result, _ = await service.add_member(course_id, role, email)
     except Exception as exc:
         return await _roster_response(
             request, service, course_id, role, error=_friendly(exc)
         )
+    finally:
+        lease.release()
     return await _roster_response(
         request,
         service,
@@ -514,12 +555,18 @@ async def roster_remove(
     service = _service(request)
     if service is None:
         return _action(request, False, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-roster-member")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result, _ = await service.remove_member(course_id, role, email)
     except Exception as exc:
         return await _roster_response(
             request, service, course_id, role, error=_friendly(exc)
         )
+    finally:
+        lease.release()
     return await _roster_response(
         request,
         service,
@@ -558,16 +605,38 @@ async def roster_preview(
         return _roster_preview_error(
             request, course_id, role, "Paste a roster or choose a CSV file."
         )
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-roster-plan")
+    if lease is None:
+        return _roster_preview_error(
+            request, course_id, role, ADMIN_ACTIVITY_BUSY_MESSAGE
+        )
     try:
         desired = parse_desired_roster(source)
         manifest = await service.plan_roster(course_id, role, desired)
     except Exception as exc:
         return _roster_preview_error(request, course_id, role, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request,
         "_classroom_roster_preview.html",
         {"manifest": manifest, "error": ""},
     )
+
+
+async def _run_roster_job(
+    service: ClassroomService,
+    manifest_id: str,
+    errors: dict[str, str],
+    lease,
+) -> None:
+    try:
+        await service.apply_manifest(manifest_id)
+    except Exception as exc:  # noqa: BLE001 - surfaced by the polling partial
+        errors[manifest_id] = _friendly(exc)
+    finally:
+        lease.release()
 
 
 @router.post("/roster/apply", response_class=HTMLResponse)
@@ -598,19 +667,22 @@ async def roster_apply(
         setattr(state, "classroom_manifest_tasks", tasks)
     current = tasks.get(manifest.id)
     if current is None or current.done():
+        lease = try_acquire_admin_activity(state, "classroom-roster-apply")
+        if lease is None:
+            return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
         errors = getattr(state, "classroom_manifest_errors", None)
         if errors is None:
             errors = {}
             setattr(state, "classroom_manifest_errors", errors)
         errors.pop(manifest.id, None)
 
-        async def apply() -> None:
-            try:
-                await service.apply_manifest(manifest.id)
-            except Exception as exc:  # noqa: BLE001 - surfaced by the polling partial
-                errors[manifest.id] = _friendly(exc)
-
-        tasks[manifest.id] = asyncio.create_task(apply())
+        try:
+            tasks[manifest.id] = asyncio.create_task(
+                _run_roster_job(service, manifest.id, errors, lease)
+            )
+        except Exception:
+            lease.release()
+            raise
     current_manifest = await asyncio.to_thread(service.manifests.get, manifest.id)
     return _manifest_response(request, current_manifest, "")
 
@@ -634,10 +706,16 @@ async def roster_replan(
     service = _service(request)
     if service is None:
         return _action(request, False, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "classroom-roster-plan")
+    if lease is None:
+        return _action(request, False, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         manifest = await service.replan_manifest(manifest_id)
     except Exception as exc:
         return _action(request, False, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request,
         "_classroom_roster_preview.html",

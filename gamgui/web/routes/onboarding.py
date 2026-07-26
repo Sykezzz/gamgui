@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 
 from ...core import onboarding
 from ...core.onboarding import RunbookStore
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/onboard")
@@ -54,24 +55,44 @@ async def page(request: Request) -> HTMLResponse:
 @router.post("/role", response_class=HTMLResponse)
 async def save_role(request: Request, name: Annotated[str, Form()], steps: Annotated[str, Form()] = "") -> HTMLResponse:
     store = _store(request)
+    st = _st(request)
+    lease = try_acquire_admin_activity(st, "onboarding-template-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         store.set_role(name, steps.splitlines())
     except ValueError as exc:
         return _err(request, str(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_onboard_roles.html", {"roles": store.roles()})
 
 
 @router.post("/role/delete", response_class=HTMLResponse)
 async def delete_role(request: Request, name: Annotated[str, Form()]) -> HTMLResponse:
     store = _store(request)
-    store.delete_role(name)
+    st = _st(request)
+    lease = try_acquire_admin_activity(st, "onboarding-template-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        store.delete_role(name)
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_onboard_roles.html", {"roles": store.roles()})
 
 
 @router.post("/welcome", response_class=HTMLResponse)
 async def save_welcome(request: Request, subject: Annotated[str, Form()] = "", body: Annotated[str, Form()] = "") -> HTMLResponse:
     store = _store(request)
-    store.set_welcome(subject, body)
+    st = _st(request)
+    lease = try_acquire_admin_activity(st, "onboarding-template-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        store.set_welcome(subject, body)
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_onboard_welcome.html",
                                       {"welcome": store.welcome(), "vars": onboarding.WELCOME_VARS, "saved": True})
 
@@ -108,19 +129,25 @@ async def run(request: Request, role: Annotated[str, Form()], name: Annotated[st
     if not assignee:
         return _err(request, "Enter the assignee (who does the setup) or the new hire's email.")
     title = "Onboard {} — {}".format(name or email or "new hire", role)
+    lease = try_acquire_admin_activity(st, "onboarding-run")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
-        result = await conn.create_onboarding_runbook(assignee, title, steps)
-    except Exception as exc:  # noqa: BLE001
-        return _err(request, "Couldn't create the task list: " + str(getattr(exc, "remediation", exc)))
-    email_sent = None
-    if send_welcome and email:
-        w, ctx = store.welcome(), _ctx(name, email, role, manager)
         try:
-            res = await conn.send_welcome_email(email, onboarding.render(w["subject"], ctx),
-                                                onboarding.render(w["body"], ctx))
-            email_sent = bool(res.ok)
-        except Exception:  # noqa: BLE001
-            email_sent = False
+            result = await conn.create_onboarding_runbook(assignee, title, steps)
+        except Exception as exc:  # noqa: BLE001
+            return _err(request, "Couldn't create the task list: " + str(getattr(exc, "remediation", exc)))
+        email_sent = None
+        if send_welcome and email:
+            w, ctx = store.welcome(), _ctx(name, email, role, manager)
+            try:
+                res = await conn.send_welcome_email(email, onboarding.render(w["subject"], ctx),
+                                                    onboarding.render(w["body"], ctx))
+                email_sent = bool(res.ok)
+            except Exception:  # noqa: BLE001
+                email_sent = False
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_onboard_run.html", {
         "result": result, "assignee": assignee, "title": title, "email_sent": email_sent, "email": email,
     })

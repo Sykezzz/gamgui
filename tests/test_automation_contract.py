@@ -49,6 +49,8 @@ def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
     assert "pinned and latest GAM contracts" in workflow
     assert "updater, bundle, and rollback contracts" in workflow
     assert "GamGUI --self-test --json" in workflow
+    assert "profile: [core, classroom-oneroster]" in workflow
+    assert 'make app PROFILE="${{ matrix.profile }}"' in workflow
     assert "name: update-ready" in workflow
     assert "needs: [verify-sha, test, gam-contracts, updater-and-build]" in workflow
 
@@ -59,6 +61,8 @@ def test_ci_dispatches_post_merge_validation_only_for_district_main_push():
     assert "post-merge-validation.yml" in workflow
     assert 'branches: [main, district-main]' in workflow
     assert 'scripts/bump_gam.py --tag "$LATEST"' in workflow
+    assert "profile: [core, classroom-oneroster]" in workflow
+    assert 'make app PROFILE="${{ matrix.profile }}"' in workflow
 
 
 def test_post_merge_latest_contract_is_pinned_before_download():

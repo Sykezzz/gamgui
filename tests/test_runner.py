@@ -10,7 +10,7 @@ import pytest
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
 from gamgui.core.gam.errors import GAMError, GAMErrorKind
-from gamgui.core.gam.runner import GAMRunner
+from gamgui.core.gam.runner import GAMRunner, secure_remove_private_file
 
 
 async def test_version(runner):
@@ -117,6 +117,103 @@ async def test_spool_is_removed_when_consumer_fails(vault, tmp_path, domain):
             raise RuntimeError("consumer failed")
     assert not spool_path.exists()
     assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_secure_private_remove_retries_transient_unlink_failure(
+    tmp_path,
+    monkeypatch,
+):
+    private = tmp_path / "private.tmp"
+    private.write_bytes(b"sensitive")
+    original_unlink = Path.unlink
+    calls = 0
+
+    def transient(self, *args, **kwargs):
+        nonlocal calls
+        if self == private and calls < 2:
+            calls += 1
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", transient)
+
+    assert secure_remove_private_file(private)
+    assert calls == 2
+    assert not private.exists()
+
+
+def test_secure_private_remove_reports_persistent_lock(tmp_path, monkeypatch):
+    private = tmp_path / "private.tmp"
+    private.write_bytes(b"sensitive")
+    original_unlink = Path.unlink
+
+    def locked(self, *args, **kwargs):
+        if self == private:
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+
+    assert not secure_remove_private_file(private, attempts=2)
+    assert private.exists()
+
+
+async def test_spool_cleanup_failure_never_masks_consumer_failure(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def cleanup_failed(_path):
+        return False
+
+    monkeypatch.setattr(
+        "gamgui.core.gam.runner.await_secure_remove_private_file",
+        cleanup_failed,
+    )
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "print('private output')"],
+        ):
+            raise RuntimeError("consumer failed")
+
+
+async def test_spool_cleanup_failure_surfaces_after_success(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def cleanup_failed(_path):
+        return False
+
+    monkeypatch.setattr(
+        "gamgui.core.gam.runner.await_secure_remove_private_file",
+        cleanup_failed,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be removed securely"):
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "print('private output')"],
+        ):
+            pass
 
 
 async def test_cancelling_spooled_command_stops_process_and_removes_files(

@@ -1,0 +1,87 @@
+<section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="import-detail-heading">
+  {% if notice %}
+  <div class="mb-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>
+  {% endif %}
+  <div class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <p class="eyebrow text-brand-blueink">Selected import</p>
+      <h2 id="import-detail-heading" class="mt-1 font-serif text-xl text-brand-black">{{ snapshot.filename | default("OneRoster snapshot") }}</h2>
+      <p class="mt-1 text-xs text-brand-blueink">Import ID <code class="font-mono">{{ snapshot.id }}</code></p>
+    </div>
+    <div class="rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-sm font-semibold text-brand-black" role="status">{{ snapshot.state | default("uploaded") | replace("_", " ") | title }}</div>
+  </div>
+
+  <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+    <div><dt class="text-brand-blueink">Package mode</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ snapshot.package_mode | default("unknown") }}</dd></div>
+    <div><dt class="text-brand-blueink">Issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.issue_count | default(0) }}</dd></div>
+    <div><dt class="text-brand-blueink">Blocking issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.blocking_issue_count | default(0) }}</dd></div>
+    <div><dt class="text-brand-blueink">Ready for apply</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ "Yes" if snapshot.ready_for_apply else "No" }}</dd></div>
+    <div class="sm:col-span-2"><dt class="text-brand-blueink">Academic session</dt><dd class="mt-0.5 font-mono text-xs text-brand-black">{{ snapshot.selected_session_id | default("Selection required", true) }}</dd></div>
+  </dl>
+
+  {% if snapshot.counts %}
+  <div class="mt-4 overflow-x-auto">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">Normalized OneRoster entity counts</caption>
+      <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink"><tr><th class="px-3 py-2" scope="col">Entity</th><th class="px-3 py-2" scope="col">Rows</th></tr></thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for name, count in snapshot.counts.items() %}
+        <tr><th class="px-3 py-2 font-medium text-brand-black" scope="row">{{ name | replace("_", " ") | title }}</th><td class="px-3 py-2 tabular-nums text-brand-blueink">{{ count }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <div class="mt-5 flex flex-wrap gap-3">
+    <button type="button" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+            hx-post="/classroom/imports/import/{{ snapshot.id }}/validate"
+            hx-target="#oneroster-workspace" hx-swap="innerHTML">Validate locally</button>
+    {% for kind in ("sessions", "courses", "teachers", "students", "issues", "excluded") %}
+    <button type="button" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+            hx-get="/classroom/imports/import/{{ snapshot.id }}/preview?kind={{ kind }}"
+            hx-target="#oneroster-preview" hx-swap="innerHTML">{{ kind | title }}</button>
+    {% endfor %}
+  </div>
+  <div id="oneroster-preview" class="mt-5" aria-live="polite">
+    <div class="rounded-xl border border-dashed border-brand-gray/60 p-5 text-sm text-brand-blueink">Choose a bounded preview. No live Classroom state is read by these local views.</div>
+  </div>
+
+  <div class="mt-5 grid gap-4 lg:grid-cols-2">
+    <section class="rounded-xl border border-brand-gray/40 bg-paper/60 p-4" aria-labelledby="oneroster-export-heading">
+      <h3 id="oneroster-export-heading" class="font-semibold text-brand-black">GAM-ready CSV exports</h3>
+      <p class="mt-1 text-sm text-brand-blueink">Generated from the retained normalized snapshot and streamed as downloads. Exporting does not contact Google.</p>
+      <div class="mt-3 flex flex-wrap gap-2">
+        {% for kind, label in (("courses", "Courses"), ("teachers", "Teachers"), ("students", "Students"), ("courses_needs_teacher", "Quarantined courses")) %}
+        <a href="/classroom/imports/import/{{ snapshot.id }}/export/{{ kind }}"
+           class="inline-flex rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">{{ label }} CSV</a>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="rounded-xl border border-brand-blue/30 bg-brand-white p-4" aria-labelledby="oneroster-live-plan-heading">
+      <h3 id="oneroster-live-plan-heading" class="font-semibold text-brand-black">Compare with live Classroom</h3>
+      <p class="mt-1 text-sm text-brand-blueink">This explicit action reads Directory and Classroom state. It does not run any mutation.</p>
+      {% if snapshot.ready_for_apply %}
+      <form class="mt-3 space-y-3" hx-post="/classroom/imports/import/{{ snapshot.id }}/plan" hx-target="#oneroster-plan" hx-swap="innerHTML">
+        <label class="block text-sm font-medium text-brand-black">Pilot or rollout evidence
+          <textarea name="pilot_evidence" required minlength="8" maxlength="1000" rows="3"
+                    class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
+                    placeholder="Example: Two-course additions-only pilot approved and verified on 2026-07-25."></textarea>
+        </label>
+        <p class="text-xs text-brand-blueink">This note is sealed into each resulting manifest with source, threshold, exclusion, and live-state evidence.</p>
+        <div class="flex flex-wrap gap-2">
+          <button type="submit" name="mode" value="normal" class="rounded-lg bg-brand-blueink px-3 py-1.5 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Build full live plan</button>
+          <button type="submit" name="mode" value="limited" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Build additions-only plan</button>
+        </div>
+      </form>
+      {% else %}
+      <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">Resolve blocking issues and select one academic session before building a live plan.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <div id="oneroster-plan" class="mt-5" aria-live="polite">
+    <div class="rounded-xl border border-dashed border-brand-gray/60 p-5 text-sm text-brand-blueink">No live plan has been built. A plan must be rebuilt whenever source, configuration, or live Classroom state changes.</div>
+  </div>
+</section>

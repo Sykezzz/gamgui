@@ -1,0 +1,11 @@
+<div>
+  {% if notice %}
+  <div class="rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>
+  {% endif %}
+  {% if error %}
+  <div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="alert">
+    <p>{{ error }}</p>
+    {% if error_code %}<p class="mt-1 text-xs">Error code: <code class="font-mono">{{ error_code }}</code></p>{% endif %}
+  </div>
+  {% endif %}
+</div>

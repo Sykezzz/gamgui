@@ -1,0 +1,15 @@
+<section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="oneroster-unavailable-heading">
+  <p class="eyebrow text-brand-blueink">Optional component</p>
+  <h2 id="oneroster-unavailable-heading" class="mt-2 font-serif text-2xl text-brand-black">
+    {% if feature.reason == "disabled" %}OneRoster Classroom is disabled{% elif feature.reason == "auth_required" %}Connect a Workspace domain first{% elif feature.reason == "degraded" %}OneRoster Classroom needs attention{% else %}Install OneRoster Classroom{% endif %}
+  </h2>
+  <p class="mt-2 max-w-2xl text-sm text-brand-blueink/80">{{ feature.message }}</p>
+  <div class="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="status">
+    Core Classroom course and roster administration is still available.
+    <span class="block mt-1 text-xs">Status code: <code class="font-mono">{{ feature.code }}</code></span>
+  </div>
+  <div class="mt-4 flex flex-wrap gap-3">
+    <a href="/components" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Open component settings</a>
+    <a href="/classroom" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Return to Classroom</a>
+  </div>
+</section>

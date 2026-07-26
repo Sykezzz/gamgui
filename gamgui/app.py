@@ -18,10 +18,12 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import uvicorn
 
+from .core.activity import activity_registry
+from .core.components import ComponentManager
 from .core.paths import APP_DATA_ENV, app_data_dir
 from .core.secrets.ephemeral import sweep_stale_configs, wipe_live_configs
 from .core.updater import (
@@ -30,6 +32,7 @@ from .core.updater import (
     UpdateStateStore,
     activation_evidence_valid,
     bundle_self_test,
+    candidate_is_blocked,
     installed_app_path,
     prepare_database_schemas,
     wait_for_process_exit,
@@ -107,7 +110,9 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
-def _active_admin_jobs(state: AppState) -> bool:
+def _active_admin_jobs(state: AppState, *, include_registry: bool = True) -> bool:
+    if include_registry and activity_registry.is_active():
+        return True
     terminal = {"completed", "failed", "cancelled", "interrupted"}
     for job in state.jobs.values():
         finished = getattr(job, "finished", None)
@@ -124,10 +129,16 @@ def _active_admin_jobs(state: AppState) -> bool:
         done = getattr(task, "done", None)
         if callable(done) and not done():
             return True
+    for task in getattr(state, "oneroster_manifest_tasks", {}).values():
+        done = getattr(task, "done", None)
+        if callable(done) and not done():
+            return True
     drive_service = getattr(state, "drive_service", None)
+    oneroster_service = getattr(state, "oneroster_service", None)
     stores = (
         getattr(state, "classroom_manifests", None),
         getattr(drive_service, "operations", None),
+        getattr(oneroster_service, "store", None),
     )
     for store in stores:
         checker = getattr(store, "has_active_jobs", None)
@@ -139,12 +150,51 @@ def _active_admin_jobs(state: AppState) -> bool:
 def _start_update_preparation(state: AppState) -> None:
     if sys.platform != "darwin" or installed_app_path() is None:
         return
-    coordinator = UpdateCoordinator(active_jobs=lambda: _active_admin_jobs(state))
+    manager = getattr(state, "component_manager", None)
+    first_run_pending = getattr(manager, "first_run_choice_pending", None)
+    try:
+        if callable(first_run_pending) and first_run_pending():
+            return
+        component_store = getattr(manager, "store", None)
+        load_component_state = getattr(component_store, "load", None)
+        if callable(load_component_state):
+            component_state = load_component_state()
+            if str(
+                getattr(component_state, "component_operation", "") or ""
+            ) == "preparing":
+                return
+    except (OSError, ValueError, RuntimeError):
+        # A corrupt or unavailable local component state must not cause a
+        # background updater to read Workspace credentials behind onboarding.
+        return
+    coordinator = UpdateCoordinator(
+        active_jobs=lambda: _active_admin_jobs(state, include_registry=False),
+        activity_registry=activity_registry,
+    )
     threading.Thread(
         target=coordinator.check_and_prepare,
         name="gamgui-update-check",
         daemon=True,
     ).start()
+
+
+def _allow_window_close(
+    state: AppState,
+    notify: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Refuse desktop shutdown while an administrative mutation is active."""
+
+    if not _active_admin_jobs(state):
+        return True
+    if notify is not None:
+        try:
+            notify(
+                "GamGUI is still completing an administrative operation. "
+                "Wait for it to finish before closing the app."
+            )
+        except Exception:
+            pass
+    return False
 
 
 def _handoff_pending_update() -> bool:
@@ -158,12 +208,14 @@ def _handoff_pending_update() -> bool:
     pending = Path(state.pending_app) if state.pending_app else None
     current = installed_app_path()
     executable = pending / "Contents" / "MacOS" / "GamGUI" if pending else None
+    if pending is not None and not pending.is_dir():
+        UpdateCoordinator().recover_missing_pending(pending)
+        return False
     if (
         pending is None
         or current is None
         or not state.candidate_sha
-        or state.candidate_sha in state.blocked_shas
-        or not pending.is_dir()
+        or candidate_is_blocked(state)
     ):
         return False
     if executable is None or not executable.is_file():
@@ -267,6 +319,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     state = AppState.create()
+    manager = getattr(state, "component_manager", None)
+    if manager is None:
+        manager = ComponentManager(registry=activity_registry)
+        try:
+            setattr(state, "component_manager", manager)
+        except (AttributeError, TypeError):
+            pass
+    try:
+        manager.cleanup_expired_snapshots()
+    except (OSError, ValueError, RuntimeError):
+        # Retention cleanup is best-effort at startup. It never blocks Core and
+        # does not load optional component code or Workspace credentials.
+        pass
     app = create_app(state)
     host, port = "127.0.0.1", _free_loopback_port()
     server = _BackgroundServer(app, host, port)
@@ -294,6 +359,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     webview.settings["ALLOW_DOWNLOADS"] = True
 
     window = webview.create_window("GamGUI", url, width=1100, height=760, min_size=(900, 600))
+
+    def _notify_close_refusal(message: str) -> None:
+        escaped = json.dumps(str(message))
+        window.evaluate_js(f"window.alert({escaped})")
+
+    def _guard_close() -> bool:
+        return _allow_window_close(state, _notify_close_refusal)
+
+    window.events.closing += _guard_close
 
     def _fit_to_screen() -> None:
         # Once the GUI loop knows the display, grow the window to fit it (so the full-width screens

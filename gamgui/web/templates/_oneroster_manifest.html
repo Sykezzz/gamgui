@@ -1,0 +1,122 @@
+<article id="oneroster-manifest-{{ manifest.id }}"
+         class="rounded-xl border border-brand-gray/40 bg-paper/50 p-4"
+         {% if polling %}
+         hx-get="/classroom/imports/manifest/{{ manifest.id }}/status"
+         hx-trigger="load delay:750ms, every 3s"
+         hx-target="this"
+         hx-swap="outerHTML"
+         {% endif %}
+         aria-labelledby="oneroster-manifest-heading-{{ manifest.id }}">
+  {% if notice %}
+  <div class="mb-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>
+  {% endif %}
+  {% if task_error %}
+  <div class="mb-3 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900" role="alert">
+    <p>{{ task_error }}</p>
+    {% if task_error_code %}<p class="mt-1 text-xs">Error code: <code class="font-mono">{{ task_error_code }}</code></p>{% endif %}
+  </div>
+  {% endif %}
+
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div>
+      <p class="eyebrow text-brand-blueink">{{ manifest.plan_kind | replace("_", " ") | title }} approval</p>
+      <h5 id="oneroster-manifest-heading-{{ manifest.id }}" class="mt-1 font-semibold text-brand-black">
+        Manifest <code class="font-mono text-xs">{{ manifest.id }}</code>
+      </h5>
+      <p class="mt-1 text-xs text-brand-blueink">Import ID <code class="font-mono">{{ manifest.import_id }}</code></p>
+    </div>
+    <span class="rounded-lg border border-brand-gray/50 bg-brand-white px-3 py-1.5 text-sm font-semibold text-brand-black" role="status">{{ manifest.status | replace("_", " ") | title }}</span>
+  </div>
+
+  <dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+    <div><dt class="text-brand-blueink">Actions</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.action_total }}</dd></div>
+    <div><dt class="text-brand-blueink">Complete</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.complete_count }}</dd></div>
+    <div><dt class="text-brand-blueink">Pending</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.pending_count }}</dd></div>
+    <div><dt class="text-brand-blueink">Manifest hash</dt><dd class="truncate font-mono text-xs text-brand-black" title="{{ manifest.manifest_hash }}">{{ manifest.manifest_hash }}</dd></div>
+  </dl>
+
+  <details class="mt-3 rounded-lg border border-brand-gray/30 bg-brand-white p-3">
+    <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Approval evidence</summary>
+    <dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+      <div><dt class="text-brand-blueink">Pilot or rollout evidence</dt><dd class="mt-1 text-brand-black">{{ manifest.pilot_evidence.operator_note | default("No operator note recorded.", true) }}</dd></div>
+      <div><dt class="text-brand-blueink">Prior accepted import</dt><dd class="mt-1 break-all font-mono text-xs text-brand-black">{{ manifest.pilot_evidence.prior_accepted_import_id | default("None", true) }}</dd></div>
+      <div><dt class="text-brand-blueink">Threshold profile hash</dt><dd class="mt-1 truncate font-mono text-xs text-brand-black" title="{{ manifest.threshold_evidence.profile_hash }}">{{ manifest.threshold_evidence.profile_hash | default("Not configured", true) }}</dd></div>
+      <div><dt class="text-brand-blueink">Quarantines and exclusions</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ manifest.exclusion_total }}</dd></div>
+    </dl>
+    {% if manifest.exclusions %}
+    <ul class="mt-3 list-disc space-y-1 pl-5 text-xs text-brand-blueink">
+      {% for issue in manifest.exclusions[:10] %}
+      <li><code class="font-mono">{{ issue.code }}</code> — {{ issue.message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </details>
+
+  {% if manifest.error %}
+  <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="alert">Result code: <code class="font-mono">{{ manifest.error }}</code></p>
+  {% endif %}
+
+  <div class="mt-4 overflow-x-auto rounded-lg border border-brand-gray/30 bg-brand-white">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">{{ manifest.plan_kind | title }} manifest actions</caption>
+      <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
+        <tr><th class="px-3 py-2" scope="col">Action</th><th class="px-3 py-2" scope="col">Subject</th><th class="px-3 py-2" scope="col">Target</th><th class="px-3 py-2" scope="col">Before</th><th class="px-3 py-2" scope="col">After</th><th class="px-3 py-2" scope="col">Status</th><th class="px-3 py-2" scope="col">Result detail</th></tr>
+      </thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for action in manifest.actions %}
+        <tr>
+          <td class="px-3 py-2 text-brand-black">{{ action.kind | replace("_", " ") | title }}</td>
+          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.subject }}</td>
+          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.target }}</td>
+          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.before }}</td>
+          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.after }}</td>
+          <td class="px-3 py-2 text-brand-blueink">{{ action.status | title }}</td>
+          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.detail }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="px-3 py-5 text-center text-brand-blueink">This manifest contains no actions.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if manifest.previous_offset is not none or manifest.next_offset is not none %}
+    <div class="flex justify-between gap-3 border-t border-brand-gray/30 px-3 py-2">
+      <div>
+        {% if manifest.previous_offset is not none %}
+        <button type="button"
+                hx-get="/classroom/imports/manifest/{{ manifest.id }}?offset={{ manifest.previous_offset }}"
+                hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML"
+                class="rounded-lg border border-brand-gray/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Previous</button>
+        {% endif %}
+      </div>
+      <p class="self-center text-xs tabular-nums text-brand-blueink">{{ manifest.action_offset + 1 if manifest.action_total else 0 }}–{{ [manifest.action_offset + manifest.actions | length, manifest.action_total] | min }} of {{ manifest.action_total }}</p>
+      <div>
+        {% if manifest.next_offset is not none %}
+        <button type="button"
+                hx-get="/classroom/imports/manifest/{{ manifest.id }}?offset={{ manifest.next_offset }}"
+                hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML"
+                class="rounded-lg border border-brand-gray/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Next</button>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {% if manifest.status in ("planned", "awaiting_students") %}
+  <form class="mt-4 rounded-lg border border-amber-300 bg-brand-white p-3"
+        hx-post="/classroom/imports/manifest/{{ manifest.id }}/execute"
+        hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML">
+    <p class="text-sm font-semibold text-brand-black">
+      {% if manifest.plan_kind == "archive" %}Approve managed-course archives
+      {% elif manifest.plan_kind == "ownership" %}Approve course ownership transfers
+      {% elif manifest.status == "awaiting_students" %}Run approved student membership changes
+      {% else %}Approve course and roster work{% endif %}
+    </p>
+    <p class="mt-1 text-xs text-brand-blueink">Live state and all hashes are revalidated before GAM runs. Interrupted or changed work must be replanned.</p>
+    <label class="mt-3 block text-sm font-medium text-brand-black">Type import ID <span class="font-mono">{{ manifest.import_id }}</span>
+      <input name="typed_import_id" required autocomplete="off"
+             class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 font-mono text-sm focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-500/30" />
+    </label>
+    <button type="submit" class="mt-3 rounded-lg bg-amber-800 px-3 py-2 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Confirm and execute</button>
+  </form>
+  {% endif %}
+</article>

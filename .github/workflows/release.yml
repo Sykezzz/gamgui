@@ -1,0 +1,575 @@
+name: Official macOS release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact district-main commit to package
+        required: true
+        type: string
+      release_tag:
+        description: Version tag matching the application version (for example v0.0.1)
+        required: true
+        type: string
+      expected_team_id:
+        description: Independently verified 10-character Apple Developer Team ID
+        required: true
+        type: string
+      publish:
+        description: Publish a GitHub release after every gate passes
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: official-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test unsigned exact-SHA profiles
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    env:
+      SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      PUBLISH_RELEASE: ${{ github.event_name == 'push' || inputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact source, version tag, and district-main ancestry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(printf '%s' "$SOURCE_SHA" | grep -Ec '^[0-9a-f]{40}$')" = "1"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -n "$(git show-ref --verify refs/remotes/origin/district-main)"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/district-main
+
+          VERSION="$(python3 -c 'from gamgui import __version__; print(__version__)')"
+          test "$RELEASE_TAG" = "v$VERSION"
+
+          if [ "$PUBLISH_RELEASE" = "true" ]; then
+            test "$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")" = "$SOURCE_SHA"
+            if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Refusing to overwrite an existing official release." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Require exact-SHA post-merge validation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/check-runs?per_page=100" \
+            >"$RUNNER_TEMP/check-runs.json"
+          python3 - "$RUNNER_TEMP/check-runs.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          accepted = [
+              item
+              for item in payload.get("check_runs", [])
+              if item.get("name") == "update-ready"
+              and item.get("status") == "completed"
+              and item.get("conclusion") == "success"
+          ]
+          if not accepted:
+              raise SystemExit("Exact source SHA has no successful update-ready check.")
+          PY
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.7"
+
+      - name: Run complete locked offline suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python "$(which python)" --extra dev --extra desktop --extra build
+          .venv/bin/pytest -q
+
+      - name: Vendor and verify pinned GAM7
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          make gam
+          .venv/bin/pytest -q tests/test_command_contract.py tests/test_bump_gam.py
+
+      - name: Build both unsigned exact-SHA profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -m 700 unsigned-dist
+          for PROFILE in core classroom-oneroster; do
+            CODESIGN_IDENTITY="" make app PROFILE="$PROFILE"
+            test -d dist/GamGUI.app
+            ditto -c -k --sequesterRsrc --keepParent \
+              dist/GamGUI.app "unsigned-dist/GamGUI-$PROFILE-unsigned.zip"
+            rm -rf dist/GamGUI.app dist/GamGUI.app.artifact.json
+          done
+
+      - name: Upload immutable unsigned profiles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-profiles-${{ env.SOURCE_SHA }}
+          path: unsigned-dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-notarize-release:
+    name: Protected sign, notarize, verify, and release
+    needs: build-and-test
+    runs-on: macos-latest
+    timeout-minutes: 60
+    environment: official-release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      PUBLISH_RELEASE: ${{ github.event_name == 'push' || inputs.publish }}
+      EXPECTED_TEAM_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_team_id || vars.APPLE_TEAM_ID }}
+    steps:
+      - name: Download exact unsigned build outputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-profiles-${{ env.SOURCE_SHA }}
+          path: unsigned-dist
+
+      - name: Unpack and validate unsigned profile identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(printf '%s' "$EXPECTED_TEAM_ID" | grep -Ec '^[A-Z0-9]{10}$')" = "1"
+          mkdir -m 700 signed-work
+          for PROFILE in core classroom-oneroster; do
+            ARCHIVE="unsigned-dist/GamGUI-$PROFILE-unsigned.zip"
+            test -f "$ARCHIVE"
+            mkdir -m 700 "signed-work/$PROFILE"
+            ditto -x -k "$ARCHIVE" "signed-work/$PROFILE"
+            APP="signed-work/$PROFILE/GamGUI.app"
+            test -d "$APP"
+            PROFILE_JSON="$(
+              find "$APP/Contents" -type f \
+                -path '*/resources/components/profile.json' -print
+            )"
+            test "$(printf '%s\n' "$PROFILE_JSON" | grep -c .)" = "1"
+            /usr/bin/python3 - "$PROFILE_JSON" "$PROFILE" "$SOURCE_SHA" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          artifact = payload.get("artifact", {})
+          if artifact.get("profile") != sys.argv[2]:
+              raise SystemExit("Unsigned bundle profile does not match its artifact name.")
+          if artifact.get("source_sha") != sys.argv[3]:
+              raise SystemExit("Unsigned bundle was not built from the requested source SHA.")
+          PY
+          done
+
+      # SECURITY BOUNDARY: this is the only step that receives Apple signing or
+      # notarization credentials. Protected-environment approval must review this
+      # narrow inline shell because workflow YAML is repository-controlled. There is
+      # no source checkout, dependency installation, project script, or app execution
+      # while credentials are present. The trap destroys credential files/keychain
+      # before any repository code is checked out or run.
+      - name: Sign and notarize with ephemeral protected credentials
+        shell: bash
+        env:
+          DEVELOPER_ID_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          RELEASE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_RELEASE_KEYCHAIN_PASSWORD }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          for VARIABLE in \
+            DEVELOPER_ID_IDENTITY \
+            DEVELOPER_ID_P12_BASE64 \
+            DEVELOPER_ID_P12_PASSWORD \
+            RELEASE_KEYCHAIN_PASSWORD \
+            NOTARY_KEY_ID \
+            NOTARY_ISSUER_ID \
+            NOTARY_PRIVATE_KEY_BASE64
+          do
+            test -n "${!VARIABLE:-}" || {
+              echo "Required official-release credential is missing: $VARIABLE" >&2
+              exit 1
+            }
+          done
+          case "$DEVELOPER_ID_IDENTITY" in
+            "Developer ID Application: "*" ($EXPECTED_TEAM_ID)") ;;
+            *)
+              echo "Developer ID identity does not match EXPECTED_TEAM_ID." >&2
+              exit 1
+              ;;
+          esac
+
+          export RELEASE_CERTIFICATE="$RUNNER_TEMP/gamgui-developer-id.p12"
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          export RELEASE_KEYCHAIN="$RUNNER_TEMP/gamgui-official.keychain-db"
+          cleanup_credentials() {
+            local cleanup_failed=0
+            local keychain_list=""
+            if [ -e "$RELEASE_KEYCHAIN" ]; then
+              security lock-keychain "$RELEASE_KEYCHAIN" || cleanup_failed=1
+              security delete-keychain "$RELEASE_KEYCHAIN" || cleanup_failed=1
+            fi
+            rm -f \
+              "$NOTARY_KEY_PATH" \
+              "$RELEASE_CERTIFICATE" \
+              "$RELEASE_KEYCHAIN" || cleanup_failed=1
+            for SENSITIVE_PATH in \
+              "$NOTARY_KEY_PATH" \
+              "$RELEASE_CERTIFICATE" \
+              "$RELEASE_KEYCHAIN"
+            do
+              if [ -e "$SENSITIVE_PATH" ]; then
+                echo "Official-release credential cleanup left a sensitive file behind." >&2
+                cleanup_failed=1
+              fi
+            done
+            if ! keychain_list="$(security list-keychains -d user)"; then
+              echo "Could not verify the post-signing keychain search list." >&2
+              cleanup_failed=1
+            elif printf '%s\n' "$keychain_list" |
+              tr -d '"' |
+              grep -F -- "$RELEASE_KEYCHAIN" >/dev/null
+            then
+              echo "Ephemeral official-release keychain remains registered." >&2
+              cleanup_failed=1
+            fi
+            return "$cleanup_failed"
+          }
+          cleanup_on_exit() {
+            local prior_status="$?"
+            if ! cleanup_credentials; then
+              echo "Official-release credential cleanup failed." >&2
+              exit 1
+            fi
+            return "$prior_status"
+          }
+          trap cleanup_on_exit EXIT
+
+          /usr/bin/python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+
+          for source, destination in (
+              ("DEVELOPER_ID_P12_BASE64", "RELEASE_CERTIFICATE"),
+              ("NOTARY_PRIVATE_KEY_BASE64", "NOTARY_KEY_PATH"),
+          ):
+              try:
+                  decoded = base64.b64decode(os.environ[source], validate=True)
+              except ValueError as exc:
+                  raise SystemExit(f"{source} is not valid base64.") from exc
+              if not decoded:
+                  raise SystemExit(f"{source} decoded to an empty file.")
+              path = pathlib.Path(os.environ[destination])
+              path.write_bytes(decoded)
+              path.chmod(0o600)
+          PY
+
+          security create-keychain -p "$RELEASE_KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$RELEASE_KEYCHAIN"
+          security unlock-keychain -p "$RELEASE_KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security import "$RELEASE_CERTIFICATE" \
+            -k "$RELEASE_KEYCHAIN" \
+            -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$RELEASE_KEYCHAIN_PASSWORD" \
+            "$RELEASE_KEYCHAIN"
+          MATCHES="$(
+            security find-identity -v -p codesigning "$RELEASE_KEYCHAIN" |
+              grep -F "\"$DEVELOPER_ID_IDENTITY\"" |
+              wc -l |
+              tr -d ' '
+          )"
+          test "$MATCHES" = "1"
+
+          sign_macho() {
+            local candidate="$1"
+            if file -b "$candidate" | grep -q "Mach-O"; then
+              codesign --force --options runtime --timestamp \
+                --keychain "$RELEASE_KEYCHAIN" \
+                --sign "$DEVELOPER_ID_IDENTITY" "$candidate"
+            fi
+          }
+
+          for PROFILE in core classroom-oneroster; do
+            APP="signed-work/$PROFILE/GamGUI.app"
+            while IFS= read -r -d '' CANDIDATE; do
+              sign_macho "$CANDIDATE"
+            done < <(find "$APP/Contents" -type f -print0)
+            while IFS= read -r -d '' CONTAINER; do
+              codesign --force --options runtime --timestamp \
+                --keychain "$RELEASE_KEYCHAIN" \
+                --sign "$DEVELOPER_ID_IDENTITY" "$CONTAINER"
+            done < <(
+              find "$APP/Contents" -depth -type d \
+                \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' -o -name '*.appex' \) \
+                -print0
+            )
+            codesign --force --options runtime --timestamp \
+              --keychain "$RELEASE_KEYCHAIN" \
+              --sign "$DEVELOPER_ID_IDENTITY" "$APP"
+            codesign --verify --deep --strict --verbose=4 "$APP"
+
+            SIGNATURE_DETAILS="signed-work/$PROFILE/signature-details.txt"
+            codesign --display --verbose=4 "$APP" >"$SIGNATURE_DETAILS" 2>&1
+            grep -F "Authority=$DEVELOPER_ID_IDENTITY" "$SIGNATURE_DETAILS" >/dev/null
+            test "$(
+              grep -Ec "^TeamIdentifier=$EXPECTED_TEAM_ID$" "$SIGNATURE_DETAILS"
+            )" = "1"
+            grep -E 'flags=.*\(runtime\)' "$SIGNATURE_DETAILS" >/dev/null
+            grep -E '^Timestamp=' "$SIGNATURE_DETAILS" >/dev/null
+
+            ENTITLEMENTS="signed-work/$PROFILE/entitlements.plist"
+            codesign --display --entitlements :- "$APP" >"$ENTITLEMENTS" 2>/dev/null || true
+            if grep -F "com.apple.security.cs.disable-library-validation" \
+              "$ENTITLEMENTS" >/dev/null; then
+              echo "Official app must not disable macOS library validation." >&2
+              exit 1
+            fi
+
+            SUBMISSION="signed-work/$PROFILE/notarization-submit.zip"
+            NOTARY_RESULT="signed-work/$PROFILE/notary-result.json"
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "$SUBMISSION"
+            xcrun notarytool submit "$SUBMISSION" \
+              --key "$NOTARY_KEY_PATH" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" \
+              --wait \
+              --output-format json >"$NOTARY_RESULT"
+            /usr/bin/python3 - "$NOTARY_RESULT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if result.get("status") != "Accepted" or not result.get("id"):
+              raise SystemExit("Apple notarization did not return Accepted evidence.")
+          PY
+            xcrun stapler staple "$APP"
+            xcrun stapler validate "$APP"
+            spctl --assess --type execute --verbose=4 "$APP"
+            codesign --verify --deep --strict --verbose=4 "$APP"
+          done
+          cleanup_credentials
+          trap - EXIT
+
+      # Checkout and all project-controlled Python run only after the credential
+      # step has verified deletion of the certificate, key, and keychain.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          path: release-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.7"
+
+      - name: Verify, self-test, and package both signed profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-source
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          uv sync --frozen --python "$(which python)" --extra dev --extra desktop
+          RELEASE_ROOT="$(cd .. && pwd)"
+          OFFICIAL_DIST="$RELEASE_ROOT/official-dist"
+          SIGNED_WORK="$RELEASE_ROOT/signed-work"
+          mkdir -m 700 "$OFFICIAL_DIST"
+
+          for PROFILE in core classroom-oneroster; do
+            APP="$SIGNED_WORK/$PROFILE/GamGUI.app"
+            NOTARY_RESULT="$SIGNED_WORK/$PROFILE/notary-result.json"
+            codesign --verify --deep --strict --verbose=4 "$APP"
+            SIGNATURE_DETAILS="$(codesign --display --verbose=4 "$APP" 2>&1)"
+            AUTHORITY="$(
+              printf '%s\n' "$SIGNATURE_DETAILS" |
+                sed -n 's/^Authority=\\(Developer ID Application: .*\\)$/\\1/p' |
+                head -1
+            )"
+            test -n "$AUTHORITY"
+            case "$AUTHORITY" in
+              "Developer ID Application: "*" ($EXPECTED_TEAM_ID)") ;;
+              *)
+                echo "Signed profile authority does not match EXPECTED_TEAM_ID." >&2
+                exit 1
+                ;;
+            esac
+            test "$(
+              printf '%s\n' "$SIGNATURE_DETAILS" |
+                grep -Ec "^TeamIdentifier=$EXPECTED_TEAM_ID$"
+            )" = "1"
+            printf '%s\n' "$SIGNATURE_DETAILS" | grep -E 'flags=.*\(runtime\)' >/dev/null
+            printf '%s\n' "$SIGNATURE_DETAILS" | grep -E '^Timestamp=' >/dev/null
+            xcrun stapler validate "$APP"
+            spctl --assess --type execute --verbose=4 "$APP"
+
+            SELF_TEST_RESULT="$SIGNED_WORK/$PROFILE/self-test.json"
+            SELF_TEST_DATA="$SIGNED_WORK/$PROFILE/self-test-data"
+            mkdir -m 700 "$SELF_TEST_DATA"
+            GAMGUI_APP_DATA_DIR="$SELF_TEST_DATA" \
+              "$APP/Contents/MacOS/GamGUI" --self-test --json >"$SELF_TEST_RESULT"
+            .venv/bin/python - "$SELF_TEST_RESULT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if result.get("ok") is not True or result.get("failures") not in ([], None):
+              raise SystemExit("Post-credential offline bundle self-test failed.")
+          PY
+
+            .venv/bin/python - "$APP" "$AUTHORITY" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from gamgui.core.components import write_artifact_sidecar
+
+          write_artifact_sidecar(
+              Path(sys.argv[1]),
+              signing_channel="developer-id",
+              signing_authority=sys.argv[2],
+          )
+          PY
+
+            VERSION="$(.venv/bin/python -c 'from gamgui import __version__; print(__version__)')"
+            ARCHITECTURE="$(uname -m)"
+            ASSET_STEM="GamGUI-${VERSION}-${PROFILE}-${ARCHITECTURE}"
+            ARCHIVE="$OFFICIAL_DIST/$ASSET_STEM.zip"
+            SIDECAR="$OFFICIAL_DIST/$ASSET_STEM.artifact.json"
+            EVIDENCE="$OFFICIAL_DIST/$ASSET_STEM.evidence.json"
+            cp "$APP.artifact.json" "$SIDECAR"
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
+            .venv/bin/python scripts/release_manifest.py record \
+              --profile "$PROFILE" \
+              --bundle "$APP" \
+              --archive "$ARCHIVE" \
+              --sidecar "$SIDECAR" \
+              --notary-result "$NOTARY_RESULT" \
+              --self-test-result "$SELF_TEST_RESULT" \
+              --signing-authority "$AUTHORITY" \
+              --output "$EVIDENCE"
+          done
+
+          EVIDENCE=("$OFFICIAL_DIST"/*.evidence.json)
+          test "${#EVIDENCE[@]}" = "2"
+          .venv/bin/python scripts/release_manifest.py build \
+            --source-sha "$SOURCE_SHA" \
+            --release-tag "$RELEASE_TAG" \
+            --artifact-evidence "${EVIDENCE[0]}" \
+            --artifact-evidence "${EVIDENCE[1]}" \
+            --output "$OFFICIAL_DIST/release-manifest.json" \
+            --checksum-output "$OFFICIAL_DIST/release-manifest.json.sha256"
+          .venv/bin/python scripts/release_manifest.py verify-assets \
+            --manifest "$OFFICIAL_DIST/release-manifest.json" \
+            --checksum "$OFFICIAL_DIST/release-manifest.json.sha256" \
+            --asset-dir "$OFFICIAL_DIST" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-team-id "$EXPECTED_TEAM_ID"
+
+          for PROFILE in core classroom-oneroster; do
+            EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
+            EXPECTED_TEAM_ID="$EXPECTED_TEAM_ID" \
+              bash scripts/verify_official_artifact.sh \
+                "$OFFICIAL_DIST/release-manifest.json" \
+                "$OFFICIAL_DIST/release-manifest.json.sha256" \
+                "$OFFICIAL_DIST" \
+                "$PROFILE"
+          done
+
+      - name: Retain verified official release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-official-${{ env.RELEASE_TAG }}-${{ env.SOURCE_SHA }}
+          path: official-dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish both profiles only after every gate passes
+        if: ${{ env.PUBLISH_RELEASE == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha
+          )" = "$SOURCE_SHA"
+          RELEASE_ASSETS=(official-dist/*.zip official-dist/*.artifact.json)
+          test "${#RELEASE_ASSETS[@]}" = "4"
+          for ASSET in "${RELEASE_ASSETS[@]}"; do
+            test -f "$ASSET"
+          done
+          RELEASE_ASSETS+=(
+            "official-dist/release-manifest.json"
+            "official-dist/release-manifest.json.sha256"
+          )
+          gh release create "$RELEASE_TAG" \
+            "${RELEASE_ASSETS[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "GamGUI $RELEASE_TAG" \
+            --generate-notes
+
+      - name: Record validation-only result
+        if: ${{ env.PUBLISH_RELEASE != 'true' }}
+        shell: bash
+        run: |
+          {
+            echo "### Official release validation passed"
+            echo
+            echo "Both signed and notarized profiles passed for \`$SOURCE_SHA\`."
+            echo "No release was published because publish=false."
+            echo
+            echo '```'
+            cat official-dist/release-manifest.json.sha256
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

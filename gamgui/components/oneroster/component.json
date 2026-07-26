@@ -1,0 +1,21 @@
+{
+  "id": "classroom-oneroster",
+  "version": "1",
+  "host_api_version": "1",
+  "module_root": "gamgui.components.oneroster",
+  "route_prefixes": [
+    "/classroom/imports"
+  ],
+  "assets": [
+    "templates/oneroster.html",
+    "templates/_oneroster_*.html"
+  ],
+  "migrations": [
+    "oneroster:v1"
+  ],
+  "schema_compatibility": "1",
+  "required_capabilities": [
+    "CLASSROOM",
+    "DIRECTORY"
+  ]
+}

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ...core.gam.errors import GAMError
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..jobs import start_job
 from ..server import TEMPLATES
 
@@ -81,7 +82,7 @@ async def _subscribers_for(conn, target: str, known_users: set) -> "tuple[str, l
     return ("group", []) if low.startswith("group:") else ("user", [scope] if _is_user_scope(scope) else [])
 
 
-async def _run_subscribe(job, conn, cal: str, emails: list) -> None:
+async def _run_subscribe(job, conn, cal: str, emails: list, *, lease=None) -> None:
     """Background: put ``cal`` on each member's calendar list so it actually appears for them."""
     try:
         for email in emails:
@@ -103,6 +104,8 @@ async def _run_subscribe(job, conn, cal: str, emails: list) -> None:
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 def _owner_candidates(acls, cal: str) -> list:
@@ -252,7 +255,7 @@ async def search(request: Request, q: str = "") -> HTMLResponse:
     return TEMPLATES.TemplateResponse(request, _CALENDAR_LIST_TEMPLATE, {"items": items, "notes": []})
 
 
-async def _build_index(job, conn, idx, domain: str) -> None:
+async def _build_index(job, conn, idx, domain: str, lease=None) -> None:
     """Background: scan the whole domain once and atomically replace the index."""
     try:
         job.current = "Scanning every user's calendars…"
@@ -265,6 +268,8 @@ async def _build_index(job, conn, idx, domain: str) -> None:
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 @router.post("/index/rebuild", response_class=HTMLResponse)
@@ -277,9 +282,28 @@ async def index_rebuild(request: Request) -> HTMLResponse:
     existing = st.jobs.get(st.cal_index_job_id)
     if existing is not None and not existing.finished:  # don't start a second multi-minute scan
         return TEMPLATES.TemplateResponse(request, _CALENDAR_INDEX_JOB_TEMPLATE, {"job": existing})
-    job = start_job(st.jobs, 0)
-    st.cal_index_job_id = job.id
-    job.task = asyncio.create_task(_build_index(job, st.connector, st.calendar_index, st.audit_domain))
+    lease = try_acquire_admin_activity(st, "calendar-index-rebuild")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        job = start_job(st.jobs, 0)
+        st.cal_index_job_id = job.id
+        job.task = asyncio.create_task(
+            _build_index(
+                job,
+                st.connector,
+                st.calendar_index,
+                st.audit_domain,
+                lease,
+            )
+        )
+    except Exception:
+        lease.release()
+        if "job" in locals():
+            st.jobs.pop(job.id, None)
+            if st.cal_index_job_id == job.id:
+                st.cal_index_job_id = ""
+        raise
     return TEMPLATES.TemplateResponse(request, _CALENDAR_INDEX_JOB_TEMPLATE, {"job": job})
 
 
@@ -359,35 +383,54 @@ async def share(request: Request, cal: Annotated[str, Form()], target: Annotated
     if not target:
         return _err(request, "Enter a person or group to share with.")
     role = role if role in ACL_ROLES else "reader"
-    result = await conn.add_calendar_acl_for(cal, target, role=role)
-    if not result.ok:
-        return _err(request, f"Couldn't share calendar: {result.detail}")
-    kind, emails = await _subscribers_for(conn, target, await _active_emails(request))
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "calendar-share")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    lease_transferred = False
     notice, job = "", None
-    if kind == "user" and emails:
-        sub = await conn.subscribe_calendar_for(emails[0], cal)
-        if sub.ok:
-            notice = f"Shared with {target} — it will now appear in their Google Calendar."
-        else:
-            notice = (f"Shared with {target}, but couldn't auto-add it to their calendar list — "
-                      "they can add it manually in Google Calendar.")
-    elif kind == "group" and emails:
-        # Fan out in the background: one gam call per member, so a large group would otherwise hold
-        # the request open for minutes. Progress is polled, same as the index rebuild.
-        st = request.app.state.gamgui
-        job = start_job(st.jobs, len(emails))
-        job.task = asyncio.create_task(_run_subscribe(job, conn, cal, emails))
-        notice = (f"Shared with {target} — adding it to {len(emails)} "
-                  f"member{'s' if len(emails) != 1 else ''}' calendars now.")
-    elif kind == "group":
-        notice = f"Shared with {target}, but that group has no members to add it for."
-    else:
-        notice = (f"Shared with {target}. That scope can't be auto-subscribed, so people may need to "
-                  "add the calendar themselves.")
     try:
-        ctx = await _detail_ctx(request, conn, cal, label)
-    except Exception as exc:
-        return _err(request, _friendly(exc))
+        result = await conn.add_calendar_acl_for(cal, target, role=role)
+        if not result.ok:
+            return _err(request, f"Couldn't share calendar: {result.detail}")
+        kind, emails = await _subscribers_for(
+            conn,
+            target,
+            await _active_emails(request),
+        )
+        if kind == "user" and emails:
+            sub = await conn.subscribe_calendar_for(emails[0], cal)
+            if sub.ok:
+                notice = f"Shared with {target} — it will now appear in their Google Calendar."
+            else:
+                notice = (f"Shared with {target}, but couldn't auto-add it to their calendar list — "
+                          "they can add it manually in Google Calendar.")
+        elif kind == "group" and emails:
+            # Fan out in the background while retaining the activity lease: an updater or another
+            # administrative mutation must not start during the per-member GAM operations.
+            job = start_job(st.jobs, len(emails))
+            job.task = asyncio.create_task(
+                _run_subscribe(job, conn, cal, emails, lease=lease)
+            )
+            lease_transferred = True
+            notice = (
+                f"Shared with {target} — adding it to {len(emails)} "
+                f"member{'s' if len(emails) != 1 else ''} calendars now."
+            )
+        elif kind == "group":
+            notice = f"Shared with {target}, but that group has no members to add it for."
+        else:
+            notice = (
+                f"Shared with {target}. That scope can't be auto-subscribed, so people may need "
+                "to add the calendar themselves."
+            )
+        try:
+            ctx = await _detail_ctx(request, conn, cal, label)
+        except Exception as exc:
+            return _err(request, _friendly(exc))
+    finally:
+        if not lease_transferred:
+            lease.release()
     ctx["share_notice"] = notice
     ctx["subscribe_job"] = job
     return TEMPLATES.TemplateResponse(request, "_calendar_detail.html", ctx)
@@ -408,13 +451,20 @@ async def unshare(request: Request, cal: Annotated[str, Form()], scope: Annotate
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     cal, scope = cal.strip(), scope.strip()
-    result = await conn.remove_calendar_acl_for(cal, scope)
-    if not result.ok:
-        return _err(request, f"Couldn't remove access: {result.detail}")
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "calendar-unshare")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
-        ctx = await _detail_ctx(request, conn, cal, label)
-    except Exception as exc:
-        return _err(request, _friendly(exc))
+        result = await conn.remove_calendar_acl_for(cal, scope)
+        if not result.ok:
+            return _err(request, f"Couldn't remove access: {result.detail}")
+        try:
+            ctx = await _detail_ctx(request, conn, cal, label)
+        except Exception as exc:
+            return _err(request, _friendly(exc))
+    finally:
+        lease.release()
     ctx["share_notice"] = f"Removed access for {scope}."
     return TEMPLATES.TemplateResponse(request, "_calendar_detail.html", ctx)
 
@@ -452,24 +502,36 @@ async def delete_cal(request: Request, cal: Annotated[str, Form()],
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     cal = cal.strip()
+    if confirm.strip() != "DELETE":  # exact-case gate
+        try:
+            owner, refusal = await _resolve_delete_owner(request, conn, cal)
+        except Exception as exc:
+            return _err(request, _friendly(exc))
+        if not owner:
+            return _err(request, refusal)
+        return _delete_view(request, cal=cal, label=label.strip(), owner=owner,
+                            error="Type DELETE (in capitals) to confirm.")
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "calendar-delete")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     # Re-resolve owner + re-validate the id server-side — never act on a client-supplied identity.
     try:
         owner, refusal = await _resolve_delete_owner(request, conn, cal)
+        if not owner:
+            return _err(request, refusal)
+        result = await conn.delete_calendar(owner, cal)
+        if not result.ok:
+            return _delete_view(request, cal=cal, label=label.strip(), owner=owner,
+                                error=f"Couldn't delete the calendar: {result.detail}")
+        idx = st.calendar_index
+        if idx is not None:
+            # Off the event loop — a sync SQLite write could block briefly if a rebuild is mid-write.
+            await asyncio.to_thread(idx.remove, cal)  # drop it from search immediately (no full rebuild)
     except Exception as exc:
         return _err(request, _friendly(exc))
-    if not owner:
-        return _err(request, refusal)
-    if confirm.strip() != "DELETE":  # exact-case gate
-        return _delete_view(request, cal=cal, label=label.strip(), owner=owner,
-                            error="Type DELETE (in capitals) to confirm.")
-    result = await conn.delete_calendar(owner, cal)
-    if not result.ok:
-        return _delete_view(request, cal=cal, label=label.strip(), owner=owner,
-                            error=f"Couldn't delete the calendar: {result.detail}")
-    idx = request.app.state.gamgui.calendar_index
-    if idx is not None:
-        # Off the event loop — a sync SQLite write could block briefly if a rebuild is mid-write.
-        await asyncio.to_thread(idx.remove, cal)  # drop it from search immediately (no full rebuild)
+    finally:
+        lease.release()
     return _delete_view(request, cal=cal, label=label.strip(), owner=owner, deleted=True)
 
 
@@ -507,7 +569,14 @@ async def event_delete(request: Request, cal: Annotated[str, Form()], event_id: 
     conn = _conn(request)
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.delete_event(cal, event_id)
-    if not result.ok:
-        return _err(request, f"Couldn't delete the event: {result.detail}")
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "calendar-event-delete")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.delete_event(cal, event_id)
+        if not result.ok:
+            return _err(request, f"Couldn't delete the event: {result.detail}")
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_event_delete.html", {"cal": cal, "event": None, "deleted": True})

@@ -1,19 +1,120 @@
-# PyInstaller spec — builds GamGUI.app (macOS).
-# Use scripts/build_app.sh, which vendors GAM and installs PyInstaller + pywebview first.
+# PyInstaller spec — builds one immutable GamGUI.app profile (macOS).
+# Use `make app PROFILE=core|classroom-oneroster`.
+import json
 import os
+import platform
+import subprocess
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [
-    ("gamgui/web/templates", "gamgui/web/templates"),
-    ("gamgui/web/static", "gamgui/web/static"),
-]
+from gamgui import __version__
+from gamgui.core.components import (
+    CORE_PROFILE,
+    ONEROSTER_PROFILE,
+    ComponentManifest,
+    build_profile_payload,
+    manifests_for_profile,
+    normalize_profile,
+)
+
+
+def source_sha():
+    value = os.environ.get("GAMGUI_SOURCE_SHA", "").strip().lower()
+    if not value:
+        value = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+        ).strip().lower()
+    if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+        raise SystemExit("GAMGUI_SOURCE_SHA must be an exact 40-character Git SHA.")
+    return value
+
+
+def tree_datas(root, destination, *, exclude_oneroster=False):
+    root_path = Path(root)
+    result = []
+    for path in sorted(item for item in root_path.rglob("*") if item.is_file()):
+        relative = path.relative_to(root_path)
+        if exclude_oneroster and (
+            path.name == "oneroster.html"
+            or path.name.startswith("_oneroster_")
+            or "oneroster" in {part.lower() for part in relative.parts}
+        ):
+            continue
+        result.append(
+            (
+                str(path),
+                str(Path(destination) / relative.parent),
+            )
+        )
+    return result
+
+
+profile = normalize_profile(os.environ.get("GAMGUI_BUILD_PROFILE"), default=CORE_PROFILE)
+source = source_sha()
+minimum_macos = os.environ.get("GAMGUI_MINIMUM_MACOS", "12.0")
+packaging_revision = os.environ.get("GAMGUI_PACKAGING_REVISION", "1")
+architecture = os.environ.get("GAMGUI_BUILD_ARCH", platform.machine())
+metadata_dir = Path(os.environ.get("GAMGUI_BUILD_METADATA_DIR", "build/profile-metadata"))
+metadata_dir.mkdir(parents=True, exist_ok=True)
+profile_metadata = metadata_dir / "profile.json"
+profile_metadata.write_text(
+    json.dumps(
+        build_profile_payload(
+            profile,
+            source_sha=source,
+            version=__version__,
+            architecture=architecture,
+            minimum_macos_version=minimum_macos,
+            packaging_revision=packaging_revision,
+        ),
+        sort_keys=True,
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+
+exclude_oneroster = profile == CORE_PROFILE
+datas = tree_datas(
+    "gamgui/web/templates",
+    "gamgui/web/templates",
+    exclude_oneroster=exclude_oneroster,
+)
+datas += tree_datas(
+    "gamgui/web/static",
+    "gamgui/web/static",
+    exclude_oneroster=exclude_oneroster,
+)
+datas.append((str(profile_metadata), "resources/components"))
 binaries = []
 hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("keyring.backends")
     + ["uvicorn.lifespan.on", "uvicorn.loops.auto", "uvicorn.protocols.http.auto"]
 )
+excludes = ["tkinter"]
+
+if profile == ONEROSTER_PROFILE:
+    hiddenimports += collect_submodules("gamgui.components.oneroster")
+    hiddenimports.append("gamgui.web.routes.oneroster")
+    component_json = Path("gamgui/components/oneroster/component.json")
+    if not component_json.is_file():
+        raise SystemExit("The OneRoster profile is missing its component.json manifest.")
+    component_payload = json.loads(component_json.read_text(encoding="utf-8"))
+    component_manifest = ComponentManifest.from_json(component_payload)
+    if (
+        component_payload != component_manifest.to_json()
+        or (component_manifest,) != manifests_for_profile(profile)
+    ):
+        raise SystemExit(
+            "The packaged OneRoster component.json does not match the code-owned manifest."
+        )
+    datas.append((str(component_json), "gamgui/components/oneroster"))
+else:
+    excludes.append("gamgui.components.oneroster")
+    excludes.append("gamgui.web.routes.oneroster")
 
 # pywebview + its macOS (Cocoa/WebKit via pyobjc) backend — collect everything it needs.
 _wv_datas, _wv_binaries, _wv_hidden = collect_all("webview")
@@ -31,7 +132,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["tkinter"],
+    excludes=excludes,
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -44,6 +145,8 @@ app = BUNDLE(
     bundle_identifier="io.github.goetchstone.gamgui",
     info_plist={
         "NSHighResolutionCapable": True,
-        "LSMinimumSystemVersion": "12.0",
+        "LSMinimumSystemVersion": minimum_macos,
+        "GamGUIBuildProfile": profile,
+        "GamGUISourceSHA": source,
     },
 )

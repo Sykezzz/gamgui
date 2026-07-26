@@ -3,7 +3,8 @@
 import pytest
 
 from gamgui.app import _active_admin_jobs, _arguments, _fit_size, _handoff_pending_update
-from gamgui.core.updater import UpdateState, UpdateStateStore
+from gamgui.core.components import ComponentArtifactId
+from gamgui.core.updater import ACTIVATION_APP_UPDATE, UpdateState, UpdateStateStore
 from gamgui.web.jobs import BatchJob
 
 # (screen_w, screen_h) for displays GamGUI runs on.
@@ -87,6 +88,17 @@ def test_pending_update_hands_off_exact_staged_state(monkeypatch, tmp_path):
             pending_app=str(pending),
             canary_result="passed",
             required_check_evidence=["update-ready"],
+            activation_kind=ACTIVATION_APP_UPDATE,
+            candidate_artifact=ComponentArtifactId(
+                source_sha="a" * 40,
+                version="0.0.1",
+                profile="core",
+                component_set_digest="b" * 64,
+                architecture="arm64",
+                minimum_macos_version="13.0",
+                packaging_revision="1",
+                artifact_sha256="c" * 64,
+            ),
         )
     )
     launched = []

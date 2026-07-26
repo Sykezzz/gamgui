@@ -4,14 +4,18 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import time
+import zipfile
 from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from gamgui.core.updater import (
+    ACTIVATION_APP_UPDATE,
+    _extract_verified_archive,
     GitHubUpdateSource,
     LocalUpdateBuilder,
     LocalUpdateInstaller,
@@ -26,17 +30,30 @@ from gamgui.core.updater import (
     snapshot_databases,
     write_health_marker_from_environment,
 )
+from gamgui.core.components import (
+    CORE_PROFILE,
+    ComponentError,
+    build_profile_payload,
+    verify_bundle_artifact,
+    write_artifact_sidecar,
+)
 from gamgui.core.canary import CANARY_CHECK_NAMES, CanaryConfigStore
 
 SHA = "a" * 40
 
 
 def _ready_state(pending: Path) -> UpdateState:
+    envelope = verify_bundle_artifact(pending)
     return UpdateState(
         candidate_sha=SHA,
         pending_app=str(pending),
         canary_result="passed",
         required_check_evidence=["update-ready"],
+        desired_profile=envelope.artifact.profile,
+        candidate_artifact=envelope.artifact,
+        candidate_signing_channel=envelope.signing_channel,
+        candidate_signing_authority=envelope.signing_authority,
+        activation_kind=ACTIVATION_APP_UPDATE,
     )
 
 
@@ -152,6 +169,49 @@ def test_discover_skips_installed_and_blocked_without_check_query():
     assert len(calls) == 2
 
 
+def test_private_fork_discovery_requires_validated_ref_to_equal_branch_head():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            (
+                f"{SHA}\trefs/heads/district-main\n"
+                f"{SHA}\trefs/heads/update-ready\n"
+            ),
+            "",
+        )
+
+    candidate = GitHubUpdateSource(run=run).discover()
+
+    assert candidate == UpdateCandidate(
+        SHA,
+        f"https://github.com/Sykezzz/gamgui/commit/{SHA}",
+        ("update-ready",),
+    )
+    argv, kwargs = calls[0]
+    assert argv[:3] == ["git", "ls-remote", "--heads"]
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert kwargs["timeout"] == 15
+
+
+def test_private_fork_discovery_rejects_stale_validated_ref():
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            (
+                f"{SHA}\trefs/heads/district-main\n"
+                f"{'b' * 40}\trefs/heads/update-ready\n"
+            ),
+            "",
+        )
+
+    assert GitHubUpdateSource(run=run).discover() is None
+
+
 def test_coordinator_prepares_and_records_canary(tmp_path):
     store = UpdateStateStore(tmp_path / "state.json")
 
@@ -162,7 +222,7 @@ def test_coordinator_prepares_and_records_canary(tmp_path):
     class Builder:
         def prepare(self, candidate):
             assert candidate.sha == SHA
-            return tmp_path / "GamGUI.app"
+            return _app_bundle(tmp_path / "GamGUI.app", "candidate")
 
         def run_canary(self, pending):
             assert pending.name == "GamGUI.app"
@@ -178,6 +238,30 @@ def test_coordinator_fails_closed_when_job_active(tmp_path):
     coordinator = UpdateCoordinator(store=store, active_jobs=lambda: True)
     assert coordinator.check_and_prepare() is None
     assert "operation is active" in store.load().last_error
+
+
+def test_official_install_never_silently_builds_a_local_update(tmp_path):
+    store = UpdateStateStore(tmp_path / "state.json")
+    store.save(
+        UpdateState(
+            installed_sha="b" * 40,
+            installed_signing_channel="developer-id",
+            installed_signing_authority=(
+                "Developer ID Application: District Admin (ABCDE12345)"
+            ),
+        )
+    )
+
+    class Source:
+        def discover(self, *_args):
+            raise AssertionError("official channel must not use the local-build source")
+
+    class Builder:
+        def prepare(self, *_args, **_kwargs):
+            raise AssertionError("official channel must not build a local artifact")
+
+    assert UpdateCoordinator(store, Source(), Builder()).check_and_prepare() is None
+    assert "Official-channel updates" in store.load().last_error
 
 
 @pytest.mark.parametrize(
@@ -202,7 +286,7 @@ def test_coordinator_rechecks_active_jobs_before_canary_and_publish(
 
     class Builder:
         def prepare(self, _candidate):
-            return tmp_path / "GamGUI.app"
+            return _app_bundle(tmp_path / "GamGUI.app", "candidate")
 
         def run_canary(self, _pending):
             calls.append("canary")
@@ -295,6 +379,23 @@ def test_candidate_canary_uses_disposable_data_root(monkeypatch, tmp_path):
     assert "admin@example.edu" not in persisted
 
 
+def test_verified_archive_rejects_content_nested_under_symlink(tmp_path):
+    archive_path = tmp_path / "candidate.zip"
+    link = zipfile.ZipInfo("GamGUI.app/Contents/linked")
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(link, "Resources")
+        archive.writestr(
+            "GamGUI.app/Contents/linked/payload",
+            b"must not follow the parent link",
+        )
+
+    with pytest.raises(ComponentError, match="beneath a symbolic link"):
+        _extract_verified_archive(archive_path, tmp_path / "extract")
+
+    assert not (tmp_path / "extract").exists()
+
+
 @pytest.mark.parametrize(
     ("returncode", "mutate", "message"),
     [
@@ -375,10 +476,43 @@ def test_backup_retention_keeps_two_newest_and_recent_old(tmp_path):
     assert {path.name for path in backups.iterdir()} == {"0", "1"}
 
 
-def _app_bundle(path: Path, content: str) -> Path:
+def _app_bundle(
+    path: Path,
+    content: str,
+    *,
+    profile: str = CORE_PROFILE,
+    source_sha: str = SHA,
+) -> Path:
     executable = path / "Contents" / "MacOS" / "GamGUI"
     executable.parent.mkdir(parents=True)
     executable.write_text(content, encoding="utf-8")
+    metadata = (
+        path
+        / "Contents"
+        / "Resources"
+        / "resources"
+        / "components"
+        / "profile.json"
+    )
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps(
+            build_profile_payload(
+                profile,
+                source_sha=source_sha,
+                version="1",
+                architecture="arm64",
+                minimum_macos_version="12.0",
+                packaging_revision="1",
+            )
+        ),
+        encoding="utf-8",
+    )
+    write_artifact_sidecar(
+        path,
+        signing_channel="local",
+        signing_authority="GamGUI Local",
+    )
     return path
 
 
@@ -483,7 +617,8 @@ def test_installer_restores_app_and_database_when_health_fails(tmp_path):
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text(encoding="utf-8") == "old"
     assert _database_value(database) == "before"
     state = store.load()
-    assert SHA in state.blocked_shas and "startup health" in state.last_error
+    assert f"sha:{SHA}" in state.profile_blocklists[CORE_PROFILE]
+    assert "startup health" in state.last_error
     assert len(launches) == 2
 
 
@@ -512,6 +647,44 @@ def test_snapshot_failure_never_deletes_live_database(monkeypatch, tmp_path):
     assert _database_value(database) == "before"
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
     assert not store.load().schema_snapshot
+
+
+def test_insufficient_disk_keeps_candidate_retryable_and_relaunches_current_app(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "data" / "updates"
+    data_root = tmp_path / "data"
+    current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
+    pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
+    store = UpdateStateStore(root / "state.json")
+    store.save(_ready_state(pending))
+    launches = []
+
+    monkeypatch.setattr(
+        "gamgui.core.updater.shutil.disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+
+    def popen(argv, env=None, **_kwargs):
+        launches.append((argv, env or {}))
+        return _Process()
+
+    installer = LocalUpdateInstaller(
+        store=store,
+        root=root,
+        data_root=data_root,
+        popen=popen,
+    )
+
+    assert not installer.install(SHA, pending, current)
+    state = store.load()
+    assert state.candidate_sha == SHA
+    assert SHA not in state.blocked_shas
+    assert state.component_error_code == "CMP-DOWNLOAD-FAILED"
+    assert pending.is_dir()
+    assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
+    assert launches and launches[0][1]["GAMGUI_SKIP_UPDATE_ONCE"] == "1"
 
 
 def test_state_commit_failure_restores_previous_app_and_database(tmp_path):
@@ -555,7 +728,7 @@ def test_state_commit_failure_restores_previous_app_and_database(tmp_path):
     assert not installer.install(SHA, pending, current, health_timeout=0.1)
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
     assert _database_value(database) == "before"
-    assert SHA in backing.load().blocked_shas
+    assert f"sha:{SHA}" in backing.load().profile_blocklists[CORE_PROFILE]
 
 
 def test_state_failure_during_rollback_still_relaunches_previous_app(tmp_path):
@@ -622,6 +795,12 @@ def test_installer_rejects_staged_state_without_both_activation_evidences(
     current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
     pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
     state.pending_app = str(pending)
+    envelope = verify_bundle_artifact(pending)
+    state.desired_profile = envelope.artifact.profile
+    state.candidate_artifact = envelope.artifact
+    state.candidate_signing_channel = envelope.signing_channel
+    state.candidate_signing_authority = envelope.signing_authority
+    state.activation_kind = ACTIVATION_APP_UPDATE
     store = UpdateStateStore(root / "state.json")
     store.save(state)
 
@@ -629,7 +808,7 @@ def test_installer_rejects_staged_state_without_both_activation_evidences(
     assert not installer.install(SHA, pending, current)
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
     blocked = store.load()
-    assert SHA in blocked.blocked_shas
+    assert f"sha:{SHA}" in blocked.profile_blocklists[CORE_PROFILE]
     assert "required CI or canary evidence" in blocked.last_error
 
 
@@ -667,7 +846,7 @@ def test_installer_restores_old_app_when_second_rename_fails(monkeypatch, tmp_pa
     assert not installer.install(SHA, pending, current)
     assert failed
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
-    assert SHA in store.load().blocked_shas
+    assert f"sha:{SHA}" in store.load().profile_blocklists[CORE_PROFILE]
 
 
 def test_stop_waits_again_after_kill(tmp_path):
@@ -760,7 +939,11 @@ def test_database_snapshot_excludes_updater_state(tmp_path):
     assert _database_value(data_root / "directory.db") == "one"
 
 
-def test_prepare_database_schemas_initializes_every_store_on_copy(tmp_path):
+def test_prepare_database_schemas_initializes_every_core_store_on_copy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GAMGUI_BUILD_PROFILE", "core")
     paths = prepare_database_schemas(tmp_path)
     assert {path.name for path in paths} == {
         "directory_index.db",

@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}OneRoster Imports — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set field = "w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" %}
+<div class="space-y-6">
+  <header class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <p class="eyebrow text-brand-blueink">Classroom / OneRoster</p>
+      <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Import Studio</h1>
+      <p class="mt-2 max-w-3xl text-sm text-brand-blueink/80">
+        Validate a full OneRoster 1.1 snapshot, resolve blocking issues, and preview exact
+        managed-course changes before approving any Classroom operation.
+      </p>
+    </div>
+    <a href="/components" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Component settings</a>
+  </header>
+
+  {% if not feature.ready %}
+    {% include "_oneroster_unavailable.html" %}
+  {% else %}
+  <div class="grid gap-4 sm:grid-cols-3">
+    <div class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm">
+      <p class="text-xs uppercase tracking-wider text-brand-blueink">Imports retained</p>
+      <p class="mt-1 font-serif text-2xl tabular-nums text-brand-black">{{ history | length }}</p>
+    </div>
+    <div class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm">
+      <p class="text-xs uppercase tracking-wider text-brand-blueink">Threshold profile</p>
+      <p class="mt-1 font-serif text-xl text-brand-black">{{ "Configured" if thresholds.configured else "Required before full apply" }}</p>
+    </div>
+    <div class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm">
+      <p class="text-xs uppercase tracking-wider text-brand-blueink">Student gate</p>
+      <p class="mt-1 font-serif text-xl text-brand-black">{{ gate.state | default("CLOSED") }}</p>
+    </div>
+  </div>
+
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="oneroster-access-heading">
+    <h2 id="oneroster-access-heading" class="font-serif text-xl text-brand-black">Live access</h2>
+    <p class="mt-1 text-sm text-brand-blueink/80">
+      Uploads and local previews never read Workspace credentials. Verify access here
+      only when you are ready to build or execute a live Classroom plan.
+    </p>
+    <div id="oneroster-access" class="mt-4" aria-live="polite">
+      {% include "_oneroster_access.html" %}
+    </div>
+  </section>
+
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="oneroster-upload-heading">
+    <h2 id="oneroster-upload-heading" class="font-serif text-xl text-brand-black">Upload a full snapshot</h2>
+    <p class="mt-1 text-sm text-brand-blueink/80">The package is validated locally. Uploading does not contact Google or run GAM. Maximum package size: 250 MB.</p>
+    <form class="mt-4 flex flex-wrap items-end gap-3"
+          enctype="multipart/form-data"
+          hx-post="/classroom/imports/upload"
+          hx-target="#oneroster-workspace"
+          hx-swap="innerHTML">
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">OneRoster ZIP
+        <input class="{{ field }} mt-1" type="file" name="package" accept=".zip,application/zip" required />
+      </label>
+      <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Upload and validate</button>
+    </form>
+  </section>
+
+  <div id="oneroster-workspace" aria-live="polite">
+    <div class="rounded-2xl border border-dashed border-brand-gray/60 bg-brand-white/60 p-8 text-center">
+      <p class="font-serif text-lg text-brand-black">No import selected</p>
+      <p class="mt-1 text-sm text-brand-blueink">Upload a package or open a retained import from history.</p>
+    </div>
+  </div>
+
+  <div class="grid items-start gap-6 xl:grid-cols-2">
+    <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="threshold-heading">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h2 id="threshold-heading" class="font-serif text-xl text-brand-black">Import thresholds</h2>
+          <p class="mt-1 text-sm text-brand-blueink/80">Count and percentage limits are evaluated against the last accepted snapshot.</p>
+        </div>
+        <button type="button" class="text-sm font-medium text-brand-blueink underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                hx-get="/classroom/imports/thresholds" hx-target="#oneroster-thresholds" hx-swap="innerHTML">Configure</button>
+      </div>
+      <div id="oneroster-thresholds" class="mt-4">
+        {% include "_oneroster_thresholds.html" %}
+      </div>
+    </section>
+
+    <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="student-gate-heading">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h2 id="student-gate-heading" class="font-serif text-xl text-brand-black">Student enrollment gate</h2>
+          <p class="mt-1 text-sm text-brand-blueink/80">Student membership remains blocked until an approved manifest is armed or opened.</p>
+        </div>
+        <button type="button" class="text-sm font-medium text-brand-blueink underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                hx-get="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">Manage</button>
+      </div>
+      <div id="oneroster-gate" class="mt-4">
+        {% include "_oneroster_gate.html" %}
+      </div>
+    </section>
+  </div>
+
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="history-heading">
+    <div class="flex items-center justify-between gap-3">
+      <div>
+        <h2 id="history-heading" class="font-serif text-xl text-brand-black">Import history</h2>
+        <p class="mt-1 text-sm text-brand-blueink/80">Up to 50 retained snapshots. Expired raw and normalized data is purged by Core.</p>
+      </div>
+      <button type="button" class="text-sm font-medium text-brand-blueink underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+              hx-get="/classroom/imports/history" hx-target="#oneroster-history" hx-swap="innerHTML">Refresh</button>
+    </div>
+    <div id="oneroster-history" class="mt-4" aria-live="polite">
+      {% include "_oneroster_history.html" %}
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

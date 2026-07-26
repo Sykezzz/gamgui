@@ -13,9 +13,15 @@ from typing import Annotated
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from ...core.activity import ActivityBusyError
 from ...core.canary import CanaryConfigStore
 from ...core.connectors.gam_connector import GAMConnector
 from ...core.setup import SetupService
+from ..activity import (
+    ADMIN_ACTIVITY_BUSY_MESSAGE,
+    activity_error_message,
+    try_acquire_admin_activity,
+)
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/setup")
@@ -29,11 +35,33 @@ def _service(request: Request) -> SetupService:
 @router.get("", response_class=HTMLResponse)
 async def setup_page(request: Request) -> HTMLResponse:
     st = request.app.state.gamgui
+    manager = st.ensure_component_manager()
+    component_status = manager.status()
+    component_only = bool(
+        manager.first_run_choice_pending()
+        or component_status.restart_required
+    )
+    if component_only:
+        # The optional-feature decision is deliberately rendered before any setup
+        # service probes or credential discovery. Component preparation must not
+        # touch Workspace Keychain state.
+        return TEMPLATES.TemplateResponse(
+            request,
+            "setup.html",
+            {
+                "component_only": True,
+                "gam_version": "",
+                "gam_version_warning": "",
+                "binary_present": st.runner.binary_exists(),
+                "candidate_dirs": (),
+            },
+        )
     svc = _service(request)
     return TEMPLATES.TemplateResponse(
         request,
         "setup.html",
         {
+            "component_only": False,
             "gam_version": await svc.engine_version(),
             "gam_version_warning": await svc.engine_version_warning(),
             "binary_present": st.runner.binary_exists(),
@@ -55,20 +83,41 @@ async def do_import(
             request, "_error.html",
             {"message": "Enter the domain and super-admin email, then choose a credentials folder."},
         )
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "setup-credential-import")
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+        )
     svc = _service(request)
     try:
-        imported = svc.import_dir(config_dir, domain)
-    except (ValueError, OSError, RuntimeError) as exc:
-        # A typo'd or non-directory path is operator error, not a crash — say which, and let them
-        # correct it in place. The import path is written to raise only operator-facing ValueError,
-        # but it stands on the filesystem and on $HOME: an unreadable folder (OSError) or an
-        # environment with no determinable home (RuntimeError from Path.home()/expanduser) are
-        # conditions the operator can act on, and a 500 tells them nothing. Deliberately narrow —
-        # a programming error is not an OSError, and still surfaces as a 500.
-        return TEMPLATES.TemplateResponse(
-            request, "_error.html",
-            {"message": str(exc) or "That folder could not be read — check the path and try again."},
+        # A scope proof belongs to the credential set that produced it.  Replacing
+        # credentials for the same domain must make OneRoster fail closed until
+        # setup verification succeeds again, even if the import itself fails.
+        scope_invalidator = getattr(
+            st.oneroster_service,
+            "invalidate_scope_readiness",
+            None,
         )
+        if callable(scope_invalidator):
+            scope_invalidator()
+        try:
+            imported = svc.import_dir(config_dir, domain)
+        except (ValueError, OSError, RuntimeError) as exc:
+            # A typo'd or non-directory path is operator error, not a crash — say which, and let
+            # them correct it in place. Deliberately narrow: programming errors still surface.
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {
+                    "message": str(exc)
+                    or "That folder could not be read — check the path and try again."
+                },
+            )
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_dwd.html",
         {
@@ -111,30 +160,41 @@ async def verify(
         return TEMPLATES.TemplateResponse(
             request,
             "_error.html",
-            {
-                "message": (
-                    "Finish or stop the active administrative operation "
-                    "before reconnecting."
-                )
-            },
+            {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
         )
     svc = _service(request)
     result = await svc.verify(domain, admin)
     if result.ok:
         try:
             st.activate_connector(GAMConnector(runner=st.runner, domain=domain))
+        except ActivityBusyError:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+            )
         except RuntimeError as exc:
             return TEMPLATES.TemplateResponse(
                 request,
                 "_error.html",
-                {"message": str(exc)},
+                {"message": activity_error_message(exc)},
             )
         config_path = (
             Path(st.runner.base_dir) / "canary-config.json"
             if st.runner.base_dir is not None
             else None
         )
-        CanaryConfigStore(config_path).save(domain, admin)
+        lease = try_acquire_admin_activity(st, "setup-canary-save")
+        if lease is None:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+            )
+        try:
+            CanaryConfigStore(config_path).save(domain, admin)
+        finally:
+            lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_verify.html", {"result": result, "domain": domain, "admin": admin}
     )

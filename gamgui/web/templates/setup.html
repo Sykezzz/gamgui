@@ -4,6 +4,26 @@
 {% set input_cls = "w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-[15px] text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" %}
 {% set btn_primary = "inline-flex items-center rounded-lg bg-brand-blue px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-blueink transition-colors" %}
 <div class="space-y-8">
+  {% if component_only %}
+  <header>
+    <p class="eyebrow text-brand-blue">First launch</p>
+    <h1 class="mt-2 font-serif text-3xl text-brand-black tracking-tight">Choose optional features</h1>
+    <p class="text-brand-blueink/80 mt-2 text-[15px] max-w-2xl">
+      Choose whether to add OneRoster Import Studio before connecting Google Workspace.
+      This step does not read credentials, contact Google, or run GAM.
+    </p>
+  </header>
+  {% endif %}
+
+  <div id="setup-optional-features"
+       hx-get="/components/status?context=setup"
+       hx-trigger="load"
+       hx-swap="innerHTML"
+       aria-live="polite">
+    <p class="text-sm text-brand-blueink">Checking optional features…</p>
+  </div>
+
+  {% if not component_only %}
   <div>
     <p class="eyebrow text-brand-blue">Setup</p>
     <h1 class="mt-2 font-serif text-3xl text-brand-black tracking-tight">Connect Google Workspace</h1>
@@ -89,5 +109,11 @@
   </div>
 
   <div id="wizard-next"></div>
+  {% else %}
+  <p class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 text-sm text-brand-blueink/80">
+    If you skip the component, Core setup continues immediately. If you install it,
+    GamGUI prepares the sealed full profile and continues after the required restart.
+  </p>
+  {% endif %}
 </div>
 {% endblock %}

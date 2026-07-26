@@ -50,6 +50,7 @@ class GAMUser:
     last_login_time: Optional[str] = None
     aliases: List[str] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    user_id: str = ""
 
     @property
     def full_name(self) -> str:
@@ -66,6 +67,7 @@ class GAMUser:
         phone = _primary(d.get("phones"))            # work phone number
         return cls(
             primary_email=_get(d, "primaryEmail", _EMAIL_KEY, "User", default=""),
+            user_id=str(_get(d, "id", "userId", "User ID", default="") or ""),
             given_name=_get(name, "givenName") or _get(d, "givenName", "First Name", default=""),
             family_name=_get(name, "familyName") or _get(d, "familyName", "Last Name", default=""),
             suspended=_as_bool(_get(d, "suspended", "Suspended", default=False)),
