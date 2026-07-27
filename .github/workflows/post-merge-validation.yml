@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
       - name: Advance authenticated updater ref to the exact validated commit
         env:
           VALIDATED_SHA: ${{ inputs.sha }}
@@ -137,8 +137,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$VALIDATED_SHA"
-          git fetch origin district-main:refs/remotes/origin/district-main
+          git fetch --no-tags origin \
+            district-main:refs/remotes/origin/district-main \
+            update-ready:refs/remotes/origin/update-ready
           test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"
+          READY_SHA="$(git rev-parse origin/update-ready)"
+          git merge-base --is-ancestor "$READY_SHA" "$VALIDATED_SHA"
           git push \
             origin \
             "$VALIDATED_SHA:refs/heads/update-ready"
