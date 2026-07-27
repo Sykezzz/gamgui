@@ -41,6 +41,7 @@ from ..core.classroom.manifests import (
 from ..core.classroom.service import ClassroomService
 from ..core.connectors.gam_connector import GAMConnector
 from ..core.components import (
+    CORE_PROFILE,
     ComponentError,
     ComponentManager,
     ONEROSTER_COMPONENT,
@@ -290,7 +291,7 @@ class AppState:
             state.candidate_sha == expected_sha
             or state.installed_sha != expected_sha
         )
-        if legacy_health_start and not transaction_probe:
+        if transaction_probe or legacy_health_start:
             pending = pending or not manager.committed_runtime_identity_ready(
                 state
             )
@@ -303,11 +304,36 @@ class AppState:
             manager = self.ensure_component_manager()
             state = manager.store.load()
             expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+            marker_value = os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER", "")
+            embedded = getattr(manager, "embedded", None)
+            embedded_artifact = getattr(embedded, "artifact", None)
+            try:
+                updates_root = Path(
+                    os.path.abspath(Path(manager.store.path).parent)
+                )
+                marker_path = Path(os.path.abspath(marker_value))
+                expected_marker = (
+                    updates_root
+                    / "health"
+                    / f"{expected_sha}.ok"
+                )
+                marker_matches = (
+                    marker_path == expected_marker
+                    and not updates_root.is_symlink()
+                    and not expected_marker.parent.is_symlink()
+                    and not expected_marker.is_symlink()
+                    and marker_path.is_file()
+                    and marker_path.read_text(encoding="utf-8").strip() == "ok"
+                )
+            except (AttributeError, OSError, ValueError):
+                marker_matches = False
             legacy_commit = bool(
-                not self.activation_probe_mode
-                and os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
+                marker_matches
                 and os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1"
                 and not os.environ.get(ACTIVATION_PROBE_ENV)
+                and not os.environ.get(ACTIVATION_TRANSACTION_ENV)
+                and getattr(embedded_artifact, "profile", "") == CORE_PROFILE
+                and getattr(embedded_artifact, "source_sha", "") == expected_sha
                 and state.installed_sha == expected_sha
                 and not state.candidate_sha
             )
@@ -326,6 +352,8 @@ class AppState:
             if not self.activation_probe_pending():
                 state = manager.store.load()
                 if state.installed_sha == expected_sha and not state.candidate_sha:
+                    if not manager.committed_runtime_identity_ready(state):
+                        return
                     if self.activation_probe_mode:
                         if not await self._rehydrate_after_activation():
                             return

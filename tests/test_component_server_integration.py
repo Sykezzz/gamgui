@@ -204,8 +204,9 @@ def test_activation_probe_blocks_mutations_and_scheduler_until_commit(
     monkeypatch,
 ):
     monkeypatch.setenv(APP_DATA_ENV, str(tmp_path))
-    state = _state(tmp_path, monkeypatch, CORE_PROFILE)
     sha = "a" * 40
+    monkeypatch.setenv("GAMGUI_SOURCE_SHA", sha)
+    state = _state(tmp_path, monkeypatch, CORE_PROFILE)
     state.component_manager.store.save(
         UpdateState(
             installed_sha="b" * 40,
@@ -242,6 +243,9 @@ def test_activation_probe_blocks_mutations_and_scheduler_until_commit(
     committed = state.component_manager.store.load()
     committed.installed_sha = sha
     committed.candidate_sha = ""
+    committed.installed_profile = CORE_PROFILE
+    committed.installed_components = []
+    committed.installed_artifact = state.component_manager.embedded.artifact
     state.component_manager.store.save(committed)
     state._schedule_oneroster_gate()
     assert scheduled == ["oneroster-student-release"]
@@ -258,6 +262,7 @@ def test_legacy_installed_updater_can_bootstrap_core_health_once(
     monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
     monkeypatch.setenv("GAMGUI_INSTALLED_SHA", sha)
     monkeypatch.delenv(ACTIVATION_PROBE_ENV, raising=False)
+    monkeypatch.delenv(ACTIVATION_TRANSACTION_ENV, raising=False)
     store = UpdateStateStore(tmp_path / "updates" / "state.json")
     marker = store.path.parent / "health" / f"{sha}.ok"
     monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
@@ -324,7 +329,13 @@ async def test_legacy_helper_commit_backfills_running_component_host_before_choi
     monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
     monkeypatch.setenv("GAMGUI_INSTALLED_SHA", sha)
     monkeypatch.delenv(ACTIVATION_PROBE_ENV, raising=False)
-    store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    # A legacy helper supplies the health marker but not the newer transaction
+    # environment.  app.main therefore starts this exact process as a sealed
+    # activation probe, even though the marker remains the legacy `.ok` form.
+    state = AppState.create_activation_probe(token="legacy-running")
+    manager = state.component_manager
+    assert manager is not None
+    store = manager.store
     marker = store.path.parent / "health" / f"{sha}.ok"
     pending = store.path.parent / "pending" / sha / "GamGUI.app"
     monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
@@ -337,21 +348,16 @@ async def test_legacy_helper_commit_backfills_running_component_host_before_choi
             required_check_evidence=["update-ready"],
         )
     )
-    manager = ComponentManager(
-        store=store,
-        registry=ActivityRegistry(),
-        data_root=tmp_path,
+    rehydration_vault = RecordingVault(("district.example",))
+    monkeypatch.setattr(
+        "gamgui.web.server.SecretsVault",
+        lambda *_args, **_kwargs: rehydration_vault,
     )
-    state = AppState(
-        vault=RecordingVault(),
-        runner=GAMRunner(
-            vault=RecordingVault(),
-            base_dir=tmp_path,
-        ),
-        component_manager=manager,
-        activity_registry=manager.registry,
-        token="legacy-running",
-    )
+
+    async def unexpected_retry(_delay):
+        raise AssertionError("legacy SHA-only commit was not reconciled")
+
+    monkeypatch.setattr("gamgui.web.server.asyncio.sleep", unexpected_retry)
     payload = state.update_activation_health_payload()
     assert payload is not None
     write_health_marker_from_environment(payload)
@@ -368,7 +374,10 @@ async def test_legacy_helper_commit_backfills_running_component_host_before_choi
     await state._wait_for_activation_commit()
 
     committed = store.load()
+    assert not state.activation_probe_mode
     assert not state.activation_probe_pending()
+    assert not committed.candidate_sha
+    assert not committed.pending_app
     assert committed.installed_profile == CORE_PROFILE
     assert committed.installed_components == []
     assert committed.installed_artifact is not None
@@ -377,6 +386,10 @@ async def test_legacy_helper_commit_backfills_running_component_host_before_choi
         committed.installed_artifact.component_set_digest
         == manager.embedded.artifact.component_set_digest
     )
+    assert manager.committed_runtime_identity_ready(committed)
+    assert not committed.component_prompt_answered
+    assert state.vault is rehydration_vault
+    assert rehydration_vault.list_calls == 0
 
     app = create_app(state)
     transport = httpx.ASGITransport(app=app)
@@ -398,6 +411,145 @@ async def test_legacy_helper_commit_backfills_running_component_host_before_choi
     after_choice = store.load()
     assert after_choice.component_prompt_answered
     assert after_choice.installed_artifact == committed.installed_artifact
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "marker_text", "marker_case"),
+    (
+        (ONEROSTER_PROFILE, "ok\n", "expected"),
+        (CORE_PROFILE, '{"ok":true}\n', "expected"),
+        (CORE_PROFILE, "ok\n", "wrong"),
+        (CORE_PROFILE, "ok\n", "final-symlink"),
+        (CORE_PROFILE, "ok\n", "ancestor-symlink"),
+    ),
+)
+async def test_legacy_commit_reconciliation_rejects_optional_profile_or_bad_marker(
+    tmp_path,
+    monkeypatch,
+    profile,
+    marker_text,
+    marker_case,
+):
+    sha = "a" * 40
+    monkeypatch.setenv(APP_DATA_ENV, str(tmp_path))
+    monkeypatch.setenv("GAMGUI_BUILD_PROFILE", profile)
+    monkeypatch.setenv("GAMGUI_SOURCE_SHA", sha)
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", sha)
+    monkeypatch.delenv(ACTIVATION_PROBE_ENV, raising=False)
+    monkeypatch.delenv(ACTIVATION_TRANSACTION_ENV, raising=False)
+    state = AppState.create_activation_probe(token="legacy-rejected")
+    manager = state.component_manager
+    assert manager is not None
+    store = manager.store
+    expected_marker = store.path.parent / "health" / f"{sha}.ok"
+    if marker_case == "wrong":
+        marker = tmp_path / "forged-health" / f"{sha}.ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(marker_text, encoding="utf-8")
+    elif marker_case == "final-symlink":
+        marker = expected_marker
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        target = tmp_path / "forged-marker"
+        target.write_text(marker_text, encoding="utf-8")
+        try:
+            marker.symlink_to(target)
+        except OSError:
+            pytest.skip("symbolic links are unavailable")
+    elif marker_case == "ancestor-symlink":
+        marker = expected_marker
+        target = tmp_path / "forged-health"
+        target.mkdir(parents=True, exist_ok=True)
+        marker.parent.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            marker.parent.symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symbolic links are unavailable")
+        marker.write_text(marker_text, encoding="utf-8")
+    else:
+        marker = expected_marker
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(marker_text, encoding="utf-8")
+    monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
+    store.path.write_text(
+        json.dumps({"installed_sha": sha}) + "\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_reconciliation():
+        raise AssertionError("unsafe legacy state was reconciled")
+
+    async def stop_after_first_poll(_delay):
+        raise RuntimeError("legacy state remains gated")
+
+    monkeypatch.setattr(
+        manager,
+        "reconcile_committed_runtime",
+        unexpected_reconciliation,
+    )
+    monkeypatch.setattr(
+        "gamgui.web.server.asyncio.sleep",
+        stop_after_first_poll,
+    )
+
+    with pytest.raises(RuntimeError, match="legacy state remains gated"):
+        await state._wait_for_activation_commit()
+
+    assert state.activation_probe_mode
+    assert state.activation_probe_pending()
+    assert store.load().installed_artifact is None
+
+
+@pytest.mark.asyncio
+async def test_transaction_probe_sha_only_commit_never_rehydrates(
+    tmp_path,
+    monkeypatch,
+):
+    sha = "a" * 40
+    transaction = "1" * 32
+    monkeypatch.setenv(APP_DATA_ENV, str(tmp_path))
+    monkeypatch.setenv("GAMGUI_BUILD_PROFILE", CORE_PROFILE)
+    monkeypatch.setenv("GAMGUI_SOURCE_SHA", sha)
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", sha)
+    monkeypatch.setenv(ACTIVATION_PROBE_ENV, "1")
+    monkeypatch.setenv(ACTIVATION_TRANSACTION_ENV, transaction)
+    state = AppState.create_activation_probe(token="transaction-rejected")
+    manager = state.component_manager
+    assert manager is not None
+    store = manager.store
+    monkeypatch.setenv(
+        "GAMGUI_UPDATE_HEALTH_MARKER",
+        str(store.path.parent / "health" / f"{transaction}.json"),
+    )
+    store.path.write_text(
+        json.dumps({"installed_sha": sha}) + "\n",
+        encoding="utf-8",
+    )
+
+    async def unexpected_rehydration():
+        raise AssertionError("transaction probe rehydrated without artifact identity")
+
+    async def stop_after_first_poll(_delay):
+        raise RuntimeError("transaction state remains gated")
+
+    monkeypatch.setattr(
+        state,
+        "_rehydrate_after_activation",
+        unexpected_rehydration,
+    )
+    monkeypatch.setattr(
+        "gamgui.web.server.asyncio.sleep",
+        stop_after_first_poll,
+    )
+
+    with pytest.raises(RuntimeError, match="transaction state remains gated"):
+        await state._wait_for_activation_commit()
+
+    assert state.activation_probe_mode
+    assert state.activation_probe_pending()
+    assert not manager.committed_runtime_identity_ready(store.load())
 
 
 def test_first_http_navigation_stays_component_only_without_keychain_reads(
