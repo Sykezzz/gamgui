@@ -47,13 +47,17 @@ class DriveOperationStore:
 
     def _secure_files(self) -> None:
         _secure_private_directory(self.path.parent)
-        for candidate in (
-            self.path,
+        _secure_private_file(self.path)
+        for companion in (
             Path(f"{self.path}-wal"),
             Path(f"{self.path}-shm"),
         ):
-            if candidate.is_symlink() or candidate.exists():
-                _secure_private_file(candidate)
+            try:
+                _secure_private_file(companion)
+            except FileNotFoundError:
+                # SQLite may delete an idle companion while permissions are
+                # being tightened. Do not suppress any other safety failure.
+                continue
 
     def _init(self) -> None:
         with self._connect() as conn:

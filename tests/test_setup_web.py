@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gamgui.core import setup as setup_mod
+from gamgui.core.activity import ActivityPathUnavailableError
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 from gamgui.core.setup import DISTRICT_FEATURE_DWD_SCOPES, SetupService, _root_is_sane
@@ -643,7 +644,17 @@ def test_no_determinable_home_reports_instead_of_crashing(ctx, monkeypatch):
 
     r = client.post("/setup/import", data={
         "domain": "ex.com", "admin": "a@ex.com", "config_dir": str(base)})
-    assert r.status_code == 200 and "outside the places" in r.text
+    assert r.status_code == 200
+    # Linux reaches the bounded import check first; macOS first resolves the
+    # durable setup lock under Application Support. Both paths must fail closed
+    # with an actionable response instead of escaping as a 500.
+    assert (
+        "outside the places" in r.text
+        or (
+            "private setup lock" in r.text
+            and "could not be expanded safely" in r.text
+        )
+    )
     assert client.get("/setup").status_code == 200            # and the wizard still renders
     assert not vault.has_credentials("ex.com")
 
@@ -665,6 +676,21 @@ def test_a_tilde_path_with_no_home_is_a_message_not_a_500(ctx, monkeypatch):
 
 
 # --- the import route renders filesystem trouble instead of a 500 -----------------------------
+
+
+def test_import_route_renders_activity_lock_path_failures(ctx, monkeypatch):
+    client, base, vault, _ = ctx
+
+    def fail_activity_lock(*_args, **_kwargs):
+        raise ActivityPathUnavailableError()
+
+    monkeypatch.setattr(setup_routes, "try_acquire_admin_activity", fail_activity_lock)
+    r = client.post("/setup/import", data={
+        "domain": "ex.com", "admin": "a@ex.com", "config_dir": str(base)})
+    assert r.status_code == 200
+    assert "private setup lock" in r.text
+    assert "could not be expanded safely" in r.text
+    assert not vault.has_credentials("ex.com")
 
 
 def test_an_unreadable_credential_file_does_not_500(ctx):

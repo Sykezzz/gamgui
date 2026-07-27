@@ -16,6 +16,7 @@ from gamgui.core import activity as activity_module
 from gamgui.core.activity import (
     DURABLE_ACTIVITY_FILENAME,
     ActivityBusyError,
+    ActivityPathUnavailableError,
     ActivityRegistry,
 )
 
@@ -89,6 +90,43 @@ def test_activity_registry_is_exclusive_and_release_is_idempotent():
 def test_activity_registry_rejects_unbounded_or_unsafe_kinds(kind):
     with pytest.raises(ValueError):
         ActivityRegistry().acquire(kind)
+
+
+def test_durable_path_resolver_failure_is_actionable_and_fail_closed():
+    def unavailable_path():
+        raise RuntimeError("Could not determine home directory.")
+
+    registry = ActivityRegistry(durable_path=unavailable_path)
+
+    with pytest.raises(
+        ActivityPathUnavailableError,
+        match="home-folder configuration",
+    ) as failure:
+        registry.acquire("app-update")
+    assert isinstance(failure.value.__cause__, RuntimeError)
+
+    snapshot = registry.snapshot()
+    assert snapshot is not None
+    assert snapshot.kind == "external-activity"
+
+
+def test_durable_path_expansion_failure_is_actionable_and_fail_closed(monkeypatch):
+    def unavailable_home(_path):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "expanduser", unavailable_home)
+    registry = ActivityRegistry(durable_path="~/.gamgui/activity-lease.json")
+
+    with pytest.raises(
+        ActivityPathUnavailableError,
+        match="home-folder configuration",
+    ) as failure:
+        registry.acquire("app-update")
+    assert isinstance(failure.value.__cause__, RuntimeError)
+
+    snapshot = registry.snapshot()
+    assert snapshot is not None
+    assert snapshot.kind == "external-activity"
 
 
 @POSIX_ONLY

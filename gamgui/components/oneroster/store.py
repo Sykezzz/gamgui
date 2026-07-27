@@ -1682,13 +1682,18 @@ class OneRosterStore:
     def _restrict_state_perms(self) -> None:
         _chmod(self.root, 0o700)
         _chmod(self.snapshots_root, 0o700)
-        for candidate in (
-            self.state_path,
+        _chmod(self.state_path, 0o600)
+        for companion in (
             Path(f"{self.state_path}-wal"),
             Path(f"{self.state_path}-shm"),
         ):
-            if candidate.is_symlink() or candidate.exists():
-                _chmod(candidate, 0o600)
+            try:
+                _chmod(companion, 0o600)
+            except FileNotFoundError:
+                # SQLite owns companion lifetimes and may remove one while it
+                # is being hardened. Main-state and all other failures remain
+                # fail-closed.
+                continue
 
 
 def _snapshot_conn(path: Path) -> sqlite3.Connection:
@@ -2141,13 +2146,17 @@ def _prepare_private_database(path: Path) -> None:
 
 def _secure_sqlite_files(path: Path) -> None:
     _secure_private_directory(path.parent)
-    for candidate in (
-        path,
+    _secure_private_file(path)
+    for companion in (
         Path(f"{path}-wal"),
         Path(f"{path}-shm"),
     ):
-        if candidate.is_symlink() or candidate.exists():
-            _secure_private_file(candidate)
+        try:
+            _secure_private_file(companion)
+        except FileNotFoundError:
+            # SQLite can delete a WAL/SHM file after it was observed. Missing
+            # companions are safe; permission, symlink, and type errors are not.
+            continue
 
 
 def _secure_private_directory(path: Path, *, create: bool = False) -> None:

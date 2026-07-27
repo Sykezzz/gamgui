@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from gamgui.core.activity import ActivityRegistry
 from gamgui.core.audit import AuditLog
 from gamgui.core.catalog import load_catalog
 from gamgui.core.connectors.base import RiskLevel
@@ -29,9 +30,22 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("GAM_MOCK_FIXTURES", str(FIXTURES))
     vault = SecretsVault(InMemoryBackend())
     vault.set_all(DOMAIN, {"client_secrets": "{}", "oauth2": "tok", "oauth2service": '{"client_id": "x"}'})
-    runner = GAMRunner(vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path)
+    registry = ActivityRegistry()
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=FIXTURES / "mock_gam.sh",
+        base_dir=tmp_path,
+        activity_registry=registry,
+    )
     conn = GAMConnector(runner=runner, domain=DOMAIN, audit=AuditLog(tmp_path / "audit.jsonl"))
-    state = AppState(vault=vault, runner=runner, audit_domain=DOMAIN, connector=conn, token="t")
+    state = AppState(
+        vault=vault,
+        runner=runner,
+        audit_domain=DOMAIN,
+        connector=conn,
+        token="t",
+        activity_registry=registry,
+    )
     c = TestClient(create_app(state))
     c.get("/?token=t")
     return c
@@ -485,7 +499,21 @@ def test_browse_only_command_cannot_run(client):
     assert "run it in GAM" in r.text          # refused (apostrophe in "can't" is HTML-escaped)
 
 
-def test_sequence_add_remove_and_run(client):
+def test_sequence_add_remove_and_run(client, monkeypatch):
+    from gamgui.web.routes import builder as builder_routes
+
+    async def complete_without_running_gam(job, _conn, _previews, lease=None):
+        job.finished = True
+        if lease is not None:
+            lease.release()
+
+    # This assertion covers task scheduling and the polling response. Step
+    # execution is covered deterministically by the executor test below.
+    monkeypatch.setattr(
+        builder_routes,
+        "_run_sequence",
+        complete_without_running_gam,
+    )
     client.post("/builder/sequence/add", data={"cid": "build.set_signature",
                                                "email": "alice@example.com", "signature": "Hi"})
     r = client.post("/builder/sequence/add", data={"cid": "build.add_delegate",

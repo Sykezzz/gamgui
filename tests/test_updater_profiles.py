@@ -38,6 +38,19 @@ from gamgui.core.updater import (
 SHA = "b" * 40
 
 
+def _signed_bundle_run(argv, **kwargs):
+    """Portable codesign double for verified-file unit tests."""
+
+    if argv[:3] == ["codesign", "--display", "--extract-certificates"]:
+        Path(kwargs["cwd"], "codesign0.cer").write_bytes(b"test-signing-leaf")
+    return subprocess.CompletedProcess(
+        argv,
+        0,
+        "",
+        "Authority=GamGUI Local\n",
+    )
+
+
 def _bundle(
     path: Path,
     profile: str,
@@ -661,31 +674,46 @@ def test_missing_staged_bundle_recovers_profile_swap_and_app_update_for_retry(
 
 def test_verified_file_seam_rehashes_the_staged_copy(tmp_path):
     source = _bundle(tmp_path / "source" / "GamGUI.app", ONEROSTER_PROFILE)
+    trusted = _bundle(tmp_path / "installed" / "GamGUI.app", CORE_PROFILE)
     commands = []
 
     def run(argv, **kwargs):
         commands.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return _signed_bundle_run(argv, **kwargs)
 
-    builder = LocalUpdateBuilder(root=tmp_path / "updates", run=run)
+    builder = LocalUpdateBuilder(
+        root=tmp_path / "updates",
+        run=run,
+        trusted_local_bundle=trusted,
+    )
     pending, envelope = builder.prepare_verified_file(
         source,
         ONEROSTER_PROFILE,
     )
     assert pending.is_dir()
     assert envelope.artifact.profile == ONEROSTER_PROFILE
-    assert commands == [[str(source / "Contents" / "MacOS" / "GamGUI"), "--self-test"]]
+    assert [
+        command
+        for command in commands
+        if command
+        and Path(command[0]) == source / "Contents" / "MacOS" / "GamGUI"
+    ] == [[str(source / "Contents" / "MacOS" / "GamGUI"), "--self-test"]]
 
 
 def test_verified_file_policy_runs_before_candidate_self_test(tmp_path):
     source = _bundle(tmp_path / "source" / "GamGUI.app", ONEROSTER_PROFILE)
+    trusted = _bundle(tmp_path / "installed" / "GamGUI.app", CORE_PROFILE)
     events: list[object] = []
 
-    def run(argv, **_kwargs):
+    def run(argv, **kwargs):
         events.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return _signed_bundle_run(argv, **kwargs)
 
-    builder = LocalUpdateBuilder(root=tmp_path / "updates", run=run)
+    builder = LocalUpdateBuilder(
+        root=tmp_path / "updates",
+        run=run,
+        trusted_local_bundle=trusted,
+    )
     pending, _envelope = builder.prepare_verified_file(
         source,
         ONEROSTER_PROFILE,
@@ -693,10 +721,10 @@ def test_verified_file_policy_runs_before_candidate_self_test(tmp_path):
     )
 
     assert pending.is_dir()
-    assert events == [
-        "policy",
-        [str(source / "Contents" / "MacOS" / "GamGUI"), "--self-test"],
-    ]
+    self_test = [str(source / "Contents" / "MacOS" / "GamGUI"), "--self-test"]
+    assert events[0] == "policy"
+    assert events[-1] == self_test
+    assert sum(event == self_test for event in events) == 1
 
 
 def test_local_update_builder_rejects_rewound_validated_commit(
@@ -849,7 +877,14 @@ def test_schema_preparation_is_profile_aware(tmp_path, monkeypatch):
     assert component_state.is_file()
 
 
-def test_verified_file_signing_migration_requires_durable_team_id(tmp_path):
+def test_verified_file_signing_migration_requires_durable_team_id(
+    tmp_path,
+    monkeypatch,
+):
+    # This unit covers the platform-independent migration approval gate. The
+    # macOS signature/notarization verifier has dedicated tests with signed
+    # command doubles.
+    monkeypatch.setattr("gamgui.core.updater.sys.platform", "linux")
     current = _bundle(tmp_path / "current" / "GamGUI.app", CORE_PROFILE)
     pending = _bundle(
         tmp_path / "updates" / "pending" / SHA / "GamGUI.app",

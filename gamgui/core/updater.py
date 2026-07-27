@@ -831,11 +831,11 @@ class LocalUpdateBuilder:
     ) -> tuple[Path, ArtifactEnvelope]:
         """Validate and stage a signed, immutable local/offline artifact.
 
-        ``pre_execution_policy`` runs after immutable identity, compatibility,
-        signature, and notarization checks but before any executable content in
-        the candidate is launched.  Update coordinators use this seam to reject
+        ``pre_execution_policy`` runs after immutable identity and compatibility
+        checks but before platform signature commands or executable content in
+        the candidate. Update coordinators use this rejection-only seam to stop
         blocked, replayed, or non-forward artifacts without granting them code
-        execution.
+        execution or invoking unnecessary external verification.
         """
 
         expected_profile = normalize_profile(expected_profile)
@@ -976,6 +976,8 @@ class LocalUpdateBuilder:
                     "CMP-VERIFY-FAILED",
                     "The selected application bundle is incomplete.",
                 )
+            if pre_execution_policy is not None:
+                pre_execution_policy(envelope)
             if sys.platform == "darwin":
                 self._command(
                     ["codesign", "--verify", "--deep", "--strict", str(bundle)]
@@ -1030,8 +1032,6 @@ class LocalUpdateBuilder:
                             str(bundle),
                         ]
                     )
-            if pre_execution_policy is not None:
-                pre_execution_policy(envelope)
             self._command([str(executable), "--self-test"], cwd=bundle.parent)
             pending = self._stage_bundle(bundle, envelope)
             return pending, envelope

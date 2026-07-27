@@ -183,13 +183,18 @@ class RosterManifestStore:
 
     def _restrict_perms(self) -> None:
         _secure_private_directory(self.path.parent)
-        for candidate in (
-            self.path,
+        _secure_private_file(self.path)
+        for companion in (
             Path(str(self.path) + "-wal"),
             Path(str(self.path) + "-shm"),
         ):
-            if candidate.is_symlink() or candidate.exists():
-                _secure_private_file(candidate)
+            try:
+                _secure_private_file(companion)
+            except FileNotFoundError:
+                # SQLite may remove an unused WAL/SHM file between directory
+                # enumeration and hardening. A missing companion contains no
+                # data to expose; every other validation failure stays fatal.
+                continue
 
     def create(self, domain: str, course_id: str, diff: RosterDiff) -> RosterManifest:
         manifest_id = secrets.token_urlsafe(12)

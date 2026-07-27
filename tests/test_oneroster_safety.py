@@ -216,3 +216,50 @@ def test_oneroster_store_permission_failure_prevents_state_database_creation(
         OneRosterStore("example.org", root)
 
     assert not (root / "state.db").exists()
+
+
+def test_oneroster_store_tolerates_only_disappearing_sqlite_companions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "component"
+    store = OneRosterStore("example.org", root)
+    original = store_module._chmod
+
+    def disappear_companions(candidate, mode):
+        if str(candidate).endswith(("-wal", "-shm")):
+            raise FileNotFoundError(candidate)
+        return original(candidate, mode)
+
+    monkeypatch.setattr(store_module, "_chmod", disappear_companions)
+    store._restrict_state_perms()
+
+    normalized = root / "normalized.db"
+    normalized.touch()
+    store_module._secure_sqlite_files(normalized)
+
+    def reject_companion(candidate, mode):
+        if str(candidate).endswith("-wal"):
+            raise PermissionError("unsafe companion")
+        return original(candidate, mode)
+
+    monkeypatch.setattr(store_module, "_chmod", reject_companion)
+    with pytest.raises(PermissionError, match="unsafe companion"):
+        store._restrict_state_perms()
+
+
+def test_oneroster_missing_main_database_stays_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = OneRosterStore("example.org", tmp_path / "component")
+    original = store_module._chmod
+
+    def disappear_main(candidate, mode):
+        if Path(candidate) == store.state_path:
+            raise FileNotFoundError(candidate)
+        return original(candidate, mode)
+
+    monkeypatch.setattr(store_module, "_chmod", disappear_main)
+    with pytest.raises(FileNotFoundError):
+        store._restrict_state_perms()

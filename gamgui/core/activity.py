@@ -45,6 +45,18 @@ class ActivityBusyError(RuntimeError):
         self.active_kind = active_kind
 
 
+class ActivityPathUnavailableError(RuntimeError):
+    """Raised when the durable activity lock path cannot be resolved safely."""
+
+    error_code = "CMP-ACTIVITY-PATH-UNAVAILABLE"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "GamGUI could not resolve its durable administrative activity lock path. "
+            "Check this account's home-folder configuration and try again."
+        )
+
+
 @dataclass(frozen=True)
 class ActivitySnapshot:
     """Privacy-safe description of the currently held lease."""
@@ -243,7 +255,13 @@ class ActivityRegistry:
                     kind=self._deferred_release.kind,
                     started_at=self._deferred_release.started_at,
                 )
-            durable_path = self._resolve_durable_path()
+            try:
+                durable_path = self._resolve_durable_path()
+            except ActivityPathUnavailableError:
+                # If the process cannot locate the cross-process lock, it cannot
+                # prove that another process is idle. Observation therefore
+                # remains blocked rather than degrading to a process-local view.
+                return _blocked_snapshot()
             if durable_path is None:
                 return None
             try:
@@ -384,11 +402,19 @@ class ActivityRegistry:
 
     def _resolve_durable_path(self) -> Optional[Path]:
         value = self._durable_path
-        if callable(value):
-            value = value()
-        if value is None:
-            return None
-        path = Path(value).expanduser()
+        try:
+            if callable(value):
+                value = value()
+            if value is None:
+                return None
+            path = Path(value).expanduser()
+        except (OSError, RuntimeError, ValueError) as exc:
+            # A mutating operation must never silently fall back to the
+            # process-local registry when the configured durable path cannot
+            # be resolved. Normalize expected environment/path failures so
+            # callers can render a corrective refusal without exposing local
+            # filesystem detail.
+            raise ActivityPathUnavailableError() from exc
         if not path.name:
             raise ValueError("Durable activity path must name a file.")
         return path

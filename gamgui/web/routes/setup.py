@@ -13,7 +13,7 @@ from typing import Annotated
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
-from ...core.activity import ActivityBusyError
+from ...core.activity import ActivityBusyError, ActivityPathUnavailableError
 from ...core.canary import CanaryConfigStore
 from ...core.components import ComponentError
 from ...core.connectors.gam_connector import GAMConnector
@@ -31,6 +31,12 @@ SETUP_COMPONENT_GATE_MESSAGE = (
     "Finish the Optional Features choice and restart GamGUI if requested "
     "before connecting Google Workspace. No Workspace credentials or GAM "
     "commands were accessed."
+)
+
+SETUP_ACTIVITY_PATH_MESSAGE = (
+    "GamGUI could not determine the current home directory, so the private "
+    "setup lock and credentials path could not be expanded safely. Restore "
+    "this account's home-folder configuration, reopen setup, and try again."
 )
 
 
@@ -121,7 +127,18 @@ async def do_import(
             {"message": "Enter the domain and super-admin email, then choose a credentials folder."},
         )
     st = request.app.state.gamgui
-    lease = try_acquire_admin_activity(st, "setup-credential-import")
+    try:
+        lease = try_acquire_admin_activity(st, "setup-credential-import")
+    except ActivityPathUnavailableError:
+        # The durable activity lock is resolved before the credential folder.
+        # On macOS that resolution uses the account home directory and can fail
+        # in managed/launchd contexts. Refuse the import without touching
+        # credentials and give the operator a corrective path instead of a 500.
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": SETUP_ACTIVITY_PATH_MESSAGE},
+        )
     if lease is None:
         return TEMPLATES.TemplateResponse(
             request,

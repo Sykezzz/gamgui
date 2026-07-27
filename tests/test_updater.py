@@ -51,6 +51,19 @@ SHA = "a" * 40
 TRANSACTION = "1" * 32
 
 
+def _signed_bundle_run(argv, **kwargs):
+    """Portable codesign double for tests that pass bundle verification."""
+
+    if argv[:3] == ["codesign", "--display", "--extract-certificates"]:
+        Path(kwargs["cwd"], "codesign0.cer").write_bytes(b"test-signing-leaf")
+    return subprocess.CompletedProcess(
+        argv,
+        0,
+        "",
+        "Authority=GamGUI Local\n",
+    )
+
+
 def test_managed_mac_build_environment_includes_gui_missing_tool_paths():
     environment = _managed_mac_build_environment(
         {"PATH": "/custom/bin"},
@@ -667,8 +680,8 @@ def test_installer_activates_exact_candidate_and_records_snapshot(tmp_path):
     store.save(_ready_state(pending))
     launches = []
 
-    def run(*_args, **_kwargs):
-        return subprocess.CompletedProcess([], 0, "", "")
+    def run(argv, **kwargs):
+        return _signed_bundle_run(argv, **kwargs)
 
     def popen(argv, env):
         launches.append((argv, env))
@@ -745,7 +758,7 @@ def test_durable_journal_recovers_after_abrupt_exit_at_each_activation_phase(
         store=CrashAfterJournalPhase(),
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
         popen=popen,
     )
     with pytest.raises(SystemExit, match=crash_phase):
@@ -759,7 +772,7 @@ def test_durable_journal_recovers_after_abrupt_exit_at_each_activation_phase(
         store=backing,
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
     )
     assert recovery.recover(
         current_app=current,
@@ -797,7 +810,7 @@ def test_installer_reverifies_incoming_copy_before_exchange(monkeypatch, tmp_pat
         store=store,
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
     )
 
     assert not installer.install(SHA, pending, current)
@@ -859,8 +872,8 @@ def test_installer_restores_app_and_database_when_health_fails(tmp_path):
     store.save(_ready_state(pending))
     launches = []
 
-    def run(*_args, **_kwargs):
-        return subprocess.CompletedProcess([], 0, "", "")
+    def run(argv, **kwargs):
+        return _signed_bundle_run(argv, **kwargs)
 
     def popen(argv, env):
         launches.append((argv, env))
@@ -983,7 +996,7 @@ def test_state_commit_failure_restores_previous_app_and_database(tmp_path):
         store=FailCommitStore(),
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
         popen=popen,
     )
 
@@ -1024,7 +1037,7 @@ def test_state_failure_during_rollback_still_relaunches_previous_app(tmp_path):
         store=FailEverySaveStore(),
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
         popen=popen,
     )
 
@@ -1108,7 +1121,7 @@ def test_installer_restores_old_app_when_atomic_exchange_fails(monkeypatch, tmp_
         store=store,
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
     )
 
     assert not installer.install(SHA, pending, current)
@@ -1179,7 +1192,7 @@ def test_installer_does_not_restore_while_updated_process_may_be_running(tmp_pat
         store=store,
         root=root,
         data_root=data_root,
-        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        run=_signed_bundle_run,
         popen=popen,
     )
     assert not installer.install(SHA, pending, current, health_timeout=0.01)

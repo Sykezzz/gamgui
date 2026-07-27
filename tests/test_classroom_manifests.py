@@ -183,3 +183,61 @@ def test_roster_store_uses_owner_only_directory_and_database_modes(tmp_path):
 
     assert path.parent.stat().st_mode & 0o777 == 0o700
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_roster_store_tolerates_only_disappearing_sqlite_companions(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "ops.db"
+    store = RosterManifestStore(path)
+    original = manifests_module._secure_private_file
+
+    def disappear_companions(candidate):
+        if str(candidate).endswith(("-wal", "-shm")):
+            raise FileNotFoundError(candidate)
+        return original(candidate)
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_secure_private_file",
+        disappear_companions,
+    )
+
+    store._restrict_perms()
+
+    def reject_companion(candidate):
+        if str(candidate).endswith("-wal"):
+            raise PermissionError("unsafe companion")
+        return original(candidate)
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_secure_private_file",
+        reject_companion,
+    )
+    with pytest.raises(PermissionError, match="unsafe companion"):
+        store._restrict_perms()
+
+
+def test_roster_store_missing_main_database_stays_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "ops.db"
+    store = RosterManifestStore(path)
+    original = manifests_module._secure_private_file
+
+    def disappear_main(candidate):
+        if Path(candidate) == path:
+            raise FileNotFoundError(candidate)
+        return original(candidate)
+
+    monkeypatch.setattr(
+        manifests_module,
+        "_secure_private_file",
+        disappear_main,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        store._restrict_perms()
