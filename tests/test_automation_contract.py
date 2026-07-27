@@ -45,6 +45,10 @@ def test_gam_update_refreshes_every_pinned_contract_before_auto_merge():
 
 def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
     workflow = _workflow("post-merge-validation.yml")
+    update_ready_job = workflow.split("\n  update-ready:\n", 1)[1].split(
+        "\n  report-failure:\n",
+        1,
+    )[0]
     assert "test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"" in workflow
     assert "pinned and latest GAM contracts" in workflow
     assert "updater, bundle, and rollback contracts" in workflow
@@ -56,8 +60,19 @@ def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
     assert '"$VALIDATED_SHA:refs/heads/update-ready"' in workflow
     assert "group: post-merge-update-ready" in workflow
     assert "cancel-in-progress: true" in workflow
-    assert 'git fetch origin district-main:refs/remotes/origin/district-main' in workflow
-    assert 'test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"' in workflow
+    assert "fetch-depth: 0" in update_ready_job
+    assert "git fetch --no-tags origin" in update_ready_job
+    assert "district-main:refs/remotes/origin/district-main" in update_ready_job
+    assert "update-ready:refs/remotes/origin/update-ready" in update_ready_job
+    assert (
+        'test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"'
+        in update_ready_job
+    )
+    assert 'READY_SHA="$(git rev-parse origin/update-ready)"' in update_ready_job
+    assert (
+        'git merge-base --is-ancestor "$READY_SHA" "$VALIDATED_SHA"'
+        in update_ready_job
+    )
     assert "--force" not in workflow
 
 
