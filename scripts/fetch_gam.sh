@@ -5,7 +5,8 @@
 # GAM-team/GAM GitHub releases, records its SHA-256, extracts it, and copies the PyInstaller
 # bundle (the `gam` executable plus its support files) into resources/gam7/. Records the version.
 #
-# Usage: scripts/fetch_gam.sh [--tag vX.Y.Z|latest]   (default: the pinned, tested version)
+# Usage: scripts/fetch_gam.sh [--tag vX.Y.Z|latest]
+#        (default: the pinned, tested version, verified against scripts/gam_checksums.txt)
 set -euo pipefail
 
 REPO="GAM-team/GAM"
@@ -14,7 +15,6 @@ DEST="$ROOT/gamgui/resources/gam7"
 CATALOG="$DEST/command_catalog.json"
 # Pinned for reproducible builds. Override with `--tag latest` to grab the newest release.
 TAG="v7.46.11"
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="$2"; shift 2 ;;
@@ -91,7 +91,7 @@ if [ -n "$EXPECTED" ]; then
   fi
   echo "==> Checksum verified against committed pin (scripts/gam_checksums.txt)."
 else
-  echo "ERROR: no committed checksum for '$ASSET_NAME'." >&2
+  echo "ERROR: no pinned checksum for '$ASSET_NAME'." >&2
   echo "  Refusing to install an unpinned GAM binary on this architecture." >&2
   echo "  The automated bump must record every supported macOS architecture first." >&2
   exit 1

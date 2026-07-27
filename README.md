@@ -1,3 +1,4 @@
+
 # GamGUI
 
 A free, local, open-source **macOS GUI for [GAM7](https://github.com/GAM-team/GAM)** — administer
@@ -36,41 +37,75 @@ mutation or bounded-pilot approval.
 
 Actively developed and used against live Google Workspace tenants. Working today:
 
-- **Setup wizard** — first-run GAM project / OAuth / domain-wide-delegation flow.
-- **Users** — fast list/search/detail (cached + paginated), profile editing
-  (title/department/location) with a bulk "assign store" tool, mailbox **delegates**, **vacation
-  responders**, and a guarded **suspend**.
-- **Gmail signatures** — a scoped designer with variables, a live preview, and bulk apply.
+- **Setup wizard** — either **import an existing GAM install** (it auto-detects `$GAMCFGDIR`,
+  `~/.gam`, and its own setup dir, shows which credential files each one holds, and moves them into
+  the Keychain) or follow the guided fresh GAM project / OAuth flow; then the manual
+  domain-wide-delegation step and a verify.
+- **Users** — fast list/search/detail (cached + paginated), profile editing (title/department —
+  location is shown but not editable) with a bulk "assign store" tool, mailbox **delegates**,
+  **vacation responders**, group membership, per-user calendar sharing (grant/revoke access to that
+  person's own calendar), **sign out everywhere**, and a guarded **suspend**.
+- **Gmail signatures** — a scoped designer with variables, saved templates, a live preview, and
+  bulk apply with a live per-user ✓/✗ feed as each signature gets set.
 - **Groups** — membership management, including a drag-and-drop board.
-- **Calendars** — find any shared calendar by name (instant, from a local index that scales to large
-  tenants), see who has access, search a calendar's events, and remove a stray event or an entire
-  orphaned secondary calendar.
+- **Calendars** — instant indexed search at district scale; list resources or a person's calendars,
+  inspect and grant/revoke ACLs, subscribe an individual or every current group member with bounded
+  background progress, search events, and remove a stray event or orphaned secondary calendar.
 - **Classroom** — locally indexed course search, provisioned-course creation, metadata and lifecycle
   changes, guarded owner transfer, and exact-preview teacher/student roster reconciliation.
 - **Drive** — bounded per-user file search, metadata and sharing administration, safe file previews,
   and exact-manifest ownership transfer for a file, folder, or supported Classroom claim.
-- **Lifecycle** — a guided **offboarding** routine (reset password → delegate → auto-responder →
-  transfer Drive & calendars → remove from everyone's calendars → reminder on the manager), with a
-  live preview of the generated auto-reply.
-- **Reports and audit** — 2SV gaps, inactive accounts, admins, missing recovery, directory
-  completeness, and an incrementally indexed local audit trail; result pages are hard-bounded.
+- **Lifecycle** — guided onboarding runbooks and a guarded offboarding routine (reset password →
+  delegate → auto-responder → transfer Drive and calendars → unsubscribe calendars → manager
+  reminder), with previews and progress evidence.
+- **Command Builder** — search the categorized GAM catalog; curated commands get typed slots,
+  guarded preview/run, sequencing, bounded interactive results and CSV download, plus explicit
+  Google Sheet export for complete results.
+- **Reports and audit** — 2SV gaps, inactive or suspended accounts, admins, missing recovery,
+  storage/mail usage, directory completeness, and an incrementally indexed local audit trail.
 - **Local updater** — on an installed macOS app, prepares only an exact `district-main` commit that
   has the `update-ready` check, runs bundle/self-tests plus the approved bounded canary, and rolls
   back the app and local databases if activation health fails.
 
 You build and run it yourself; it is not yet notarized for distribution to other Macs.
 
-> **Destructive actions are guarded — but verify before trusting them on production.** Suspend,
+> **Destructive actions are guarded — but check what has actually been proven live.** Suspend,
 > account delete, calendar/event delete, data transfer, the offboarding routine, and bulk operations
-> all run behind a *preview → typed confirmation → audit-logged* path. A few of the newer ones
-> haven't yet been exercised against a live tenant, so run them once on a **throwaway test
-> user/event** before relying on them. Account deletion is reversible only within Google's ~20-day
-> window. GamGUI is provided **as-is under the MIT License, with no warranty — use at your own
-> risk**; you are responsible for what you run against your own tenant.
+> all run behind a *preview → typed confirmation → audit-logged* path. That guard is well covered by
+> tests; what tests cannot prove is that a given GAM command behaves as expected against a real
+> tenant. See [Live verification status](#live-verification-status) for which writes have been
+> confirmed against a production domain and which have not — and run anything in the second list
+> once on a **throwaway user/event/calendar** before you rely on it. Account deletion is reversible
+> only within Google's ~20-day window. GamGUI is provided **as-is under the MIT License, with no
+> warranty — use at your own risk**; you are responsible for what you run against your own tenant.
+
+### Live verification status
+
+Every write is audited, so this list is derived from real audit logs rather than memory. "Confirmed
+live" means the operation has succeeded at least once against a production Google Workspace domain.
+
+**Confirmed live:** calendar share (ACL) · calendar auto-subscribe (making a shared calendar appear
+in someone's sidebar) · add calendar event · delete calendar · add delegate · remove group member ·
+reset password · set organization fields · set signature · set vacation · transfer data · plus all
+reads (a read-only pass over the parsers ships as `scripts/acceptance.py`).
+
+**Not yet confirmed live** — treat as unproven and test on a throwaway target first: unshare a
+calendar (remove ACL) · remove delegate · clear vacation · add group member · sign out everywhere ·
+delete event · delete user · the group fan-out of a calendar share (the individual calls it makes —
+ACL add and subscribe — are each confirmed live, but the group expansion itself is not) · and the two
+offboarding repairs described below.
+
+**Known-good repairs awaiting live re-run.** Two offboarding bugs were found in real audit logs and
+fixed, but the fixes have not themselves been exercised live yet: Drive and calendar are now
+transferred in a *single* data-transfer call (two separate calls collided with a `409 conflict`),
+and "remove from everyone's calendars" now tolerates the `cannotChangeOwnAcl` error that used to
+abort the sweep.
 
 ## Design goals
 
-- **Local & native** — a single bundled `.app`; no server, nothing leaves your machine.
+- **Local & native** — a single bundled `.app`; no cloud service, nothing leaves your machine. The
+  UI is served by a loopback-only local server on a random port, gated by a per-launch token (see
+  [Security model](#security-model)).
 - **Secure** — secrets live in the macOS Keychain; GAM's plaintext credential files are
   materialized into a locked-down temporary directory only for the duration of each `gam`
   invocation, then wiped. ([details](#security-model))
@@ -89,7 +124,9 @@ Bounded selectors/reports → domain-isolated SQLite indexes → background snap
 Classroom/Drive writes   → live re-read → exact preview/manifest → guarded apply → audit
 ```
 
-Wrapped in a `pywebview` native window (WKWebView). See `docs`/the plan for the full design.
+Wrapped in a `pywebview` native window (WKWebView). See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+layout and conventions, and [docs/builder-commands.md](docs/builder-commands.md) for the Builder
+catalog.
 
 ## Performance and local-index behavior
 
@@ -165,8 +202,24 @@ domain and `oauth2.txt` is effectively an admin password, so GamGUI:
 1. keeps the canonical copies in the **Keychain** (`keyring`, device-bound, not synced);
 2. materializes them into a `chmod 700` temp dir (files `chmod 600`) set as `GAMCFGDIR` only for
    each `gam` call;
-3. wipes that dir on completion (success or failure);
+3. wipes that dir on completion (success or failure) — and, because "the app quit mid-call" is the
+   case that actually strands plaintext credentials, also via an `atexit` hook, a graceful-shutdown
+   timeout that lets in-flight calls unwind, and an owner-PID marker so a later run can collect a
+   directory whose owning process is gone;
 4. writes refreshed OAuth tokens back to the Keychain.
+
+Beyond the credentials themselves:
+
+- **The local server is not open to other local processes.** It binds loopback on a random port and
+  requires a per-launch token — and because cookies are *not* port-scoped (so `SameSite` alone would
+  treat every port on `127.0.0.1` as the same site), it also rejects cross-origin callers outright.
+- **GAM is never invoked through a shell.** Every command is an explicit argv list built by
+  `GAMCommands`; user input is always a single list element, never string-interpolated.
+- **Every mutation is guarded and audited** — `guard.evaluate()` classifies risk and resolves the
+  concrete affected set for a preview, and the write is appended to a local audit log.
+- **The vendored `gam` binary is checksum-pinned and verified fail-closed.** A release asset with no
+  committed pin is refused rather than installed, since a swapped binary would inherit
+  domain-wide impersonation.
 
 ## District setup and acceptance runbook
 
@@ -244,6 +297,9 @@ intentional dependency change, regenerate and review the lock with exactly `uv 0
 
 The GAM7 binary is **not committed** (platform-specific, large) — `make gam` / `scripts/fetch_gam.sh`
 fetches the pinned version (`v7.46.11`) from the official releases and records its checksum.
+
+`make setup` auto-selects a usable Python 3.10+ when `PYTHON` is unset; set
+`PYTHON=/path/to/python` to choose one explicitly.
 
 ### Build a standalone `.app` (macOS)
 
@@ -367,6 +423,13 @@ or tenant data, and it never treats a missing/failed canary as approval to proce
 `pytest` is fully offline (mock gam + in-memory Keychain). CI runs it on Ubuntu and macOS across
 Python 3.10, 3.12, and 3.14 — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
+**Static analysis.** CodeQL runs on every push and PR to `main`, plus weekly, over both the Python
+code and the workflows themselves — configured in-tree so it is reviewable rather than hidden in
+repository settings: [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) with
+[`.github/codeql/codeql-config.yml`](.github/codeql/codeql-config.yml). It uses the broader
+`security-extended` suite, and skips `tests/`, the vendored GAM release, and vendored browser
+libraries — the config explains why for each.
+
 ## Email signatures
 
 The **Signatures** screen designs one HTML signature with variables, previews it rendered for a real
@@ -416,6 +479,13 @@ Size icons ~2× their display size and set explicit `width`/`height` on each `<i
 - **GitHub + jsDelivr (free, no billing).** Commit the images to a public repo and serve them via the
   jsDelivr CDN: `https://cdn.jsdelivr.net/gh/<user>/<repo>@<branch>/path/logo.png`. CDN-fast, no card.
 - **Cloudflare R2 / Amazon S3** — or any public-object store — also work.
+
+## Where this is going
+
+[ROADMAP.md](ROADMAP.md) — the ranked backlog, plus the trade-offs behind what it does *not* do yet.
+[CONTRIBUTING.md](CONTRIBUTING.md) — layout, conventions, and how to add a Builder command.
+[SECURITY.md](SECURITY.md) — threat model, the invariants the code is expected to hold, and how to
+report a vulnerability privately.
 
 ## License
 

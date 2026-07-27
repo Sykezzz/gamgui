@@ -1,3 +1,4 @@
+
 """Application entry point.
 
 Starts the local FastAPI server on a random loopback port and opens it in a native WKWebView
@@ -21,6 +22,8 @@ from typing import Optional, Sequence
 
 import uvicorn
 
+from .core.paths import APP_DATA_ENV, app_data_dir
+from .core.secrets.ephemeral import sweep_stale_configs, wipe_live_configs
 from .core.updater import (
     LocalUpdateInstaller,
     UpdateCoordinator,
@@ -32,8 +35,14 @@ from .core.updater import (
     wait_for_process_exit,
     write_health_marker_from_environment,
 )
-from .core.paths import APP_DATA_ENV, app_data_dir
 from .web.server import AppState, create_app
+
+# Seconds uvicorn may spend waiting for in-flight requests at shutdown. This has to be set: with no
+# graceful-shutdown timeout uvicorn waits forever and never cancels, so a gam call still running
+# when the window closes keeps its materialized credentials on disk. With it, the handler is
+# cancelled, the `with EphemeralConfig(...)` block unwinds and the dir is wiped. Long enough for a
+# quick call to finish, short enough that quitting still feels instant.
+_GRACEFUL_SHUTDOWN_SECONDS = 3
 
 
 def _free_loopback_port() -> int:
@@ -46,7 +55,13 @@ def _free_loopback_port() -> int:
 
 class _BackgroundServer:
     def __init__(self, app, host: str, port: int) -> None:
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS,
+        )
         self.server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self.server.run, daemon=True)
 
@@ -58,7 +73,12 @@ class _BackgroundServer:
 
     def stop(self) -> None:
         self.server.should_exit = True
-        self._thread.join(timeout=5)
+        self._thread.join(timeout=_GRACEFUL_SHUTDOWN_SECONDS + 2)
+        # Whatever the daemon thread was still holding is orphaned now: detached tasks (bulk
+        # signature apply, Builder sequences) die with the loop without unwinding their context
+        # managers. Wipe our own dirs first, then sweep anything a previous run left behind.
+        wipe_live_configs()
+        sweep_stale_configs(max_age_seconds=0)
 
 
 def _fit_size(screen_w: int, screen_h: int) -> "tuple[int, int]":
@@ -268,6 +288,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         finally:
             server.stop()
         return 0
+
+    # WKWebView drops Content-Disposition downloads unless this is on — without it the CSV export
+    # links (Audit viewer, Builder results) silently do nothing in the native window.
+    webview.settings["ALLOW_DOWNLOADS"] = True
 
     window = webview.create_window("GamGUI", url, width=1100, height=760, min_size=(900, 600))
 

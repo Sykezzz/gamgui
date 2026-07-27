@@ -539,15 +539,20 @@ class AuditIndex:
             total=total,
         )
 
-    def latest(self, limit: int = 2000) -> List[Dict[str, Any]]:
+    def latest(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.sync()
-        limit = max(0, int(limit))
-        if not limit:
-            return []
         with self._lock, closing(self._conn()) as conn:
-            rows = conn.execute(
-                "SELECT payload FROM records ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    "SELECT payload FROM records ORDER BY id DESC"
+                ).fetchall()
+            else:
+                limit = max(0, int(limit))
+                if not limit:
+                    return []
+                rows = conn.execute(
+                    "SELECT payload FROM records ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
     def iter_filtered(
@@ -659,10 +664,22 @@ class AuditLog:
         return list(reversed(get_audit_index(self.path).latest(limit)))
 
 
-def read_records(path: Optional[Path] = None, limit: int = 2000) -> List[Dict[str, Any]]:
+def iter_records(
+    path: Optional[Path] = None,
+    *,
+    limit: Optional[int] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Iterate indexed records newest-first without a legacy fixed cap."""
+    yield from get_audit_index(path).latest(limit)
+
+
+def read_records(
+    path: Optional[Path] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """Read JSONL records through the rebuildable local index (no source writes or gam calls).
 
     Tolerant of a missing file and of malformed/blank lines (skipped rather than raised).
-    Returns the most-recent-written-first, capped at ``limit`` entries.
+    Returns the most-recent-written-first, optionally capped at ``limit`` entries.
     """
     return get_audit_index(path).latest(limit)
