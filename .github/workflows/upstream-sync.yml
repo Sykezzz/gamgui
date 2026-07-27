@@ -56,11 +56,8 @@ jobs:
               CONFLICTS="$(git diff --name-only --diff-filter=U | sed 's/^/- `/' | sed 's/$/`/')"
               git merge --abort
               TITLE="Upstream sync blocked"
-              BODY="The upstream \`main\` commit \`$UPSTREAM_SHORT\` conflicts with \`district-main\` in:
-
-$CONFLICTS
-
-No branch was advanced."
+            BODY="$(printf 'The upstream `main` commit `%s` conflicts with `district-main` in:\n\n%s\n\nNo branch was advanced.' \
+              "$UPSTREAM_SHORT" "$CONFLICTS")"
               NUMBER="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
               if [ -n "$NUMBER" ]; then
                 gh issue comment "$NUMBER" --body "$BODY"
