@@ -781,6 +781,33 @@ class ComponentManager:
             ]
         self.store.save(state)
 
+    def committed_runtime_identity_ready(
+        self,
+        state: Optional[object] = None,
+    ) -> bool:
+        """Return whether persisted installed identity matches the sealed runtime."""
+
+        if self.embedded is None or self._embedded_error is not None:
+            return False
+        current = state if state is not None else self.store.load()
+        artifact = getattr(current, "installed_artifact", None)
+        embedded = self.embedded.artifact
+        return bool(
+            isinstance(artifact, ComponentArtifactId)
+            and getattr(current, "installed_sha", "") == embedded.source_sha
+            and getattr(current, "installed_profile", "") == embedded.profile
+            and set(getattr(current, "installed_components", ()) or ())
+            == set(component_ids_for_profile(embedded.profile))
+            and replace(artifact, artifact_sha256="")
+            == replace(embedded, artifact_sha256="")
+        )
+
+    def reconcile_committed_runtime(self) -> bool:
+        """Backfill a legacy updater's SHA-only commit from the sealed bundle."""
+
+        self._reconcile_pristine_install()
+        return self.committed_runtime_identity_ready()
+
     def runtime_projection(self) -> Optional[object]:
         """Return the updater's validated candidate view without persisting it."""
 

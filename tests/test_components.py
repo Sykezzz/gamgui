@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -520,6 +521,40 @@ def test_legacy_sha_mismatch_is_not_backfilled(tmp_path):
     )
 
     assert store.load().installed_artifact is None
+
+
+def test_committed_runtime_identity_rejects_stale_packaging_metadata(tmp_path):
+    embedded = EmbeddedProfile.from_json(
+        build_profile_payload(
+            CORE_PROFILE,
+            source_sha=SHA,
+            version="2",
+            architecture="arm64",
+            minimum_macos_version="12.0",
+            packaging_revision="2",
+        )
+    )
+    stale = replace(
+        embedded.artifact,
+        version="1",
+        packaging_revision="1",
+    )
+    store = UpdateStateStore(tmp_path / "state.json")
+    store.save(
+        UpdateState(
+            installed_sha=SHA,
+            installed_profile=CORE_PROFILE,
+            installed_artifact=stale,
+        )
+    )
+    manager = ComponentManager(
+        store=store,
+        registry=ActivityRegistry(),
+        data_root=tmp_path / "data",
+        embedded=embedded,
+    )
+
+    assert not manager.committed_runtime_identity_ready()
 
 
 def test_pristine_direct_install_records_detected_signing_identity(

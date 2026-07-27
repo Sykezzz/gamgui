@@ -2878,14 +2878,36 @@ def write_health_marker_from_environment(
     path = Path(marker)
     path.parent.mkdir(parents=True, exist_ok=True)
     evidence = dict(payload or {"ok": True})
+    legacy_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+    legacy_contract = (
+        os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1"
+        and not os.environ.get(ACTIVATION_PROBE_ENV)
+        and not os.environ.get(ACTIVATION_TRANSACTION_ENV)
+        and _valid_sha(legacy_sha)
+        and path.name == f"{legacy_sha}.ok"
+        and evidence.get("ok") is True
+        and evidence.get("transaction_id") == ""
+        and evidence.get("sha") == legacy_sha
+        and evidence.get("profile") == CORE_PROFILE
+        and isinstance(evidence.get("component_set_digest"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(evidence.get("component_set_digest")),
+        )
+        is not None
+    )
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
     descriptor = -1
     try:
-        encoded = (
-            json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("utf-8")
+        if legacy_contract:
+            encoded = b"ok\n"
+        else:
+            encoded = (
+                json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)

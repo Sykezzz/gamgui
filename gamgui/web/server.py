@@ -41,6 +41,7 @@ from ..core.classroom.manifests import (
 from ..core.classroom.service import ClassroomService
 from ..core.connectors.gam_connector import GAMConnector
 from ..core.components import (
+    ComponentError,
     ComponentManager,
     ONEROSTER_COMPONENT,
     ONEROSTER_PROFILE,
@@ -283,19 +284,47 @@ class AppState:
         if not transaction_probe and not legacy_health_start:
             return False
         expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
-        state = self.ensure_component_manager().store.load()
-        return bool(
+        manager = self.ensure_component_manager()
+        state = manager.store.load()
+        pending = bool(
             state.candidate_sha == expected_sha
             or state.installed_sha != expected_sha
         )
+        if legacy_health_start and not transaction_probe:
+            pending = pending or not manager.committed_runtime_identity_ready(
+                state
+            )
+        return pending
 
     async def _wait_for_activation_commit(self) -> None:
         """Enable background work only after the helper commits candidate state."""
 
         for _attempt in range(600):
+            manager = self.ensure_component_manager()
+            state = manager.store.load()
+            expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+            legacy_commit = bool(
+                not self.activation_probe_mode
+                and os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
+                and os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1"
+                and not os.environ.get(ACTIVATION_PROBE_ENV)
+                and state.installed_sha == expected_sha
+                and not state.candidate_sha
+            )
+            if (
+                legacy_commit
+                and not manager.committed_runtime_identity_ready(state)
+            ):
+                try:
+                    reconciled = await asyncio.to_thread(
+                        manager.reconcile_committed_runtime
+                    )
+                except (ComponentError, OSError, RuntimeError, ValueError):
+                    return
+                if not reconciled:
+                    return
             if not self.activation_probe_pending():
-                state = self.ensure_component_manager().store.load()
-                expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+                state = manager.store.load()
                 if state.installed_sha == expected_sha and not state.candidate_sha:
                     if self.activation_probe_mode:
                         if not await self._rehydrate_after_activation():
