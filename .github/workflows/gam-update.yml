@@ -43,35 +43,55 @@ jobs:
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Refresh pin, checksum, catalog, tests, mock, and docs
+      - name: Find retryable automation pull request
         if: steps.release.outputs.needed == 'true'
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          DISTRICT_SHORT="$(git rev-parse --short=12 origin/district-main)"
+          BRANCH="automation/gam-${TAG}-${DISTRICT_SHORT}"
+          PR="$(gh pr list --base district-main --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+          if [ -z "$PR" ] && gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            BRANCH="${BRANCH}-run-${GITHUB_RUN_ID}"
+          fi
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+      - name: Refresh pin, checksum, catalog, tests, mock, and docs
+        if: steps.release.outputs.needed == 'true' && steps.branch.outputs.pr == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           uv sync --frozen --python "$(which python)" --extra dev
           .venv/bin/python scripts/bump_gam.py --tag "$TAG"
-          .venv/bin/pytest -q tests/test_command_contract.py tests/test_bump_gam.py
+          .venv/bin/pytest -q tests/test_command_contract.py tests/test_bump_gam.py tests/test_acceptance_privacy.py
       - name: Open auto-merge pull request
         if: steps.release.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          EXISTING_PR: ${{ steps.branch.outputs.pr }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          DISTRICT_SHORT="$(git rev-parse --short=12 origin/district-main)"
-          BRANCH="automation/gam-${TAG}-${DISTRICT_SHORT}"
-          git checkout -b "$BRANCH"
-          git add README.md scripts/fetch_gam.sh scripts/gam_checksums.txt \
-            scripts/bump_gam.py gamgui/core/gam/commands.py \
-            gamgui/resources/gam7/VERSION gamgui/resources/gam7/command_catalog.json \
-            tests/fixtures/mock_gam.sh tests/test_bump_gam.py
-          git commit -m "chore: bump GAM7 to ${TAG}"
-          git push origin "HEAD:refs/heads/$BRANCH"
-          PR="$(gh pr create --base district-main --head "$BRANCH" \
-            --title "chore: bump GAM7 to ${TAG}" \
-            --body "Automated GAM7 pin, checksum, catalog, mock, tests, and documentation update. Expanded CI and exact-SHA post-merge validation remain mandatory.")"
+          PR="$EXISTING_PR"
+          if [ -z "$PR" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -b "$BRANCH"
+            git add README.md scripts/fetch_gam.sh scripts/gam_checksums.txt \
+              scripts/bump_gam.py gamgui/core/gam/commands.py \
+              gamgui/resources/gam7/VERSION gamgui/resources/gam7/command_catalog.json \
+              tests/fixtures/mock_gam.sh tests/test_acceptance_privacy.py tests/test_bump_gam.py
+            git commit -m "chore: bump GAM7 to ${TAG}"
+            git push origin "HEAD:refs/heads/$BRANCH"
+            PR="$(gh pr create --base district-main --head "$BRANCH" \
+              --title "chore: bump GAM7 to ${TAG}" \
+              --body "Automated GAM7 pin, checksum, catalog, mock, tests, and documentation update. Expanded CI and exact-SHA post-merge validation remain mandatory.")"
+          else
+            echo "Resuming existing automatic update pull request: $PR"
+          fi
           gh workflow run ci.yml --ref "$BRANCH"
           gh pr merge "$PR" --auto --merge --delete-branch
           MERGED_SHA=""
