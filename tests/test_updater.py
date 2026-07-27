@@ -20,6 +20,8 @@ from gamgui.core.updater import (
     ACTIVATION_PHASE_HEALTH_PASSED,
     ACTIVATION_PHASE_PREPARED,
     ACTIVATION_PHASE_SWAPPED,
+    ACTIVATION_PROBE_ENV,
+    ACTIVATION_TRANSACTION_ENV,
     ActivationJournal,
     _managed_mac_build_environment,
     _extract_verified_archive,
@@ -1261,3 +1263,48 @@ def test_health_marker(monkeypatch, tmp_path):
     write_health_marker_from_environment()
     assert json.loads(marker.read_text(encoding="utf-8")) == {"ok": True}
     assert not list(marker.parent.glob("*.tmp"))
+
+
+def test_transaction_health_marker_retains_bound_json(
+    monkeypatch,
+    tmp_path,
+):
+    marker = tmp_path / "health" / f"{TRANSACTION}.json"
+    payload = {
+        "ok": True,
+        "transaction_id": TRANSACTION,
+        "sha": SHA,
+        "profile": CORE_PROFILE,
+        "component_set_digest": "b" * 64,
+    }
+    monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", SHA)
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+    monkeypatch.setenv(ACTIVATION_PROBE_ENV, "1")
+    monkeypatch.setenv(ACTIVATION_TRANSACTION_ENV, TRANSACTION)
+
+    write_health_marker_from_environment(payload)
+
+    assert json.loads(marker.read_text(encoding="utf-8")) == payload
+    assert not list(marker.parent.glob("*.tmp"))
+
+
+def test_legacy_health_marker_refuses_invalid_component_digest(
+    monkeypatch,
+    tmp_path,
+):
+    marker = tmp_path / "health" / f"{SHA}.ok"
+    payload = {
+        "ok": True,
+        "transaction_id": "",
+        "sha": SHA,
+        "profile": CORE_PROFILE,
+        "component_set_digest": "B" * 64,
+    }
+    monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", SHA)
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+
+    write_health_marker_from_environment(payload)
+
+    assert json.loads(marker.read_text(encoding="utf-8")) == payload

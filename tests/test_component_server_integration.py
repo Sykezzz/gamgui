@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from gamgui.core.activity import ActivityRegistry
@@ -21,6 +24,7 @@ from gamgui.core.updater import (
     INSTALLED_SOURCE_EVIDENCE,
     UpdateState,
     UpdateStateStore,
+    write_health_marker_from_environment,
 )
 from gamgui.web.server import AppState, create_app
 
@@ -279,13 +283,16 @@ def test_legacy_installed_updater_can_bootstrap_core_health_once(
         token="legacy",
     )
 
-    assert state.update_activation_health_payload() == {
+    payload = state.update_activation_health_payload()
+    assert payload == {
         "ok": True,
         "transaction_id": "",
         "sha": sha,
         "profile": CORE_PROFILE,
         "component_set_digest": manager.embedded.artifact.component_set_digest,
     }
+    write_health_marker_from_environment(payload)
+    assert marker.read_text(encoding="utf-8") == "ok\n"
     monkeypatch.setenv("GAMGUI_SOURCE_SHA", "c" * 40)
     mismatched_manager = ComponentManager(
         store=store,
@@ -300,7 +307,97 @@ def test_legacy_installed_updater_can_bootstrap_core_health_once(
     committed.installed_sha = sha
     committed.candidate_sha = ""
     store.save(committed)
+    assert state.activation_probe_pending()
+    assert manager.reconcile_committed_runtime()
     assert not state.activation_probe_pending()
+
+
+@pytest.mark.asyncio
+async def test_legacy_helper_commit_backfills_running_component_host_before_choice(
+    tmp_path,
+    monkeypatch,
+):
+    sha = "a" * 40
+    monkeypatch.setenv(APP_DATA_ENV, str(tmp_path))
+    monkeypatch.setenv("GAMGUI_BUILD_PROFILE", CORE_PROFILE)
+    monkeypatch.setenv("GAMGUI_SOURCE_SHA", sha)
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", sha)
+    monkeypatch.delenv(ACTIVATION_PROBE_ENV, raising=False)
+    store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    marker = store.path.parent / "health" / f"{sha}.ok"
+    pending = store.path.parent / "pending" / sha / "GamGUI.app"
+    monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
+    store.save(
+        UpdateState(
+            installed_sha="b" * 40,
+            candidate_sha=sha,
+            pending_app=str(pending),
+            canary_result="passed",
+            required_check_evidence=["update-ready"],
+        )
+    )
+    manager = ComponentManager(
+        store=store,
+        registry=ActivityRegistry(),
+        data_root=tmp_path,
+    )
+    state = AppState(
+        vault=RecordingVault(),
+        runner=GAMRunner(
+            vault=RecordingVault(),
+            base_dir=tmp_path,
+        ),
+        component_manager=manager,
+        activity_registry=manager.registry,
+        token="legacy-running",
+    )
+    payload = state.update_activation_health_payload()
+    assert payload is not None
+    write_health_marker_from_environment(payload)
+    assert marker.read_text(encoding="utf-8") == "ok\n"
+
+    # The pre-profile helper rewrites state using its older schema after it
+    # accepts the marker, while this candidate process and manager stay alive.
+    store.path.write_text(
+        json.dumps({"installed_sha": sha}) + "\n",
+        encoding="utf-8",
+    )
+    assert state.activation_probe_pending()
+
+    await state._wait_for_activation_commit()
+
+    committed = store.load()
+    assert not state.activation_probe_pending()
+    assert committed.installed_profile == CORE_PROFILE
+    assert committed.installed_components == []
+    assert committed.installed_artifact is not None
+    assert committed.installed_artifact.source_sha == sha
+    assert (
+        committed.installed_artifact.component_set_digest
+        == manager.embedded.artifact.component_set_digest
+    )
+
+    app = create_app(state)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        follow_redirects=True,
+    ) as client:
+        landing = await client.get("/?token=legacy-running")
+        assert landing.status_code == 200
+        assert "Choose optional features" in landing.text
+        skipped = await client.post(
+            "/components/oneroster/skip",
+            data={"context": "setup"},
+        )
+
+    assert skipped.status_code == 200
+    assert skipped.headers["HX-Redirect"] == "/setup"
+    after_choice = store.load()
+    assert after_choice.component_prompt_answered
+    assert after_choice.installed_artifact == committed.installed_artifact
 
 
 def test_first_http_navigation_stays_component_only_without_keychain_reads(
