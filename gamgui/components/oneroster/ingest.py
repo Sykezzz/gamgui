@@ -1466,6 +1466,7 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
 
 def _create_normalized_db(path: Path) -> None:
     path.unlink(missing_ok=True)
+    _prepare_private_database(path)
     with closing(_normalized_conn(path)) as conn, conn:
         conn.executescript(
             """
@@ -1528,13 +1529,30 @@ def _create_normalized_db(path: Path) -> None:
 
 
 def _normalized_conn(path: Path) -> sqlite3.Connection:
+    path = Path(path)
+    _prepare_private_database(path)
+    before = path.lstat()
     conn = sqlite3.connect(str(path), timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    try:
+        after = path.lstat()
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            raise PermissionError(
+                "OneRoster normalized persistence changed during open."
+            )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        _chmod_sqlite(path)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=10000")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _replace_issues(
@@ -1715,14 +1733,47 @@ def _quarantine_message(code: str) -> str:
 
 
 def _chmod(path: Path, mode: int) -> None:
+    path = Path(path)
+    if mode not in {0o600, 0o700}:
+        raise ValueError("OneRoster ingestion mode must be owner-only.")
+    metadata = path.lstat()
+    expected_type = stat.S_ISDIR if mode == 0o700 else stat.S_ISREG
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        raise PermissionError("OneRoster ingestion path has an unsafe type.")
+    os.chmod(path, mode)
+    verified = path.lstat()
+    getuid = getattr(os, "getuid", None)
+    if path.is_symlink() or not expected_type(verified.st_mode):
+        raise PermissionError("OneRoster ingestion path changed type.")
+    if callable(getuid) and int(verified.st_uid) != int(getuid()):
+        raise PermissionError("OneRoster ingestion path is not owned by this user.")
+    if os.name == "posix" and stat.S_IMODE(verified.st_mode) != mode:
+        raise PermissionError("OneRoster ingestion path is not owner-only.")
+
+
+def _prepare_private_database(path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod(path.parent, 0o700)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError:
+        _chmod(path, 0o600)
+        return
+    try:
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    _chmod(path, 0o600)
 
 
 def _chmod_sqlite(path: Path) -> None:
     _chmod(path.parent, 0o700)
     for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
-        if candidate.exists():
+        if candidate.is_symlink() or candidate.exists():
             _chmod(candidate, 0o600)

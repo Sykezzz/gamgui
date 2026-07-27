@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from gamgui.components.oneroster import OneRosterService, SafetyLimits, SnapshotState
+from gamgui.components.oneroster import store as store_module
 from gamgui.components.oneroster.ingest import _preflight_members
+from gamgui.components.oneroster.store import OneRosterStore
 from tests.test_oneroster_helpers import valid_files, zip_bytes
 
 
@@ -194,3 +196,23 @@ def test_row_level_issue_amplification_is_summarized_and_bounded(
     assert snapshot.issue_count <= 5
     assert issues.total <= 5
     assert any(item["code"] == "OR-ISSUE-LIMIT" for item in issues.items)
+
+
+def test_oneroster_store_permission_failure_prevents_state_database_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "component"
+    original_chmod = store_module.os.chmod
+
+    def fail_root_chmod(candidate, mode):
+        if Path(candidate) == root:
+            raise PermissionError("policy denied")
+        return original_chmod(candidate, mode)
+
+    monkeypatch.setattr(store_module.os, "chmod", fail_root_chmod)
+
+    with pytest.raises(PermissionError, match="policy denied"):
+        OneRosterStore("example.org", root)
+
+    assert not (root / "state.db").exists()

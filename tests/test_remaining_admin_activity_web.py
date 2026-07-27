@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +141,77 @@ def test_owned_admin_mutations_refuse_a_concurrent_activity(tmp_path):
     assert builder_state.builder_sequence == [{"sentinel": True}]
     assert "Principal" not in runbooks.role_names()
     assert "District" not in signature_store.names()
+
+
+def test_calendar_group_fanout_holds_activity_until_background_work_finishes():
+    registry = ActivityRegistry()
+
+    class Connector:
+        def __init__(self) -> None:
+            self.acl_adds = 0
+            self.unshares = 0
+            self.release_subscriptions = False
+
+        async def add_calendar_acl_for(self, _cal, _target, role="reader"):
+            self.acl_adds += 1
+            return SimpleNamespace(ok=True, detail="")
+
+        async def list_group_members(self, _group):
+            return [
+                SimpleNamespace(email="one@example.com"),
+                SimpleNamespace(email="two@example.com"),
+            ]
+
+        async def subscribe_calendar_for(self, _email, _cal):
+            while not self.release_subscriptions:
+                await asyncio.sleep(0.01)
+            return SimpleNamespace(ok=True, detail="")
+
+        async def list_calendar_acls_for(self, _cal):
+            return []
+
+        async def remove_calendar_acl_for(self, _cal, _scope):
+            self.unshares += 1
+            return SimpleNamespace(ok=True, detail="")
+
+    connector = Connector()
+    state = SimpleNamespace(
+        activity_registry=registry,
+        connector=connector,
+        jobs={},
+    )
+
+    with _client(calendars_router, state) as client:
+        response = client.post(
+            "/calendars/share",
+            data={
+                "cal": "primary@example.com",
+                "target": "group:team@example.com",
+                "role": "reader",
+            },
+        )
+        assert response.status_code == 200
+        assert connector.acl_adds == 1
+        assert registry.snapshot().kind == "calendar-share"
+
+        refused = client.post(
+            "/calendars/unshare",
+            data={
+                "cal": "primary@example.com",
+                "scope": "one@example.com",
+            },
+        )
+        assert "CMP-ACTIVE-JOB" in refused.text
+        assert connector.unshares == 0
+
+        connector.release_subscriptions = True
+        deadline = time.monotonic() + 2
+        while registry.is_active() and time.monotonic() < deadline:
+            client.get("/calendars/share/status")
+            time.sleep(0.01)
+
+        assert not registry.is_active()
+        assert connector.acl_adds == 1
 
 
 def test_group_mutation_releases_lease_when_connector_fails():

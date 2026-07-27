@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -248,6 +249,58 @@ def _ready_service(tmp_path: Path) -> tuple[OneRosterService, str]:
     return service, snapshot.id
 
 
+def _claim_for_executor(
+    service: OneRosterService,
+    manifest,
+    executor: OneRosterExecutor,
+) -> None:
+    service.store.confirm_manifest(manifest.id, manifest.import_id)
+    service.store.claim_manifest(
+        manifest.id,
+        owner_id=executor._operation_owner,
+        owner_identity=executor._operation_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_refuses_gam_when_exact_manifest_claim_is_missing(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction(
+                "create",
+                "course_create",
+                "Section_999",
+                "teacher@example.org",
+                after=json.dumps(
+                    {
+                        "alias": "Section_999",
+                        "name": "Lease test",
+                        "owner_email": "teacher@example.org",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ),
+    )
+    executor = OneRosterExecutor(service.store, connector)
+
+    with pytest.raises(OneRosterError) as lost:
+        await executor._apply(
+            manifest.id,
+            owner_ids={"teacher@example.org": "teacher-id"},
+        )
+
+    assert lost.value.code == "OR-MANIFEST-LEASE-LOST"
+    assert connector.batches == []
+
+
 @pytest.mark.asyncio
 async def test_live_plan_resolves_directory_and_never_guesses_missing_users(tmp_path: Path):
     service, import_id = _ready_service(tmp_path)
@@ -462,6 +515,7 @@ async def test_persisted_apply_streams_at_most_fifty_actions(
     )
     monkeypatch.setattr(service.store, "get_manifest", reject_full_manifest)
     executor = OneRosterExecutor(service.store, connector, batch_size=500)
+    _claim_for_executor(service, manifest, executor)
 
     applied, failed, skipped = await executor._apply(
         manifest.id,
@@ -500,6 +554,7 @@ async def test_failed_batch_and_failed_roster_reread_never_verify_removal(
 
     action = next(item for item in manifest.actions if item.kind == action_kind)
     executor = OneRosterExecutor(service.store, connector)
+    _claim_for_executor(service, manifest, executor)
     applied, failed, skipped = await executor._apply(
         manifest.id,
         (action,),
@@ -530,6 +585,7 @@ async def test_applied_batch_with_omitted_verification_course_is_failed(
     manifest = service.persist_live_plan(plan).ordinary
     action = next(item for item in manifest.actions if item.kind == "student_add")
     executor = OneRosterExecutor(service.store, connector)
+    _claim_for_executor(service, manifest, executor)
 
     applied, failed, skipped = await executor._apply(
         manifest.id,
@@ -790,7 +846,10 @@ async def test_missing_prior_managed_alias_creates_separate_archive_plan(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_interrupted_manifest_never_auto_resumes(tmp_path: Path):
+async def test_interrupted_manifest_never_auto_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     root = tmp_path / "component"
     service = OneRosterService("example.org", root)
     snapshot = service.upload(zip_bytes(valid_files()))
@@ -802,6 +861,10 @@ async def test_interrupted_manifest_never_auto_resumes(tmp_path: Path):
     service.store.confirm_manifest(manifest.id, snapshot.id)
     service.store.claim_manifest(manifest.id)
 
+    monkeypatch.setattr(
+        "gamgui.components.oneroster.store.process_lease_is_dead",
+        lambda _pid, _identity: True,
+    )
     restarted = OneRosterService("example.org", root)
     restarted.mark_scope_ready()
     recovered = restarted.get_manifest(manifest.id)
@@ -822,6 +885,107 @@ async def test_interrupted_manifest_never_auto_resumes(tmp_path: Path):
     assert replacement.manifest_hash != manifest.manifest_hash
     assert replacement.status == "planned"
     assert not replacement.confirmed
+
+
+def test_live_manifest_claim_is_preserved_and_owner_checked(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction(
+                "action",
+                "student_add",
+                "Section_101",
+                "student@example.org",
+            ),
+        ),
+    )
+    service.store.confirm_manifest(manifest.id, import_id)
+    service.store.claim_manifest(manifest.id, owner_id="executor-a")
+
+    reopened = OneRosterService("example.org", service.store.root)
+    assert reopened.get_manifest_header(manifest.id).status == "running"
+    with pytest.raises(PermissionError, match="another executor"):
+        reopened.store.mark_action_result(
+            manifest.id,
+            "action",
+            status="applied",
+            owner_id="executor-b",
+        )
+    with pytest.raises(PermissionError, match="another executor"):
+        reopened.store.finish_manifest(
+            manifest.id,
+            status="interrupted",
+            owner_id="executor-b",
+        )
+
+    updated = service.store.mark_action_result(
+        manifest.id,
+        "action",
+        status="applied",
+        owner_id="executor-a",
+    )
+    assert updated is not None and updated.actions[0].status == "applied"
+    finished = service.store.finish_manifest(
+        manifest.id,
+        status="completed",
+        owner_id="executor-a",
+    )
+    assert finished.status == "completed"
+
+
+def test_legacy_manifest_schema_migrates_without_recovering_unknown_run(
+    tmp_path: Path,
+):
+    root = tmp_path / "legacy-component"
+    root.mkdir()
+    state = root / "state.db"
+    with sqlite3.connect(state) as connection:
+        connection.execute(
+            """
+            CREATE TABLE manifests (
+                id TEXT PRIMARY KEY, domain TEXT NOT NULL, import_id TEXT NOT NULL,
+                source_hash TEXT NOT NULL, config_hash TEXT NOT NULL,
+                live_hash TEXT NOT NULL, manifest_hash TEXT NOT NULL UNIQUE,
+                threshold_evaluation_hash TEXT NOT NULL, status TEXT NOT NULL,
+                created_at REAL NOT NULL, error TEXT NOT NULL,
+                plan_kind TEXT NOT NULL DEFAULT 'ordinary',
+                confirmed_at REAL NOT NULL DEFAULT 0,
+                threshold_evidence_json TEXT NOT NULL DEFAULT '{}',
+                exclusions_json TEXT NOT NULL DEFAULT '[]',
+                pilot_evidence_json TEXT NOT NULL DEFAULT '{}',
+                prepared_live_hash TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO manifests VALUES (
+                'legacy-manifest', 'example.org', 'legacy-import',
+                'source', 'config', 'live', ?, 'threshold', 'running',
+                1, '', 'ordinary', 1, '{}', '[]', '{}', ''
+            )
+            """,
+            ("a" * 64,),
+        )
+
+    store = OneRosterService("example.org", root).store
+
+    with sqlite3.connect(state) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(manifests)")
+        }
+        row = connection.execute(
+            """
+            SELECT status, run_owner, run_pid, run_identity
+            FROM manifests WHERE id = 'legacy-manifest'
+            """
+        ).fetchone()
+    assert {"run_owner", "run_pid", "run_identity"}.issubset(columns)
+    assert row == ("running", "", 0, "")
+    assert store.has_active_jobs()
 
 
 @pytest.mark.asyncio

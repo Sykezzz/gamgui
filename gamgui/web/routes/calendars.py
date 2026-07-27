@@ -413,9 +413,14 @@ async def share(request: Request, cal: Annotated[str, Form()], target: Annotated
                 _run_subscribe(job, conn, cal, emails, lease=lease)
             )
             lease_transferred = True
+            destination = (
+                "member's calendar"
+                if len(emails) == 1
+                else "members' calendars"
+            )
             notice = (
                 f"Shared with {target} — adding it to {len(emails)} "
-                f"member{'s' if len(emails) != 1 else ''} calendars now."
+                f"{destination} now."
             )
         elif kind == "group":
             notice = f"Shared with {target}, but that group has no members to add it for."

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -13,12 +14,19 @@ from pathlib import Path
 
 import pytest
 
+from gamgui.core.activation_lock import OwnerOnlyActivationLock
 from gamgui.core.updater import (
     ACTIVATION_APP_UPDATE,
+    ACTIVATION_PHASE_HEALTH_PASSED,
+    ACTIVATION_PHASE_PREPARED,
+    ACTIVATION_PHASE_SWAPPED,
+    ActivationJournal,
+    _managed_mac_build_environment,
     _extract_verified_archive,
     GitHubUpdateSource,
     LocalUpdateBuilder,
     LocalUpdateInstaller,
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
     UpdateCandidate,
     UpdateCoordinator,
     UpdateState,
@@ -40,6 +48,24 @@ from gamgui.core.components import (
 from gamgui.core.canary import CANARY_CHECK_NAMES, CanaryConfigStore
 
 SHA = "a" * 40
+TRANSACTION = "1" * 32
+
+
+def test_managed_mac_build_environment_includes_gui_missing_tool_paths():
+    environment = _managed_mac_build_environment(
+        {"PATH": "/custom/bin"},
+        home=Path("/Users/admin"),
+    )
+    paths = environment["PATH"].split(os.pathsep)
+
+    assert paths[:3] == [
+        "/Users/admin/.local/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+    assert "/usr/bin" in paths
+    assert paths[-1] == "/custom/bin"
+    assert len(paths) == len(set(paths))
 
 
 def _ready_state(pending: Path) -> UpdateState:
@@ -80,10 +106,43 @@ def test_update_state_round_trip(tmp_path):
         assert store.path.stat().st_mode & 0o777 == 0o600
 
 
+def test_update_state_round_trips_durable_activation_journal(tmp_path):
+    root = tmp_path / "updates"
+    transaction = "2" * 32
+    journal = ActivationJournal(
+        transaction_id=transaction,
+        candidate_sha=SHA,
+        phase=ACTIVATION_PHASE_PREPARED,
+        current_app=str((tmp_path / "Applications" / "GamGUI.app").resolve()),
+        pending_app=str((root / "pending" / "GamGUI.app").resolve()),
+        incoming_app=str((tmp_path / "Applications" / ".GamGUI.incoming").resolve()),
+        previous_app=str((tmp_path / "Applications" / ".GamGUI.previous").resolve()),
+        backup=str((root / "backups" / transaction).resolve()),
+        backup_app=str((root / "backups" / transaction / "GamGUI.app").resolve()),
+        backup_sidecar=str((root / "backups" / transaction / "old.json").resolve()),
+        candidate_sidecar=str((root / "backups" / transaction / "new.json").resolve()),
+        database_snapshot=str((root / "backups" / transaction / "database").resolve()),
+        health_marker=str((root / "health" / f"{transaction}.json").resolve()),
+    )
+    store = UpdateStateStore(root / "state.json")
+    state = UpdateState(
+        candidate_sha=SHA,
+        activation_transaction_id=transaction,
+        activation_journal=journal,
+    )
+
+    store.save(state)
+
+    assert store.load() == state
+
+
 def test_corrupt_state_fails_closed(tmp_path):
     path = tmp_path / "state.json"
     path.write_text("{", encoding="utf-8")
-    assert UpdateStateStore(path).load() == UpdateState()
+    state = UpdateStateStore(path).load()
+    assert state.activation_journal_invalid
+    assert state.component_error_code == "CMP-VERIFY-FAILED"
+    assert "recovery mode" in state.last_error
 
 
 def test_type_corrupt_state_is_sanitized(tmp_path):
@@ -99,6 +158,7 @@ def test_type_corrupt_state_is_sanitized(tmp_path):
                 "canary_result": "maybe",
                 "required_check_evidence": {"name": "update-ready"},
                 "retained_rollbacks": [1, "one", "two", "three"],
+                "component_prompt_answered": "false",
             }
         ),
         encoding="utf-8",
@@ -114,6 +174,7 @@ def test_type_corrupt_state_is_sanitized(tmp_path):
     assert state.canary_result == ""
     assert state.required_check_evidence == []
     assert state.retained_rollbacks == ["one", "two"]
+    assert state.component_prompt_answered is False
 
 
 def test_discover_requires_ready_check_on_exact_sha():
@@ -351,6 +412,9 @@ def test_candidate_canary_uses_disposable_data_root(monkeypatch, tmp_path):
         scratch = Path(kwargs["env"]["GAMGUI_APP_DATA_DIR"])
         seen_roots.append(scratch)
         assert scratch != live_data
+        assert kwargs["timeout"] == LOCAL_COMMAND_TIMEOUT_SECONDS
+        assert kwargs["env"]["GAMGUI_CANARY_DOMAIN"] == "example.edu"
+        assert kwargs["env"]["GAMGUI_CANARY_SUBJECT"] == "admin@example.edu"
         _database(scratch / "directory_index.db", "candidate")
         return subprocess.CompletedProcess(
             [],
@@ -516,6 +580,52 @@ def _app_bundle(
     return path
 
 
+def _write_candidate_health(
+    environment: dict[str, str],
+    pending: Path,
+) -> None:
+    artifact = verify_bundle_artifact(pending).artifact
+    marker = Path(environment["GAMGUI_UPDATE_HEALTH_MARKER"])
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "transaction_id": environment[
+                    "GAMGUI_ACTIVATION_TRANSACTION_ID"
+                ],
+                "sha": environment["GAMGUI_INSTALLED_SHA"],
+                "profile": artifact.profile,
+                "component_set_digest": artifact.component_set_digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_update_notice_requires_activation_evidence(monkeypatch, tmp_path):
+    from gamgui.web.server import _local_update_notice
+
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("GAMGUI_APP_DATA_DIR", str(data_root))
+    pending = _app_bundle(
+        data_root / "updates" / "pending" / SHA / "GamGUI.app",
+        "candidate",
+    )
+    store = UpdateStateStore()
+    store.save(UpdateState(candidate_sha=SHA, pending_app=str(pending)))
+
+    assert _local_update_notice() == ""
+
+    store.save(_ready_state(pending))
+    assert _local_update_notice() == (
+        "A verified update is ready. Quit and reopen GamGUI to install it."
+    )
+
+
 def _database(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as connection:
@@ -562,9 +672,8 @@ def test_installer_activates_exact_candidate_and_records_snapshot(tmp_path):
 
     def popen(argv, env):
         launches.append((argv, env))
-        marker = Path(env["GAMGUI_UPDATE_HEALTH_MARKER"])
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("ok\n", encoding="utf-8")
+        if env.get("GAMGUI_UPDATE_HEALTH_MARKER"):
+            _write_candidate_health(env, pending)
         return _Process()
 
     installer = LocalUpdateInstaller(
@@ -580,8 +689,163 @@ def test_installer_activates_exact_candidate_and_records_snapshot(tmp_path):
     assert state.installed_sha == SHA and not state.candidate_sha and not state.pending_app
     assert Path(state.schema_snapshot, "directory.db").is_file()
     assert len(state.retained_rollbacks) == 1
-    assert len(launches) == 1
+    assert len(launches) == 2
     assert launches[0][1]["GAMGUI_SKIP_UPDATE_ONCE"] == "1"
+    assert "GAMGUI_UPDATE_HEALTH_MARKER" in launches[0][1]
+    assert "GAMGUI_UPDATE_HEALTH_MARKER" not in launches[1][1]
+    assert "GAMGUI_ACTIVATION_PROBE" not in launches[1][1]
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    [
+        ACTIVATION_PHASE_PREPARED,
+        ACTIVATION_PHASE_SWAPPED,
+        ACTIVATION_PHASE_HEALTH_PASSED,
+    ],
+)
+
+
+def test_durable_journal_recovers_after_abrupt_exit_at_each_activation_phase(
+    crash_phase,
+    tmp_path,
+):
+    root = tmp_path / "data" / "updates"
+    data_root = tmp_path / "data"
+    current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
+    pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
+    database = data_root / "directory.db"
+    _database(database, "before")
+    backing = UpdateStateStore(root / "state.json")
+    backing.save(_ready_state(pending))
+
+    class CrashAfterJournalPhase:
+        crashed = False
+
+        def load(self):
+            return backing.load()
+
+        def save(self, state):
+            backing.save(state)
+            journal = state.activation_journal
+            if (
+                not self.crashed
+                and journal is not None
+                and journal.phase == crash_phase
+            ):
+                self.crashed = True
+                raise SystemExit(f"crash after {crash_phase}")
+
+    def popen(_argv, env):
+        _database(database, "candidate")
+        _write_candidate_health(env, pending)
+        return _Process()
+
+    crashed = LocalUpdateInstaller(
+        store=CrashAfterJournalPhase(),
+        root=root,
+        data_root=data_root,
+        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+        popen=popen,
+    )
+    with pytest.raises(SystemExit, match=crash_phase):
+        crashed.install(SHA, pending, current, health_timeout=0.1)
+
+    interrupted = backing.load()
+    assert interrupted.activation_journal is not None
+    assert interrupted.activation_journal.phase == crash_phase
+
+    recovery = LocalUpdateInstaller(
+        store=backing,
+        root=root,
+        data_root=data_root,
+        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    assert recovery.recover(
+        current_app=current,
+        transaction_id=interrupted.activation_journal.transaction_id,
+    )
+    assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
+    assert _database_value(database) == "before"
+    recovered = backing.load()
+    assert recovered.activation_journal is None
+    assert recovered.candidate_sha == ""
+    assert f"sha:{SHA}" in recovered.profile_blocklists[CORE_PROFILE]
+
+
+def test_installer_reverifies_incoming_copy_before_exchange(monkeypatch, tmp_path):
+    root = tmp_path / "data" / "updates"
+    data_root = tmp_path / "data"
+    current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
+    pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
+    store = UpdateStateStore(root / "state.json")
+    store.save(_ready_state(pending))
+    original_copytree = shutil.copytree
+
+    def tamper_incoming(source, destination, *args, **kwargs):
+        result = original_copytree(source, destination, *args, **kwargs)
+        target = Path(destination)
+        if target.name.endswith(".incoming"):
+            (target / "Contents" / "MacOS" / "GamGUI").write_text(
+                "tampered",
+                encoding="utf-8",
+            )
+        return result
+
+    monkeypatch.setattr("gamgui.core.updater.shutil.copytree", tamper_incoming)
+    installer = LocalUpdateInstaller(
+        store=store,
+        root=root,
+        data_root=data_root,
+        run=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    assert not installer.install(SHA, pending, current)
+    assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
+    state = store.load()
+    assert state.activation_journal is None
+    assert f"sha:{SHA}" in state.profile_blocklists[CORE_PROFILE]
+
+
+def test_installer_rejects_activation_lock_from_another_path(tmp_path):
+    root = tmp_path / "data" / "updates"
+    data_root = tmp_path / "data"
+    current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
+    pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
+    store = UpdateStateStore(root / "state.json")
+    store.save(_ready_state(pending))
+    wrong_lock = OwnerOnlyActivationLock.try_acquire(root / "other.lock")
+    assert wrong_lock is not None
+    try:
+        installer = LocalUpdateInstaller(
+            store=store,
+            root=root,
+            data_root=data_root,
+        )
+        assert not installer.install(
+            SHA,
+            pending,
+            current,
+            activation_lock=wrong_lock,
+        )
+    finally:
+        wrong_lock.release()
+    assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
+    assert store.load().candidate_sha == SHA
+
+
+def test_health_marker_from_exited_process_is_rejected(tmp_path):
+    marker = tmp_path / "health.json"
+    expected = {"ok": True, "sha": SHA}
+    marker.write_text(json.dumps(expected), encoding="utf-8")
+    installer = LocalUpdateInstaller(root=tmp_path)
+
+    assert not installer._wait_for_health(
+        marker,
+        _Process(returncode=0),
+        0.1,
+        expected,
+    )
 
 
 def test_installer_restores_app_and_database_when_health_fails(tmp_path):
@@ -618,7 +882,7 @@ def test_installer_restores_app_and_database_when_health_fails(tmp_path):
     assert _database_value(database) == "before"
     state = store.load()
     assert f"sha:{SHA}" in state.profile_blocklists[CORE_PROFILE]
-    assert "startup health" in state.last_error
+    assert "rolled back" in state.last_error
     assert len(launches) == 2
 
 
@@ -712,9 +976,7 @@ def test_state_commit_failure_restores_previous_app_and_database(tmp_path):
     def popen(_argv, env):
         marker = env.get("GAMGUI_UPDATE_HEALTH_MARKER")
         if marker:
-            marker = Path(marker)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text("ok\n", encoding="utf-8")
+            _write_candidate_health(env, pending)
         return _Process()
 
     installer = LocalUpdateInstaller(
@@ -739,7 +1001,9 @@ def test_state_failure_during_rollback_still_relaunches_previous_app(tmp_path):
     database = data_root / "directory.db"
     _database(database, "before")
     backing = UpdateStateStore(root / "state.json")
-    backing.save(_ready_state(pending))
+    ready = _ready_state(pending)
+    ready.activation_transaction_id = TRANSACTION
+    backing.save(ready)
 
     class FailEverySaveStore:
         def load(self):
@@ -764,10 +1028,16 @@ def test_state_failure_during_rollback_still_relaunches_previous_app(tmp_path):
         popen=popen,
     )
 
-    assert not installer.install(SHA, pending, current, health_timeout=0.01)
+    assert not installer.install(
+        SHA,
+        pending,
+        current,
+        health_timeout=0.01,
+        transaction_id=TRANSACTION,
+    )
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
     assert _database_value(database) == "before"
-    assert len(launches) == 2
+    assert len(launches) == 1
     assert launches[-1][1]["GAMGUI_SKIP_UPDATE_ONCE"] == "1"
 
 
@@ -812,30 +1082,28 @@ def test_installer_rejects_staged_state_without_both_activation_evidences(
     assert "required CI or canary evidence" in blocked.last_error
 
 
-def test_installer_restores_old_app_when_second_rename_fails(monkeypatch, tmp_path):
+def test_installer_restores_old_app_when_atomic_exchange_fails(monkeypatch, tmp_path):
+    from gamgui.core import updater as updater_module
+
     root = tmp_path / "data" / "updates"
     data_root = tmp_path / "data"
     current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
     pending = _app_bundle(root / "pending" / SHA / "GamGUI.app", "new")
     store = UpdateStateStore(root / "state.json")
     store.save(_ready_state(pending))
-    original_replace = os.replace
     failed = False
+    original_exchange = updater_module._atomic_exchange
 
-    def fail_second_swap(source, destination):
+    def fail_exchange(source, destination):
         nonlocal failed
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if (
-            not failed
-            and source_path.name.endswith(".incoming")
-            and destination_path == current
-        ):
+        if not failed:
+            assert Path(source) == current
+            assert Path(destination).name.endswith(".incoming")
             failed = True
-            raise OSError("simulated second rename failure")
-        return original_replace(source, destination)
+            raise OSError("simulated atomic exchange failure")
+        return original_exchange(source, destination)
 
-    monkeypatch.setattr("gamgui.core.updater.os.replace", fail_second_swap)
+    monkeypatch.setattr("gamgui.core.updater._atomic_exchange", fail_exchange)
     installer = LocalUpdateInstaller(
         store=store,
         root=root,
@@ -919,7 +1187,10 @@ def test_installer_does_not_restore_while_updated_process_may_be_running(tmp_pat
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "new"
     assert _database_value(database) == "candidate"
     state = store.load()
-    assert "restore deferred" in state.last_error
+    assert "recovery is pending" in state.last_error
+    assert state.candidate_sha == SHA
+    assert state.pending_app == str(pending)
+    assert state.activation_journal is not None
 
 
 def test_database_snapshot_excludes_updater_state(tmp_path):
@@ -975,4 +1246,5 @@ def test_health_marker(monkeypatch, tmp_path):
     marker = tmp_path / "health" / "ok"
     monkeypatch.setenv("GAMGUI_UPDATE_HEALTH_MARKER", str(marker))
     write_health_marker_from_environment()
-    assert marker.read_text(encoding="utf-8") == "ok\n"
+    assert json.loads(marker.read_text(encoding="utf-8")) == {"ok": True}
+    assert not list(marker.parent.glob("*.tmp"))

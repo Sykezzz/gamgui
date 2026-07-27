@@ -11,6 +11,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import stat
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Mapping, Optional, Sequence, TextIO
 
 from gamgui.core.paths import app_data_dir
+from gamgui.core.processes import current_process_identity, process_lease_is_dead
 
 from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
@@ -28,6 +30,7 @@ from .models import (
     DashboardStatus,
     GateState,
     ImportAction,
+    ImportIssue,
     IssueSeverity,
     ManifestPage,
     MAX_PAGE_SIZE,
@@ -67,10 +70,11 @@ class OneRosterStore:
         self.root = Path(root) if root is not None else default_component_data_root()
         self.snapshots_root = self.root / "snapshots"
         self.state_path = self.root / "state.db"
-        self.snapshots_root.mkdir(parents=True, exist_ok=True)
-        _chmod(self.root, 0o700)
-        _chmod(self.snapshots_root, 0o700)
+        _secure_private_directory(self.root, create=True)
+        _secure_private_directory(self.snapshots_root, create=True)
+        _prepare_private_database(self.state_path)
         self._init_state()
+        self.recover_interrupted()
         self._restrict_state_perms()
 
     def new_import(self, filename: str, *, now: Optional[float] = None) -> tuple[str, Path]:
@@ -786,17 +790,29 @@ class OneRosterStore:
         manifest_id: str,
         *,
         allow_awaiting_students: bool = False,
+        owner_id: str = "",
+        owner_pid: Optional[int] = None,
+        owner_identity: Optional[str] = None,
     ) -> ClassroomImportManifest:
+        pid = os.getpid() if owner_pid is None else int(owner_pid)
+        owner = owner_id.strip() or f"pid:{pid}"
+        identity = (
+            current_process_identity()
+            if owner_identity is None
+            else owner_identity
+        )
         allowed = ("planned", "awaiting_students") if allow_awaiting_students else ("planned",)
         placeholders = ",".join("?" for _ in allowed)
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 f"""
-                UPDATE manifests SET status = 'running', error = ''
+                UPDATE manifests
+                SET status = 'running', error = '', run_owner = ?,
+                    run_pid = ?, run_identity = ?
                 WHERE domain = ? AND id = ? AND confirmed_at > 0
                   AND status IN ({placeholders})
                 """,
-                (self.domain, manifest_id, *allowed),
+                (owner, pid, identity, self.domain, manifest_id, *allowed),
             )
             if result.rowcount != 1:
                 row = conn.execute(
@@ -821,36 +837,85 @@ class OneRosterStore:
                 )
         return self.get_manifest_header(manifest_id)
 
-    def mark_running_interrupted(self) -> int:
-        """Fail closed after a prior process exited while a manifest was running."""
-        with closing(self._conn()) as conn, conn:
-            result = conn.execute(
+    def owns_claim(self, manifest_id: str, owner_id: str) -> bool:
+        """Return whether the exact executor token still owns the running lease."""
+
+        with closing(self._conn()) as conn:
+            row = conn.execute(
                 """
-                UPDATE manifests
-                SET status = 'interrupted', error = 'OR-EXECUTION-INTERRUPTED'
+                SELECT 1 FROM manifests
+                WHERE domain = ? AND id = ? AND status = 'running'
+                  AND run_owner = ?
+                """,
+                (self.domain, manifest_id, owner_id),
+            ).fetchone()
+        return row is not None
+
+    def mark_running_interrupted(self) -> int:
+        """Backward-compatible alias for definite-death lease recovery."""
+
+        return self.recover_interrupted()
+
+    def recover_interrupted(self) -> int:
+        """Interrupt only manifests whose exact process lease is definitely dead."""
+
+        recovered = 0
+        with closing(self._conn()) as conn, conn:
+            running = conn.execute(
+                """
+                SELECT id, run_owner, run_pid, run_identity
+                FROM manifests
                 WHERE domain = ? AND status = 'running'
                 """,
                 (self.domain,),
-            )
-        return int(result.rowcount)
+            ).fetchall()
+            for manifest in running:
+                pid = int(manifest["run_pid"] or 0)
+                identity = str(manifest["run_identity"] or "")
+                if not process_lease_is_dead(pid, identity):
+                    continue
+                result = conn.execute(
+                    """
+                    UPDATE manifests
+                    SET status = 'interrupted',
+                        error = 'OR-EXECUTION-INTERRUPTED',
+                        run_owner = '', run_pid = 0, run_identity = ''
+                    WHERE domain = ? AND id = ? AND status = 'running'
+                      AND run_owner = ? AND run_pid = ? AND run_identity = ?
+                    """,
+                    (
+                        self.domain,
+                        manifest["id"],
+                        str(manifest["run_owner"] or ""),
+                        pid,
+                        identity,
+                    ),
+                )
+                recovered += int(result.rowcount)
+        if recovered:
+            self._restrict_state_perms()
+        return recovered
 
     def record_prepared_live_hash(
         self,
         manifest_id: str,
         live_hash: str,
+        *,
+        owner_id: str = "",
     ) -> ClassroomImportManifest:
         """Bind the student-release stage to the verified post-prep live state."""
 
         _validate_id(manifest_id)
         digest = _validate_digest(live_hash)
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 """
                 UPDATE manifests SET prepared_live_hash = ?
                 WHERE domain = ? AND id = ? AND status = 'running'
-                  AND prepared_live_hash = ''
+                  AND prepared_live_hash = '' AND run_owner = ?
                 """,
-                (digest, self.domain, manifest_id),
+                (digest, self.domain, manifest_id, owner),
             )
             if result.rowcount != 1:
                 raise OneRosterError(
@@ -1083,9 +1148,11 @@ class OneRosterStore:
         status: str,
         detail: str = "",
         load_manifest: bool = True,
+        owner_id: str = "",
     ) -> Optional[ClassroomImportManifest]:
         if status not in {"applied", "failed", "skipped"}:
             raise ValueError("Manifest action result must be applied, failed, or skipped.")
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 """
@@ -1093,13 +1160,32 @@ class OneRosterStore:
                 WHERE manifest_id = ? AND action_id = ?
                   AND EXISTS (
                     SELECT 1 FROM manifests WHERE id = ? AND domain = ?
-                      AND status IN ('planned', 'running', 'interrupted')
+                      AND status = 'running' AND run_owner = ?
                   )
                 """,
-                (status, detail, manifest_id, action_id, manifest_id, self.domain),
+                (
+                    status,
+                    detail,
+                    manifest_id,
+                    action_id,
+                    manifest_id,
+                    self.domain,
+                    owner,
+                ),
             )
             if result.rowcount != 1:
-                raise KeyError("Pending OneRoster manifest action not found.")
+                exists = conn.execute(
+                    """
+                    SELECT 1 FROM manifest_actions
+                    WHERE manifest_id = ? AND action_id = ?
+                    """,
+                    (manifest_id, action_id),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError("Pending OneRoster manifest action not found.")
+                raise PermissionError(
+                    "The OneRoster manifest lease is owned by another executor."
+                )
         return self.get_manifest(manifest_id) if load_manifest else None
 
     def finish_manifest(
@@ -1109,6 +1195,7 @@ class OneRosterStore:
         status: str,
         error: str = "",
         load_actions: bool = True,
+        owner_id: str = "",
     ) -> ClassroomImportManifest:
         if status not in {
             "completed",
@@ -1119,16 +1206,28 @@ class OneRosterStore:
             "awaiting_students",
         }:
             raise ValueError("Invalid OneRoster manifest terminal status.")
+        owner = owner_id.strip() or f"pid:{os.getpid()}"
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 """
-                UPDATE manifests SET status = ?, error = ?
+                UPDATE manifests
+                SET status = ?, error = ?,
+                    run_owner = '', run_pid = 0, run_identity = ''
                 WHERE domain = ? AND id = ?
+                  AND (status != 'running' OR run_owner = ?)
                 """,
-                (status, error, self.domain, manifest_id),
+                (status, error, self.domain, manifest_id, owner),
             )
             if result.rowcount != 1:
-                raise KeyError("OneRoster import manifest not found.")
+                exists = conn.execute(
+                    "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                    (self.domain, manifest_id),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError("OneRoster import manifest not found.")
+                raise PermissionError(
+                    "The OneRoster manifest lease is owned by another executor."
+                )
         return (
             self.get_manifest(manifest_id)
             if load_actions
@@ -1436,16 +1535,23 @@ class OneRosterStore:
             )
 
     def _conn(self) -> sqlite3.Connection:
+        _prepare_private_database(self.state_path)
         conn = sqlite3.connect(str(self.state_path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._restrict_state_perms()
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def _init_state(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.snapshots_root.mkdir(parents=True, exist_ok=True)
+        _secure_private_directory(self.root, create=True)
+        _secure_private_directory(self.snapshots_root, create=True)
+        _prepare_private_database(self.state_path)
         with closing(self._conn()) as conn, conn:
             conn.executescript(
                 """
@@ -1485,7 +1591,10 @@ class OneRosterStore:
                     threshold_evidence_json TEXT NOT NULL DEFAULT '{}',
                     exclusions_json TEXT NOT NULL DEFAULT '[]',
                     pilot_evidence_json TEXT NOT NULL DEFAULT '{}',
-                    prepared_live_hash TEXT NOT NULL DEFAULT ''
+                    prepared_live_hash TEXT NOT NULL DEFAULT '',
+                    run_owner TEXT NOT NULL DEFAULT '',
+                    run_pid INTEGER NOT NULL DEFAULT 0,
+                    run_identity TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS manifest_actions (
                     manifest_id TEXT NOT NULL, action_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -1551,6 +1660,24 @@ class OneRosterStore:
                 "prepared_live_hash",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            _ensure_column(
+                conn,
+                "manifests",
+                "run_owner",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                conn,
+                "manifests",
+                "run_pid",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                conn,
+                "manifests",
+                "run_identity",
+                "TEXT NOT NULL DEFAULT ''",
+            )
 
     def _restrict_state_perms(self) -> None:
         _chmod(self.root, 0o700)
@@ -1560,7 +1687,7 @@ class OneRosterStore:
             Path(f"{self.state_path}-wal"),
             Path(f"{self.state_path}-shm"),
         ):
-            if candidate.exists():
+            if candidate.is_symlink() or candidate.exists():
                 _chmod(candidate, 0o600)
 
 
@@ -1573,12 +1700,18 @@ def _snapshot_conn(path: Path) -> sqlite3.Connection:
 
 
 def _snapshot_write_conn(path: Path) -> sqlite3.Connection:
+    _prepare_private_database(path)
     conn = sqlite3.connect(str(path), timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        _secure_sqlite_files(path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _managed_aliases_from_snapshot(path: Path, domain: str) -> tuple[str, ...]:
@@ -1973,7 +2106,68 @@ def _remove_tree(target: Path, allowed_parent: Path) -> None:
 
 
 def _chmod(path: Path, mode: int) -> None:
+    path = Path(path)
+    metadata = path.lstat()
+    expected_type = stat.S_ISDIR if mode == 0o700 else stat.S_ISREG
+    if mode not in {0o600, 0o700}:
+        raise ValueError("OneRoster persistence mode must be owner-only.")
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        raise PermissionError("OneRoster persistence path has an unsafe type.")
+    os.chmod(path, mode)
+    _verify_owner_only(path, expected_mode=mode, directory=mode == 0o700)
+
+
+def _prepare_private_database(path: Path) -> None:
+    """Create an owner-only SQLite file before any roster PII can be written."""
+
+    path = Path(path)
+    _secure_private_directory(path.parent, create=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError:
+        _secure_private_file(path)
+        return
+    try:
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    _secure_private_file(path)
+
+
+def _secure_sqlite_files(path: Path) -> None:
+    _secure_private_directory(path.parent)
+    for candidate in (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+    ):
+        if candidate.is_symlink() or candidate.exists():
+            _secure_private_file(candidate)
+
+
+def _secure_private_directory(path: Path, *, create: bool = False) -> None:
+    path = Path(path)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    _chmod(path, 0o700)
+
+
+def _secure_private_file(path: Path) -> None:
+    _chmod(Path(path), 0o600)
+
+
+def _verify_owner_only(path: Path, *, expected_mode: int, directory: bool) -> None:
+    metadata = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        raise PermissionError("OneRoster persistence changed type unexpectedly.")
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and int(metadata.st_uid) != int(getuid()):
+        raise PermissionError("OneRoster persistence is not owned by this user.")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise PermissionError("OneRoster persistence is not owner-only.")

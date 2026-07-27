@@ -53,6 +53,12 @@ def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
     assert 'make app PROFILE="${{ matrix.profile }}"' in workflow
     assert "name: update-ready" in workflow
     assert "needs: [verify-sha, test, gam-contracts, updater-and-build]" in workflow
+    assert '"$VALIDATED_SHA:refs/heads/update-ready"' in workflow
+    assert "group: post-merge-update-ready" in workflow
+    assert "cancel-in-progress: true" in workflow
+    assert 'git fetch origin district-main:refs/remotes/origin/district-main' in workflow
+    assert 'test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"' in workflow
+    assert "--force" not in workflow
 
 
 def test_ci_dispatches_post_merge_validation_only_for_district_main_push():
@@ -63,6 +69,11 @@ def test_ci_dispatches_post_merge_validation_only_for_district_main_push():
     assert 'scripts/bump_gam.py --tag "$LATEST"' in workflow
     assert "profile: [core, classroom-oneroster]" in workflow
     assert 'make app PROFILE="${{ matrix.profile }}"' in workflow
+    assert "macos-build-smoke-required:" in workflow
+    assert "name: macOS application build smoke\n" in workflow
+    assert "needs: macos-build-smoke" in workflow
+    assert "MATRIX_RESULT: ${{ needs.macos-build-smoke.result }}" in workflow
+    assert 'test "$MATRIX_RESULT" = "success"' in workflow
 
 
 def test_post_merge_latest_contract_is_pinned_before_download():
@@ -80,6 +91,11 @@ def test_repository_activation_script_enables_only_required_maintenance_settings
     assert '"allow_force_pushes": false' in script
     assert '"allow_deletions": false' in script
     assert "gh repo sync" not in script
+    assert '"macOS application build smoke"' in script
+
+    workflow = _workflow("ci.yml")
+    assert "macos-build-smoke-required:" in workflow
+    assert "name: macOS application build smoke\n" in workflow
 
 
 def test_workflow_actions_are_immutable_and_dependencies_are_locked():

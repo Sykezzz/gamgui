@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -28,32 +29,31 @@ def default_operation_path() -> Path:
 class DriveOperationStore:
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = Path(path) if path else default_operation_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
+        _prepare_private_database(self.path)
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
+        _prepare_private_database(self.path)
         conn = sqlite3.connect(str(self.path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        self._secure_files()
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._secure_files()
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def _secure_files(self) -> None:
+        _secure_private_directory(self.path.parent)
         for candidate in (
             self.path,
             Path(f"{self.path}-wal"),
             Path(f"{self.path}-shm"),
         ):
-            try:
-                if candidate.exists():
-                    os.chmod(candidate, 0o600)
-            except OSError:
-                pass
+            if candidate.is_symlink() or candidate.exists():
+                _secure_private_file(candidate)
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -392,3 +392,57 @@ class DriveOperationStore:
                         """,
                         (operation["id"],),
                     )
+
+
+def _prepare_private_database(path: Path) -> None:
+    """Create an owner-only SQLite file before any Drive identifiers are stored."""
+
+    path = Path(path)
+    _secure_private_directory(path.parent, create=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError:
+        _secure_private_file(path)
+        return
+    try:
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    _secure_private_file(path)
+
+
+def _secure_private_directory(path: Path, *, create: bool = False) -> None:
+    path = Path(path)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise PermissionError("Drive operation data directory is not a private directory.")
+    os.chmod(path, 0o700)
+    _verify_owner_only(path, expected_mode=0o700, directory=True)
+
+
+def _secure_private_file(path: Path) -> None:
+    path = Path(path)
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError("Drive operation data path is not a private file.")
+    os.chmod(path, 0o600)
+    _verify_owner_only(path, expected_mode=0o600, directory=False)
+
+
+def _verify_owner_only(path: Path, *, expected_mode: int, directory: bool) -> None:
+    metadata = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        raise PermissionError("Drive operation persistence changed type unexpectedly.")
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and int(metadata.st_uid) != int(getuid()):
+        raise PermissionError("Drive operation persistence is not owned by this user.")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise PermissionError("Drive operation persistence is not owner-only.")

@@ -29,6 +29,7 @@ from gamgui.core.drive.models import (
     OperationTarget,
     TransferResult,
 )
+from gamgui.core.drive import operations as operations_module
 from gamgui.core.drive.operations import DriveOperationStore
 from gamgui.core.drive.service import (
     DriveSafetyError,
@@ -632,6 +633,36 @@ def test_stale_drive_owner_cannot_write_target_or_terminal_status(tmp_path):
     unchanged = store.get("manifest-1", "example.com")
     assert unchanged.status == "running"
     assert unchanged.targets[0].status == "pending"
+
+
+def test_drive_store_permission_failure_prevents_database_creation(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "private" / "ops.db"
+    original_chmod = operations_module.os.chmod
+
+    def fail_directory_chmod(candidate, mode):
+        if Path(candidate) == path.parent:
+            raise PermissionError("policy denied")
+        return original_chmod(candidate, mode)
+
+    monkeypatch.setattr(operations_module.os, "chmod", fail_directory_chmod)
+
+    with pytest.raises(PermissionError, match="policy denied"):
+        DriveOperationStore(path)
+
+    assert not path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owner-only mode assertion")
+def test_drive_store_uses_owner_only_directory_and_database_modes(tmp_path):
+    path = tmp_path / "private" / "ops.db"
+
+    DriveOperationStore(path)
+
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 class TooLargeTreeClient(FakeDriveClient):

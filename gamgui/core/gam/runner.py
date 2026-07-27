@@ -15,8 +15,10 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, List, Optional, Sequence
+from typing import AsyncIterator, Optional, Sequence
 
+from ..activity import ActivityRegistry
+from ..activity import activity_registry as global_activity_registry
 from ..secrets.ephemeral import EphemeralConfig
 from ..secrets.vault import SecretsVault
 from .errors import GAMError, GAMErrorKind
@@ -159,11 +161,17 @@ class GAMRunner:
         gam_binary: Optional[Path] = None,
         base_dir: Optional[Path] = None,
         timeout: float = DEFAULT_TIMEOUT,
+        activity_registry: Optional[ActivityRegistry] = None,
     ) -> None:
         self.vault = vault
         self.gam_binary = Path(gam_binary) if gam_binary else locate_gam_binary()
         self.base_dir = base_dir
         self.timeout = timeout
+        self.activity_registry = (
+            activity_registry
+            if activity_registry is not None
+            else global_activity_registry
+        )
         # Serializes mutating calls so two writes can't race the same ephemeral GAMCFGDIR.
         self._write_lock = asyncio.Lock()
 
@@ -183,15 +191,33 @@ class GAMRunner:
         env.setdefault("GAM_NO_UPDATE_CHECK", "1")
         return env
 
+    def _subprocess_options(
+        self,
+        pass_fds: tuple[int, ...],
+    ) -> dict[str, object]:
+        if not pass_fds:
+            return {}
+        if os.name != "posix":
+            raise RuntimeError(
+                "Durable administrative activity descriptors cannot be "
+                "inherited on this platform."
+            )
+        return {
+            "close_fds": True,
+            "pass_fds": pass_fds,
+        }
+
     async def _exec(self, argv: Sequence[str], cfgdir: Path, timeout: float) -> RunResult:
         self._require_binary()
-        proc = await asyncio.create_subprocess_exec(
-            str(self.gam_binary),
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._build_env(cfgdir),
-        )
+        with self.activity_registry.subprocess_pass_fds() as pass_fds:
+            proc = await asyncio.create_subprocess_exec(
+                str(self.gam_binary),
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._build_env(cfgdir),
+                **self._subprocess_options(pass_fds),
+            )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -217,13 +243,15 @@ class GAMRunner:
     ) -> RunResult:
         self._require_binary()
         with stdout_path.open("wb", buffering=0) as stdout_file:
-            proc = await asyncio.create_subprocess_exec(
-                str(self.gam_binary),
-                *argv,
-                stdout=stdout_file,
-                stderr=asyncio.subprocess.PIPE,
-                env=self._build_env(cfgdir),
-            )
+            with self.activity_registry.subprocess_pass_fds() as pass_fds:
+                proc = await asyncio.create_subprocess_exec(
+                    str(self.gam_binary),
+                    *argv,
+                    stdout=stdout_file,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=self._build_env(cfgdir),
+                    **self._subprocess_options(pass_fds),
+                )
             try:
                 _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:

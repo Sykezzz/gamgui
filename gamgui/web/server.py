@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -43,6 +44,7 @@ from ..core.components import (
     ComponentManager,
     ONEROSTER_COMPONENT,
     ONEROSTER_PROFILE,
+    component_ids_for_profile,
 )
 from ..core.directory_index import (
     DEFAULT_STALE_SECONDS,
@@ -60,8 +62,14 @@ from ..core.drive import (
     ServiceAccountTokenProvider,
 )
 from ..core.secrets.ephemeral import sweep_stale_configs
-from ..core.secrets.vault import SecretsVault
-from ..core.updater import UpdateStateStore
+from ..core.secrets.vault import InMemoryBackend, SecretsVault
+from ..core.updater import (
+    ACTIVATION_PROBE_ENV,
+    ACTIVATION_TRANSACTION_ENV,
+    UpdateStateStore,
+    activation_evidence_valid,
+    candidate_is_blocked,
+)
 from ..core.usercache import UserCache
 from .limits import RequestBodyLimitMiddleware
 
@@ -76,8 +84,13 @@ def _local_update_notice() -> str:
         state = UpdateStateStore().load()
     except (OSError, RuntimeError):
         return ""
-    if state.pending_app and state.candidate_sha:
-        return "A verified update is ready and will install after the app closes."
+    if (
+        state.pending_app
+        and state.candidate_sha
+        and activation_evidence_valid(state)
+        and not candidate_is_blocked(state)
+    ):
+        return "A verified update is ready. Quit and reopen GamGUI to install it."
     if state.last_error:
         return "The automatic update could not be prepared. This version is still running normally."
     return ""
@@ -112,6 +125,7 @@ class AppState:
     oneroster_manifest_errors: dict = field(default_factory=dict, repr=False)
     oneroster_gate_task: Optional[asyncio.Task] = field(default=None, repr=False)
     oneroster_gate_error: str = ""
+    activation_probe_mode: bool = False
     activity_registry: ActivityRegistry = field(
         default_factory=lambda: global_activity_registry,
         repr=False,
@@ -127,6 +141,11 @@ class AppState:
 
     def __post_init__(self) -> None:
         self.ensure_component_manager()
+        if self.activation_probe_mode:
+            # The activation page needs only sealed component metadata. Binding
+            # optional services here would perform redundant projection work
+            # before the page-loaded health decision.
+            return
         if self.connector is not None:
             self.ensure_directory_index()
             self.ensure_workspace_services()
@@ -166,6 +185,153 @@ class AppState:
             status.enabled
             and ONEROSTER_COMPONENT in status.installed_components
         )
+
+    def update_activation_ready(self) -> bool:
+        """Require the swapped candidate profile to initialize before health."""
+
+        return self.update_activation_health_payload() is not None
+
+    def update_activation_health_payload(self) -> Optional[dict[str, object]]:
+        """Return transaction-bound health evidence, or ``None`` when unsafe."""
+
+        marker_value = os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER", "")
+        if not marker_value:
+            return None
+        manager = self.ensure_component_manager()
+        embedded = getattr(manager, "embedded", None)
+        if embedded is None:
+            return None
+        projection = manager.runtime_projection()
+        if projection is not None:
+            activating = getattr(projection, "installed_artifact", None)
+            if activating is None:
+                return None
+            installed_components = set(
+                getattr(projection, "installed_components", ()) or ()
+            )
+            enabled_components = set(
+                getattr(projection, "enabled_components", ()) or ()
+            )
+            if (
+                embedded.artifact.profile != activating.profile
+                or embedded.artifact.component_set_digest
+                != activating.component_set_digest
+                or installed_components
+                != set(component_ids_for_profile(activating.profile))
+            ):
+                return None
+            if activating.profile == ONEROSTER_PROFILE:
+                if self.oneroster_error_code == "CMP-INCOMPATIBLE":
+                    return None
+                if (
+                    ONEROSTER_COMPONENT in enabled_components
+                    and self.audit_domain
+                    and self.oneroster_service is None
+                ):
+                    return None
+            return {
+                "ok": True,
+                "transaction_id": os.environ.get(
+                    ACTIVATION_TRANSACTION_ENV,
+                    "",
+                ),
+                "sha": activating.source_sha,
+                "profile": activating.profile,
+                "component_set_digest": activating.component_set_digest,
+            }
+
+        # The installed legacy updater predates transaction-bound profiles. It
+        # may bootstrap Core only; any optional-profile transition requires the
+        # validated projection above.
+        state = manager.store.load()
+        expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+        try:
+            expected_marker = (
+                Path(manager.store.path).parent
+                / "health"
+                / f"{expected_sha}.ok"
+            ).resolve()
+            marker_matches = Path(marker_value).resolve() == expected_marker
+        except (AttributeError, OSError, ValueError):
+            marker_matches = False
+        if (
+            os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") != "1"
+            or os.environ.get(ACTIVATION_PROBE_ENV)
+            or embedded.artifact.profile != "core"
+            or embedded.artifact.source_sha != expected_sha
+            or state.candidate_sha != expected_sha
+            or not marker_matches
+            or state.canary_result != "passed"
+            or "update-ready" not in state.required_check_evidence
+            or candidate_is_blocked(state)
+        ):
+            return None
+        return {
+            "ok": True,
+            "transaction_id": "",
+            "sha": expected_sha,
+            "profile": embedded.artifact.profile,
+            "component_set_digest": embedded.artifact.component_set_digest,
+        }
+
+    def activation_probe_pending(self) -> bool:
+        transaction_probe = os.environ.get(ACTIVATION_PROBE_ENV) == "1"
+        legacy_health_start = bool(
+            os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
+            and os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1"
+        )
+        if not transaction_probe and not legacy_health_start:
+            return False
+        expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+        state = self.ensure_component_manager().store.load()
+        return bool(
+            state.candidate_sha == expected_sha
+            or state.installed_sha != expected_sha
+        )
+
+    async def _wait_for_activation_commit(self) -> None:
+        """Enable background work only after the helper commits candidate state."""
+
+        for _attempt in range(600):
+            if not self.activation_probe_pending():
+                state = self.ensure_component_manager().store.load()
+                expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+                if state.installed_sha == expected_sha and not state.candidate_sha:
+                    if self.activation_probe_mode:
+                        if not await self._rehydrate_after_activation():
+                            return
+                    self._schedule_oneroster_gate()
+                return
+            await asyncio.sleep(0.1)
+
+    async def _rehydrate_after_activation(self) -> bool:
+        """Bind the committed app to Workspace only after activation is durable."""
+
+        if not self.activation_probe_mode:
+            return True
+        try:
+            hydrated = await asyncio.to_thread(
+                type(self).create,
+                token=self.token,
+            )
+        except Exception:
+            self.oneroster_gate_error = "CMP-AUTH-REQUIRED"
+            return False
+        for descriptor in dataclass_fields(self):
+            setattr(self, descriptor.name, getattr(hydrated, descriptor.name))
+        return True
+
+    def _schedule_activation_commit_watch(self) -> None:
+        if not self.activation_probe_pending():
+            self._schedule_oneroster_gate()
+            return
+        try:
+            asyncio.get_running_loop().create_task(
+                self._wait_for_activation_commit(),
+                name="activation-commit-watch",
+            )
+        except RuntimeError:
+            pass
 
     def ensure_component_services(self) -> None:
         """Bind optional local services without accessing GAM, Google, or Keychain."""
@@ -217,6 +383,8 @@ class AppState:
     def _schedule_oneroster_gate(self) -> None:
         """Start the local scheduler without reading Workspace data at discovery time."""
 
+        if self.activation_probe_pending():
+            return
         if self.oneroster_service is None or self.connector is None:
             return
         current = self.oneroster_gate_task
@@ -731,6 +899,7 @@ class AppState:
         vault: Optional[SecretsVault] = None,
         token: Optional[str] = None,
         preferred_domain: str = "",
+        allow_first_run_workspace_access: bool = False,
     ) -> "AppState":
         sweep_stale_configs()  # clean up any credential temp dirs orphaned by a prior crash/kill
         vault = vault or SecretsVault()
@@ -741,7 +910,10 @@ class AppState:
         # First launch deliberately presents Optional Features before touching the
         # Workspace Keychain. Choosing Skip or staging the full profile records the
         # preference; subsequent launches may discover existing Workspace credentials.
-        if component_manager.first_run_choice_pending():
+        if (
+            component_manager.first_run_choice_pending()
+            and not allow_first_run_workspace_access
+        ):
             domain = ""
         else:
             domains = vault.list_domains()
@@ -764,6 +936,27 @@ class AppState:
             directory_index=DirectoryIndex(default_directory_index_path(), domain) if domain else None,
             component_manager=component_manager,
             activity_registry=global_activity_registry,
+        )
+
+    @classmethod
+    def create_activation_probe(
+        cls,
+        token: Optional[str] = None,
+    ) -> "AppState":
+        """Create a sealed-profile health state with no Keychain or GAM access."""
+
+        vault = SecretsVault(backend=InMemoryBackend(), cache_ttl=0)
+        runner = GAMRunner(vault=vault)
+        component_manager = ComponentManager(
+            registry=global_activity_registry,
+        )
+        return cls(
+            vault=vault,
+            runner=runner,
+            token=token or secrets.token_urlsafe(24),
+            component_manager=component_manager,
+            activity_registry=global_activity_registry,
+            activation_probe_mode=True,
         )
 
 
@@ -859,10 +1052,38 @@ class PrivacyTimingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class ActivationProbeGateMiddleware(BaseHTTPMiddleware):
+    """Keep the health-start process read-only until activation is committed."""
+
+    def __init__(self, app, state: AppState) -> None:
+        super().__init__(app)
+        self._state = state
+
+    async def dispatch(self, request: Request, call_next):
+        probe_active = (
+            self._state.activation_probe_mode
+            or self._state.activation_probe_pending()
+        )
+        method = request.method.upper()
+        path = request.url.path
+        if probe_active and not (
+            method in {"GET", "HEAD", "OPTIONS"}
+            and path in {"/", "/healthz"}
+        ):
+            return JSONResponse(
+                {
+                    "error": "The verified update is finishing activation.",
+                    "code": "CMP-ACTIVE-JOB",
+                },
+                status_code=409,
+            )
+        return await call_next(request)
+
+
 def create_app(state: AppState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        state._schedule_oneroster_gate()
+        state._schedule_activation_commit_watch()
         yield
         await state.aclose()
 
@@ -881,6 +1102,7 @@ def create_app(state: AppState) -> FastAPI:
         maximum_bytes=(250 * 1024 * 1024) + (1024 * 1024),
     )
     app.add_middleware(PrivacyTimingMiddleware)
+    app.add_middleware(ActivationProbeGateMiddleware, state=state)
     app.add_middleware(TokenGateMiddleware, token=state.token)
     # Ensure the dir exists before mounting — a fresh clone or a stripped bundle may lack it,
     # and StaticFiles raises on a missing directory.
@@ -895,6 +1117,17 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
         st: AppState = request.app.state.gamgui
+        if st.activation_probe_mode:
+            return HTMLResponse(
+                """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="2">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GamGUI update</title></head>
+<body><main><h1>Finishing verified update</h1>
+<p>GamGUI is validating the installed profile. Workspace access remains paused.</p>
+</main></body></html>"""
+            )
         manager = st.ensure_component_manager()
         component_status = manager.status()
         if (

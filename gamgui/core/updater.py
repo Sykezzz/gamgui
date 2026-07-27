@@ -8,6 +8,7 @@ import inspect
 import os
 import plistlib
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -17,11 +18,13 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+import ctypes
 from contextlib import closing
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Optional
 
+from .activation_lock import OwnerOnlyActivationLock
 from .activity import ActivityBusyError, ActivityRegistry, activity_registry
 from .components import (
     CORE_PROFILE,
@@ -45,6 +48,7 @@ READY_CHECK = "update-ready"
 MAX_RETAINED_BACKUPS = 2
 BACKUP_MAX_AGE_DAYS = 30
 HEALTH_TIMEOUT_SECONDS = 45.0
+LOCAL_COMMAND_TIMEOUT_SECONDS = 30 * 60
 DISK_SPACE_RESERVE_BYTES = 256 * 1024 * 1024
 LOCAL_SIGNING_IDENTITY = "GamGUI Local"
 INSTALLED_SOURCE_EVIDENCE = "installed-source"
@@ -52,6 +56,23 @@ VERIFIED_FILE_EVIDENCE = "verified-file"
 ACTIVATION_APP_UPDATE = "app-update"
 ACTIVATION_COMPONENT_SWAP = "component-swap"
 ACTIVATION_VERIFIED_FILE = "verified-file"
+ACTIVATION_TRANSACTION_ENV = "GAMGUI_ACTIVATION_TRANSACTION_ID"
+ACTIVATION_PROBE_ENV = "GAMGUI_ACTIVATION_PROBE"
+ACTIVATION_CURRENT_APP_ENV = "GAMGUI_UPDATE_CURRENT_APP"
+ACTIVATION_RECOVERY_ENV = "GAMGUI_ACTIVATION_RECOVERY_PENDING"
+ACTIVATION_PHASE_PREPARED = "prepared"
+ACTIVATION_PHASE_SWAPPED = "swapped"
+ACTIVATION_PHASE_HEALTH_PASSED = "health-passed"
+ACTIVATION_PHASE_RECOVERY_REQUIRED = "recovery-required"
+ACTIVATION_PHASES = frozenset(
+    {
+        ACTIVATION_PHASE_PREPARED,
+        ACTIVATION_PHASE_SWAPPED,
+        ACTIVATION_PHASE_HEALTH_PASSED,
+        ACTIVATION_PHASE_RECOVERY_REQUIRED,
+    }
+)
+HEALTH_STABILITY_SECONDS = 0.25
 
 
 @dataclass(frozen=True)
@@ -59,6 +80,76 @@ class UpdateCandidate:
     sha: str
     html_url: str
     successful_checks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ActivationJournal:
+    """Durable paths needed to restore a pre-activation app and database."""
+
+    transaction_id: str
+    candidate_sha: str
+    phase: str
+    current_app: str
+    pending_app: str
+    incoming_app: str
+    previous_app: str
+    backup: str
+    backup_app: str
+    backup_sidecar: str
+    candidate_sidecar: str
+    database_snapshot: str
+    health_marker: str
+
+    @classmethod
+    def from_json(cls, value: object) -> "ActivationJournal":
+        if not isinstance(value, dict):
+            raise ValueError("Activation journal is not an object.")
+
+        def text(key: str, limit: int = 4096) -> str:
+            raw = value.get(key, "")
+            return raw[:limit] if isinstance(raw, str) else ""
+
+        journal = cls(
+            transaction_id=text("transaction_id", 32).lower(),
+            candidate_sha=text("candidate_sha", 40).lower(),
+            phase=text("phase", 32),
+            current_app=text("current_app"),
+            pending_app=text("pending_app"),
+            incoming_app=text("incoming_app"),
+            previous_app=text("previous_app"),
+            backup=text("backup"),
+            backup_app=text("backup_app"),
+            backup_sidecar=text("backup_sidecar"),
+            candidate_sidecar=text("candidate_sidecar"),
+            database_snapshot=text("database_snapshot"),
+            health_marker=text("health_marker"),
+        )
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", journal.transaction_id)
+            or not _valid_sha(journal.candidate_sha)
+            or journal.phase not in ACTIVATION_PHASES
+        ):
+            raise ValueError("Activation journal identity is invalid.")
+        path_values = (
+            journal.current_app,
+            journal.pending_app,
+            journal.incoming_app,
+            journal.previous_app,
+            journal.backup,
+            journal.backup_app,
+            journal.backup_sidecar,
+            journal.candidate_sidecar,
+            journal.database_snapshot,
+            journal.health_marker,
+        )
+        if any(not value or not Path(value).is_absolute() for value in path_values):
+            raise ValueError("Activation journal paths are invalid.")
+        return journal
+
+    def with_phase(self, phase: str) -> "ActivationJournal":
+        if phase not in ACTIVATION_PHASES:
+            raise ValueError("Activation journal phase is invalid.")
+        return replace(self, phase=phase)
 
 
 @dataclass
@@ -91,6 +182,9 @@ class UpdateState:
     component_prompt_answered: bool = False
     component_operation: str = ""
     component_error_code: str = ""
+    activation_transaction_id: str = ""
+    activation_journal: Optional[ActivationJournal] = None
+    activation_journal_invalid: bool = False
 
     @classmethod
     def from_json(cls, value: object) -> "UpdateState":
@@ -203,6 +297,20 @@ class UpdateState:
         if component_operation not in {"", "preparing"}:
             component_operation = ""
         component_error_code = _text("component_error_code", 64)
+        activation_transaction_id = _text(
+            "activation_transaction_id",
+            32,
+        ).lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", activation_transaction_id):
+            activation_transaction_id = ""
+        raw_journal = value.get("activation_journal")
+        activation_journal: Optional[ActivationJournal] = None
+        activation_journal_invalid = value.get("activation_journal_invalid") is True
+        if raw_journal not in (None, {}):
+            try:
+                activation_journal = ActivationJournal.from_json(raw_journal)
+            except (TypeError, ValueError):
+                activation_journal_invalid = True
         return cls(
             installed_sha=installed_sha,
             candidate_sha=candidate_sha,
@@ -243,11 +351,16 @@ class UpdateState:
             candidate_migration_team_id=(
                 migration_team_id if candidate_sha else ""
             ),
-            component_prompt_answered=bool(
-                value.get("component_prompt_answered", False)
+            component_prompt_answered=(
+                value.get("component_prompt_answered", False) is True
             ),
             component_operation=component_operation,
             component_error_code=component_error_code,
+            activation_transaction_id=(
+                activation_transaction_id if candidate_sha else ""
+            ),
+            activation_journal=activation_journal,
+            activation_journal_invalid=activation_journal_invalid,
         )
 
 
@@ -303,16 +416,150 @@ class UpdateStateStore:
     def load(self) -> UpdateState:
         try:
             return UpdateState.from_json(json.loads(self.path.read_text(encoding="utf-8")))
-        except (FileNotFoundError, OSError, ValueError, TypeError):
+        except FileNotFoundError:
             return UpdateState()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return UpdateState(
+                last_error=(
+                    "The updater state is unreadable. GamGUI entered local "
+                    "recovery mode and will not access Workspace."
+                ),
+                component_error_code="CMP-VERIFY-FAILED",
+                activation_journal_invalid=True,
+            )
 
     def save(self, state: UpdateState) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(state), sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        _owner_only(tmp)
-        os.replace(tmp, self.path)
-        _owner_only(self.path)
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        _owner_only_directory(parent)
+        encoded = (
+            json.dumps(asdict(state), sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        descriptor, temporary_value = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=parent,
+        )
+        temporary = Path(temporary_value)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("The updater state could not be written.")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, self.path)
+            _owner_only(self.path)
+            _fsync_directory(parent)
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            try:
+                if temporary.is_file() and not temporary.is_symlink():
+                    temporary.unlink()
+            except OSError:
+                pass
+
+    def load_runtime_projection(
+        self,
+        embedded: object,
+        environment: Optional[dict[str, str]] = None,
+    ) -> Optional[UpdateState]:
+        """Return a validated, non-persistent candidate view during health startup."""
+
+        state = self.load()
+        env = os.environ if environment is None else environment
+        transaction = str(env.get(ACTIVATION_TRANSACTION_ENV, "") or "").lower()
+        expected_sha = str(env.get("GAMGUI_INSTALLED_SHA", "") or "").lower()
+        marker_value = str(env.get("GAMGUI_UPDATE_HEALTH_MARKER", "") or "")
+        current_value = str(env.get(ACTIVATION_CURRENT_APP_ENV, "") or "")
+        candidate = state.candidate_artifact
+        embedded_artifact = getattr(embedded, "artifact", None)
+        if (
+            env.get(ACTIVATION_PROBE_ENV) != "1"
+            or not re.fullmatch(r"[0-9a-f]{32}", transaction)
+            or transaction != state.activation_transaction_id
+            or not _valid_sha(expected_sha)
+            or expected_sha != state.candidate_sha
+            or candidate is None
+            or embedded_artifact is None
+            or candidate_is_blocked(state)
+            or not activation_evidence_valid(state)
+        ):
+            return None
+        expected_marker = self.path.parent / "health" / f"{transaction}.json"
+        try:
+            marker = Path(marker_value).resolve()
+            if marker != expected_marker.resolve():
+                return None
+            pending = Path(state.pending_app).resolve()
+            pending.relative_to(self.path.parent.resolve())
+            current_app = Path(current_value).resolve()
+        except (OSError, ValueError):
+            return None
+        if (
+            not pending.is_dir()
+            or not (pending / "Contents" / "MacOS" / "GamGUI").is_file()
+            or not current_app.is_dir()
+            or not (current_app / "Contents" / "MacOS" / "GamGUI").is_file()
+        ):
+            return None
+        if candidate.artifact_sha256 or getattr(sys, "frozen", False):
+            try:
+                from .components import bundle_sha256
+
+                if (
+                    not candidate.artifact_sha256
+                    or bundle_sha256(current_app) != candidate.artifact_sha256
+                ):
+                    return None
+            except (ComponentError, OSError):
+                return None
+        identity_fields = (
+            "source_sha",
+            "version",
+            "profile",
+            "component_set_digest",
+            "architecture",
+            "minimum_macos_version",
+            "packaging_revision",
+        )
+        if any(
+            getattr(candidate, field, None)
+            != getattr(embedded_artifact, field, None)
+            for field in identity_fields
+        ):
+            return None
+        installed_components = list(component_ids_for_profile(candidate.profile))
+        projected = replace(state)
+        projected.installed_sha = candidate.source_sha
+        projected.installed_profile = candidate.profile
+        projected.installed_components = installed_components
+        projected.installed_artifact = candidate
+        projected.installed_signing_channel = (
+            state.candidate_signing_channel or state.installed_signing_channel
+        )
+        projected.installed_signing_authority = (
+            state.candidate_signing_authority
+            or state.installed_signing_authority
+        )
+        projected.enabled_components = _enabled_components_after_activation(
+            activation_kind=state.activation_kind,
+            candidate_sha=state.candidate_sha,
+            previous_sha=state.installed_sha,
+            desired_components=state.desired_components,
+            previous_enabled_components=state.enabled_components,
+            installed_components=installed_components,
+        )
+        return projected
 
 
 class GitHubUpdateSource:
@@ -424,6 +671,37 @@ class GitHubUpdateSource:
             return json.loads(response.read().decode("utf-8"))
 
 
+def _managed_mac_build_environment(
+    environment: Optional[dict[str, str]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, str]:
+    """Return a deterministic toolchain PATH for a Finder-launched managed app."""
+
+    result = dict(os.environ if environment is None else environment)
+    resolved_home = Path(home) if home is not None else Path.home()
+    preferred = (
+        resolved_home / ".local" / "bin",
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/usr/sbin"),
+        Path("/sbin"),
+    )
+    current = [
+        Path(item)
+        for item in result.get("PATH", "").split(os.pathsep)
+        if item
+    ]
+    ordered: list[str] = []
+    for candidate in (*preferred, *current):
+        value = str(candidate)
+        if value not in ordered:
+            ordered.append(value)
+    result["PATH"] = os.pathsep.join(ordered)
+    return result
+
+
 class LocalUpdateBuilder:
     """Build and stage an exact commit using the admin Mac's local signing identity."""
 
@@ -452,17 +730,29 @@ class LocalUpdateBuilder:
         if sys.platform != "darwin":
             raise RuntimeError("Automatic application builds are supported only on macOS.")
         profile = normalize_profile(profile)
+        command_env = _managed_mac_build_environment()
         checkout = self.root / "source" / candidate.sha
         checkout.parent.mkdir(parents=True, exist_ok=True)
         _require_within(checkout, self.root)
         if checkout.exists():
             _remove_tree(checkout, self.root)
         self._command(
-            ["git", "clone", "--filter=blob:none", "--no-checkout", self.repository_url, str(checkout)]
+            ["git", "clone", "--filter=blob:none", "--no-checkout", self.repository_url, str(checkout)],
+            env=command_env,
         )
-        self._command(["git", "-C", str(checkout), "fetch", "--depth", "1", "origin", candidate.sha])
-        self._command(["git", "-C", str(checkout), "checkout", "--detach", candidate.sha])
-        head = self._command(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture=True).stdout.strip()
+        self._command(
+            ["git", "-C", str(checkout), "fetch", "--depth", "1", "origin", candidate.sha],
+            env=command_env,
+        )
+        self._command(
+            ["git", "-C", str(checkout), "checkout", "--detach", candidate.sha],
+            env=command_env,
+        )
+        head = self._command(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            capture=True,
+            env=command_env,
+        ).stdout.strip()
         if head != candidate.sha:
             raise RuntimeError("Updater checkout did not resolve to the validated commit.")
         if (
@@ -481,23 +771,25 @@ class LocalUpdateBuilder:
                 ],
                 capture=True,
                 check=False,
+                env=command_env,
             )
             if ancestry.returncode != 0:
                 raise RuntimeError(
                     "The validated update is not a forward descendant of the installed commit."
                 )
 
-        self._command(["make", "setup"], cwd=checkout)
-        self._command(["make", "gam"], cwd=checkout)
+        self._command(["make", "setup"], cwd=checkout, env=command_env)
+        self._command(["make", "gam"], cwd=checkout, env=command_env)
         identities = self._command(
             ["security", "find-identity", "-p", "codesigning", "-v"],
             capture=True,
+            env=command_env,
         ).stdout
         if f'"{LOCAL_SIGNING_IDENTITY}"' not in identities:
             raise RuntimeError(
                 f'The required local signing identity "{LOCAL_SIGNING_IDENTITY}" is unavailable.'
             )
-        build_env = os.environ.copy()
+        build_env = command_env.copy()
         build_env["CODESIGN_IDENTITY"] = LOCAL_SIGNING_IDENTITY
         self._command(
             ["make", "app", f"PROFILE={profile}"],
@@ -508,8 +800,15 @@ class LocalUpdateBuilder:
         executable = built / "Contents" / "MacOS" / "GamGUI"
         if not executable.is_file():
             raise RuntimeError("The update build did not produce GamGUI.app.")
-        self._command(["codesign", "--verify", "--deep", "--strict", str(built)])
-        self._command([str(executable), "--self-test"], cwd=checkout)
+        self._command(
+            ["codesign", "--verify", "--deep", "--strict", str(built)],
+            env=command_env,
+        )
+        self._command(
+            [str(executable), "--self-test"],
+            cwd=checkout,
+            env=command_env,
+        )
         envelope = verify_bundle_artifact(built, expected_profile=profile)
         if envelope.artifact.source_sha != candidate.sha:
             raise RuntimeError(
@@ -850,6 +1149,7 @@ class LocalUpdateBuilder:
             text=True,
             capture_output=capture,
             env=env,
+            timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
         )
 
 
@@ -1340,6 +1640,9 @@ class UpdateCoordinator:
         state.candidate_migration_team_id = ""
         state.canary_result = ""
         state.activation_kind = ""
+        state.activation_transaction_id = ""
+        state.activation_journal = None
+        state.activation_journal_invalid = False
         state.required_check_evidence = []
         state.component_operation = ""
         state.component_error_code = ""
@@ -1357,6 +1660,9 @@ class UpdateCoordinator:
         state.candidate_migration_team_id = ""
         state.canary_result = "failed"
         state.activation_kind = ""
+        state.activation_transaction_id = ""
+        state.activation_journal = None
+        state.activation_journal_invalid = False
         state.required_check_evidence = []
         state.component_operation = ""
         state.component_error_code = "CMP-VERIFY-FAILED"
@@ -1382,6 +1688,9 @@ class UpdateCoordinator:
         state.candidate_migration_team_id = ""
         state.canary_result = ""
         state.activation_kind = ""
+        state.activation_transaction_id = ""
+        state.activation_journal = None
+        state.activation_journal_invalid = False
         state.required_check_evidence = []
         state.desired_profile = state.installed_profile or CORE_PROFILE
         state.desired_components = list(state.installed_components)
@@ -1440,6 +1749,66 @@ class LocalUpdateInstaller:
         current_app: Path,
         *,
         health_timeout: float = HEALTH_TIMEOUT_SECONDS,
+        activation_lock: Optional[OwnerOnlyActivationLock] = None,
+        transaction_id: str = "",
+    ) -> bool:
+        owned_lock = activation_lock is None
+        lock = activation_lock
+        if lock is None:
+            lock = OwnerOnlyActivationLock.try_acquire(
+                self.root / "activation.lock"
+            )
+            if lock is None:
+                return False
+        try:
+            try:
+                lock_matches = (
+                    lock.path.resolve()
+                    == (self.root / "activation.lock").resolve()
+                )
+            except OSError:
+                lock_matches = False
+            if not lock.held or not lock_matches:
+                return False
+            state = self.store.load()
+            transaction = (
+                transaction_id
+                or state.activation_transaction_id
+                or secrets.token_hex(16)
+            ).lower()
+            if not re.fullmatch(r"[0-9a-f]{32}", transaction):
+                return False
+            if state.activation_transaction_id not in {"", transaction}:
+                return False
+            if not state.activation_transaction_id:
+                state.activation_transaction_id = transaction
+                try:
+                    self.store.save(state)
+                except Exception:
+                    self._launch_previous(Path(current_app))
+                    return False
+            return self._install_locked(
+                sha,
+                pending_app,
+                current_app,
+                health_timeout=health_timeout,
+                transaction_id=transaction,
+            )
+        finally:
+            if owned_lock:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+    def _install_locked(
+        self,
+        sha: str,
+        pending_app: Path,
+        current_app: Path,
+        *,
+        health_timeout: float,
+        transaction_id: str,
     ) -> bool:
         state = self.store.load()
         pending_app = Path(pending_app)
@@ -1457,20 +1826,33 @@ class LocalUpdateInstaller:
         previous_signing_authority = state.installed_signing_authority
         previous_enabled_components = list(state.enabled_components)
 
-        backup = self.root / "backups" / f"{int(self._clock())}-{sha[:12]}"
+        backup = (
+            self.root
+            / "backups"
+            / f"{int(self._clock())}-{sha[:12]}-{transaction_id}"
+        )
         database_snapshot = backup / "database"
         migration_copy = backup / "migration-copy"
         backup_app = backup / "GamGUI.app"
         backup_sidecar = backup / "installed-artifact.json"
+        candidate_sidecar = backup / "candidate-artifact.json"
         installed_sidecar = artifact_sidecar_path(current_app)
         pending_sidecar = artifact_sidecar_path(pending_app)
-        marker = self.root / "health" / f"{sha}.ok"
-        incoming = current_app.parent / f".{current_app.name}.{sha[:12]}.incoming"
-        previous = current_app.parent / f".{current_app.name}.{sha[:12]}.previous"
+        marker = self.root / "health" / f"{transaction_id}.json"
+        incoming = (
+            current_app.parent
+            / f".{current_app.name}.{transaction_id}.incoming"
+        )
+        previous = (
+            current_app.parent
+            / f".{current_app.name}.{transaction_id}.previous"
+        )
         process = None
-        swapped = False
-        previous_moved = False
         snapshot_ready = False
+        sidecar_tmp: Optional[Path] = None
+        journal_saved = False
+        recovery_completed = False
+        activation_committed = False
 
         try:
             database_bytes = sum(
@@ -1489,6 +1871,7 @@ class LocalUpdateInstaller:
             try:
                 state.last_error = str(exc)
                 state.component_error_code = "CMP-DOWNLOAD-FAILED"
+                state.activation_transaction_id = ""
                 self.store.save(state)
             except Exception:
                 pass
@@ -1496,7 +1879,13 @@ class LocalUpdateInstaller:
             return False
 
         try:
-            self._validate_install_request(state, sha, pending_app, current_app)
+            self._validate_install_request(
+                state,
+                sha,
+                pending_app,
+                current_app,
+                transaction_id=transaction_id,
+            )
             backup.mkdir(parents=True, exist_ok=False)
             _owner_only_directory(backup)
             snapshot_databases(self.data_root, database_snapshot)
@@ -1516,42 +1905,117 @@ class LocalUpdateInstaller:
                 text=True,
                 capture_output=True,
                 env=migration_env,
+                timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
             )
+            _remove_tree(migration_copy, backup)
 
             shutil.copytree(current_app, backup_app, symlinks=True)
             if installed_sidecar.is_file():
                 shutil.copy2(installed_sidecar, backup_sidecar)
                 _owner_only(backup_sidecar)
-            if incoming.exists():
-                _remove_tree(incoming, current_app.parent)
-            if previous.exists():
-                _remove_tree(previous, current_app.parent)
+            if incoming.exists() or previous.exists() or marker.exists():
+                raise RuntimeError(
+                    "The activation transaction paths already exist."
+                )
             shutil.copytree(pending_app, incoming, symlinks=True)
-            os.replace(current_app, previous)
-            previous_moved = True
-            os.replace(incoming, current_app)
-            swapped = True
+            shutil.copy2(pending_sidecar, candidate_sidecar)
+            _owner_only(candidate_sidecar)
+            self._verify_candidate_bundle(
+                state,
+                incoming,
+                current_app,
+                sidecar=candidate_sidecar,
+            )
+            _fsync_tree(backup)
+            _fsync_tree(incoming)
+
+            journal = ActivationJournal(
+                transaction_id=transaction_id,
+                candidate_sha=sha,
+                phase=ACTIVATION_PHASE_PREPARED,
+                current_app=str(current_app.resolve()),
+                pending_app=str(pending_app.resolve()),
+                incoming_app=str(incoming.resolve()),
+                previous_app=str(previous.resolve()),
+                backup=str(backup.resolve()),
+                backup_app=str(backup_app.resolve()),
+                backup_sidecar=str(backup_sidecar.resolve()),
+                candidate_sidecar=str(candidate_sidecar.resolve()),
+                database_snapshot=str(database_snapshot.resolve()),
+                health_marker=str(marker.resolve()),
+            )
+            state = self.store.load()
+            if (
+                state.activation_transaction_id != transaction_id
+                or state.candidate_sha != sha
+                or Path(state.pending_app) != pending_app
+            ):
+                raise RuntimeError(
+                    "The activation transaction state changed before preparation."
+                )
+            state.activation_journal = journal
+            state.activation_journal_invalid = False
+            self.store.save(state)
+            journal_saved = True
+
+            _atomic_exchange(current_app, incoming)
+            os.replace(incoming, previous)
+            _fsync_directory(current_app.parent)
+            journal = journal.with_phase(ACTIVATION_PHASE_SWAPPED)
+            self._save_journal(journal)
 
             marker.parent.mkdir(parents=True, exist_ok=True)
-            if marker.exists():
-                marker.unlink()
+            _owner_only_directory(marker.parent)
             launch_env = os.environ.copy()
             launch_env["GAMGUI_UPDATE_HEALTH_MARKER"] = str(marker)
             launch_env["GAMGUI_INSTALLED_SHA"] = sha
             launch_env["GAMGUI_SKIP_UPDATE_ONCE"] = "1"
+            launch_env[ACTIVATION_TRANSACTION_ENV] = transaction_id
+            launch_env[ACTIVATION_PROBE_ENV] = "1"
+            launch_env[ACTIVATION_CURRENT_APP_ENV] = str(current_app)
             process = self._popen(
                 [str(current_app / "Contents" / "MacOS" / "GamGUI")],
                 env=launch_env,
             )
-            if not self._wait_for_health(marker, process, health_timeout):
+            expected_health = {
+                "ok": True,
+                "transaction_id": transaction_id,
+                "sha": sha,
+                "profile": candidate_artifact.profile,
+                "component_set_digest": candidate_artifact.component_set_digest,
+            }
+            if not self._wait_for_health(
+                marker,
+                process,
+                health_timeout,
+                expected_health,
+            ):
                 raise RuntimeError("The updated application did not report startup health in time.")
+            self._stop(process)
+            process = None
+            journal = journal.with_phase(ACTIVATION_PHASE_HEALTH_PASSED)
+            self._save_journal(journal)
 
-            if pending_sidecar.is_file():
-                sidecar_tmp = installed_sidecar.with_suffix(".tmp")
-                shutil.copy2(pending_sidecar, sidecar_tmp)
-                os.replace(sidecar_tmp, installed_sidecar)
-                _owner_only(installed_sidecar)
+            sidecar_tmp = installed_sidecar.with_name(
+                f"{installed_sidecar.name}.{transaction_id}.tmp"
+            )
+            if sidecar_tmp.exists():
+                raise RuntimeError(
+                    "The activation sidecar transaction path already exists."
+                )
+            shutil.copy2(candidate_sidecar, sidecar_tmp)
+            _fsync_file(sidecar_tmp)
+            os.replace(sidecar_tmp, installed_sidecar)
+            _owner_only(installed_sidecar)
+            _fsync_directory(installed_sidecar.parent)
             state = self.store.load()
+            if (
+                state.activation_transaction_id != transaction_id
+                or state.activation_journal != journal
+            ):
+                raise RuntimeError(
+                    "The activation transaction state changed before commit."
+                )
             state.installed_sha = sha
             installed_profile = (
                 candidate_artifact.profile
@@ -1591,6 +2055,9 @@ class LocalUpdateInstaller:
             state.candidate_migration_team_id = ""
             state.canary_result = ""
             state.activation_kind = ""
+            state.activation_transaction_id = ""
+            state.activation_journal = None
+            state.activation_journal_invalid = False
             state.schema_snapshot = str(database_snapshot)
             state.last_error = ""
             state.required_check_evidence = []
@@ -1614,13 +2081,14 @@ class LocalUpdateInstaller:
                 :MAX_RETAINED_BACKUPS
             ]
             self.store.save(state)
+            activation_committed = True
             # State persistence is the activation commit point. Cleanup after this point is
             # best-effort and must never roll back a healthy application.
-            swapped = False
-            previous_moved = False
             self._best_effort_remove(previous, current_app.parent)
             self._best_effort_remove(pending_app, self.root)
             self._best_effort_unlink(pending_sidecar, self.root)
+            self._best_effort_unlink(candidate_sidecar, self.root)
+            self._best_effort_unlink(marker, self.root)
             try:
                 removed = UpdateCoordinator(store=self.store).prune_backups(
                     self.root / "backups"
@@ -1641,59 +2109,228 @@ class LocalUpdateInstaller:
                     self.store.save(state)
             except Exception:
                 pass
+            self._launch_activated(current_app)
             return True
         except Exception as exc:
-            rollback_errors: list[str] = []
+            if activation_committed:
+                # The fsynced state transition is the commit point. Post-commit
+                # cleanup or relaunch failure must not reinterpret the verified
+                # candidate as an uncommitted transaction.
+                return True
             process_stopped = False
             try:
                 self._stop(process)
                 process_stopped = True
-            except Exception as rollback_exc:
-                rollback_errors.append(f"process stop failed: {rollback_exc}")
-            if process_stopped:
+            except Exception:
+                process_stopped = False
+            if journal_saved:
                 try:
-                    if previous_moved or swapped:
-                        if current_app.exists():
-                            _remove_tree(current_app, current_app.parent)
-                        if previous.exists():
-                            os.replace(previous, current_app)
-                        elif backup_app.is_dir():
-                            shutil.copytree(backup_app, current_app, symlinks=True)
-                        if backup_sidecar.is_file():
-                            shutil.copy2(backup_sidecar, installed_sidecar)
-                        elif installed_sidecar.exists():
-                            installed_sidecar.unlink()
-                except Exception as rollback_exc:
-                    rollback_errors.append(f"application restore failed: {rollback_exc}")
+                    state = self.store.load()
+                    active_journal = state.activation_journal
+                    if (
+                        active_journal is not None
+                        and active_journal.transaction_id == transaction_id
+                    ):
+                        self._save_journal(
+                            active_journal.with_phase(
+                                ACTIVATION_PHASE_RECOVERY_REQUIRED
+                            ),
+                            error=(
+                                "Activation recovery is pending. GamGUI will keep "
+                                "Workspace administration paused until the previous "
+                                "application and database are restored."
+                            ),
+                        )
+                except Exception:
+                    pass
+            if journal_saved and process_stopped:
                 try:
-                    if snapshot_ready:
-                        restore_databases(self.data_root, database_snapshot)
-                except Exception as rollback_exc:
-                    rollback_errors.append(f"database restore failed: {rollback_exc}")
-            else:
-                rollback_errors.append(
-                    "application and database restore deferred because the updated process could not be confirmed stopped"
-                )
-            reason = str(exc)
-            if rollback_errors:
-                reason += " Rollback warning: " + "; ".join(rollback_errors)
+                    recovery_completed = self.recover(
+                        current_app=current_app,
+                        transaction_id=transaction_id,
+                    )
+                except Exception:
+                    recovery_completed = False
+                if recovery_completed:
+                    self._launch_previous(current_app)
+                return False
+            if journal_saved:
+                # The durable journal, backup, pending bundle, and database
+                # snapshot intentionally remain untouched. A later launch
+                # recovers them after the candidate process is provably gone.
+                return False
             try:
+                reason = str(exc)
                 self._block(
                     sha,
                     reason,
                     database_snapshot if snapshot_ready else None,
                 )
             except Exception:
-                # A state-file failure must not prevent the restored application from
-                # relaunching. The staged bundle is still removed below so it cannot loop.
                 pass
             self._best_effort_remove(pending_app, self.root)
             self._best_effort_unlink(pending_sidecar, self.root)
-            if process_stopped:
-                self._launch_previous(current_app)
+            self._best_effort_remove(backup, self.root)
+            self._launch_previous(current_app)
             return False
         finally:
-            self._best_effort_remove(incoming, current_app.parent)
+            if activation_committed or recovery_completed or not journal_saved:
+                self._best_effort_remove(incoming, current_app.parent)
+                self._best_effort_unlink(marker, self.root)
+            if sidecar_tmp is not None:
+                self._best_effort_unlink(sidecar_tmp, current_app.parent)
+
+    def _save_journal(
+        self,
+        journal: ActivationJournal,
+        *,
+        error: str = "",
+    ) -> None:
+        state = self.store.load()
+        if (
+            state.activation_transaction_id not in {
+                "",
+                journal.transaction_id,
+            }
+            or (
+                state.candidate_sha
+                and state.candidate_sha != journal.candidate_sha
+            )
+        ):
+            raise RuntimeError("The durable activation journal changed.")
+        state.activation_journal = journal
+        state.activation_journal_invalid = False
+        if error:
+            state.component_error_code = "CMP-VERIFY-FAILED"
+            state.last_error = error
+        self.store.save(state)
+
+    def recover(
+        self,
+        *,
+        current_app: Optional[Path] = None,
+        activation_lock: Optional[OwnerOnlyActivationLock] = None,
+        transaction_id: str = "",
+    ) -> bool:
+        """Restore a journaled pre-activation bundle and database exactly once."""
+
+        if activation_lock is not None:
+            try:
+                lock_matches = (
+                    activation_lock.held
+                    and activation_lock.path.resolve()
+                    == (self.root / "activation.lock").resolve()
+                )
+            except OSError:
+                lock_matches = False
+            if not lock_matches:
+                return False
+        state = self.store.load()
+        journal = state.activation_journal
+        if journal is None or state.activation_journal_invalid:
+            return False
+        if transaction_id and journal.transaction_id != transaction_id:
+            return False
+        expected_current = Path(journal.current_app)
+        if current_app is not None:
+            try:
+                if Path(current_app).resolve() != expected_current.resolve():
+                    return False
+            except OSError:
+                return False
+        self._validate_journal(journal)
+
+        backup_app = Path(journal.backup_app)
+        backup_sidecar = Path(journal.backup_sidecar)
+        database_snapshot = Path(journal.database_snapshot)
+        installed_sidecar = artifact_sidecar_path(expected_current)
+        restore_copy = expected_current.parent / (
+            f".{expected_current.name}.{journal.transaction_id}.restore"
+        )
+        if restore_copy.exists():
+            _remove_tree(restore_copy, expected_current.parent)
+        shutil.copytree(backup_app, restore_copy, symlinks=True)
+        _fsync_tree(restore_copy)
+        if not (
+            restore_copy / "Contents" / "MacOS" / "GamGUI"
+        ).is_file():
+            raise RuntimeError("The rollback application snapshot is incomplete.")
+        if state.installed_artifact is not None and backup_sidecar.is_file():
+            verify_bundle_artifact(
+                restore_copy,
+                expected_profile=state.installed_artifact.profile,
+                expected_artifact=state.installed_artifact,
+                sidecar=backup_sidecar,
+            )
+        if sys.platform == "darwin":
+            self._run(
+                ["codesign", "--verify", "--deep", "--strict", str(restore_copy)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        if expected_current.exists():
+            _atomic_exchange(expected_current, restore_copy)
+        else:
+            os.replace(restore_copy, expected_current)
+        if backup_sidecar.is_file():
+            sidecar_restore = installed_sidecar.with_name(
+                f"{installed_sidecar.name}.{journal.transaction_id}.restore"
+            )
+            shutil.copy2(backup_sidecar, sidecar_restore)
+            _fsync_file(sidecar_restore)
+            os.replace(sidecar_restore, installed_sidecar)
+            _owner_only(installed_sidecar)
+            _fsync_directory(installed_sidecar.parent)
+        elif installed_sidecar.exists() and not installed_sidecar.is_symlink():
+            installed_sidecar.unlink()
+        restore_databases(self.data_root, database_snapshot)
+        self._block(
+            journal.candidate_sha,
+            "The staged application failed activation and was rolled back.",
+            database_snapshot,
+        )
+
+        self._best_effort_remove(restore_copy, expected_current.parent)
+        self._best_effort_remove(Path(journal.incoming_app), expected_current.parent)
+        self._best_effort_remove(Path(journal.previous_app), expected_current.parent)
+        self._best_effort_remove(Path(journal.pending_app), self.root)
+        self._best_effort_unlink(
+            artifact_sidecar_path(Path(journal.pending_app)),
+            self.root,
+        )
+        self._best_effort_unlink(Path(journal.candidate_sidecar), self.root)
+        self._best_effort_unlink(Path(journal.health_marker), self.root)
+        return True
+
+    def _validate_journal(self, journal: ActivationJournal) -> None:
+        current = Path(journal.current_app)
+        pending = Path(journal.pending_app)
+        incoming = Path(journal.incoming_app)
+        previous = Path(journal.previous_app)
+        backup = Path(journal.backup)
+        if current.suffix != ".app":
+            raise ValueError("The activation journal application path is invalid.")
+        _require_within(pending, self.root)
+        _require_within(backup, self.root / "backups")
+        _require_within(Path(journal.backup_app), backup)
+        _require_within(Path(journal.backup_sidecar), backup)
+        _require_within(Path(journal.candidate_sidecar), backup)
+        _require_within(Path(journal.database_snapshot), backup)
+        _require_within(Path(journal.health_marker), self.root / "health")
+        if (
+            incoming.parent.resolve() != current.parent.resolve()
+            or previous.parent.resolve() != current.parent.resolve()
+            or incoming.name
+            != f".{current.name}.{journal.transaction_id}.incoming"
+            or previous.name
+            != f".{current.name}.{journal.transaction_id}.previous"
+        ):
+            raise ValueError("The activation journal transaction paths are invalid.")
+        if not Path(journal.backup_app).is_dir():
+            raise ValueError("The activation rollback bundle is missing.")
+        if not Path(journal.database_snapshot).is_dir():
+            raise ValueError("The activation database snapshot is missing.")
 
     def _validate_install_request(
         self,
@@ -1701,9 +2338,16 @@ class LocalUpdateInstaller:
         sha: str,
         pending_app: Path,
         current_app: Path,
+        *,
+        transaction_id: str = "",
     ) -> None:
         if not _valid_sha(sha):
             raise ValueError("The candidate SHA is invalid.")
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+            or state.activation_transaction_id != transaction_id
+        ):
+            raise ValueError("The activation transaction does not match staged state.")
         if state.candidate_sha != sha or Path(state.pending_app) != pending_app:
             raise ValueError("The install request does not match the staged update state.")
         if state.candidate_artifact is None:
@@ -1720,10 +2364,33 @@ class LocalUpdateInstaller:
         _require_within(pending_app, self.root)
         if not pending_app.is_dir() or not (pending_app / "Contents" / "MacOS" / "GamGUI").is_file():
             raise ValueError("The staged application bundle is incomplete.")
-        envelope = verify_bundle_artifact(
+        if current_app.suffix != ".app" or not current_app.is_dir():
+            raise ValueError("The installed application bundle could not be resolved.")
+        if pending_app.is_symlink() or current_app.is_symlink():
+            raise ValueError("Application bundle symlinks are not accepted.")
+        self._verify_candidate_bundle(
+            state,
             pending_app,
-            expected_profile=profile,
-            expected_artifact=state.candidate_artifact,
+            current_app,
+            sidecar=artifact_sidecar_path(pending_app),
+        )
+
+    def _verify_candidate_bundle(
+        self,
+        state: UpdateState,
+        bundle: Path,
+        current_app: Path,
+        *,
+        sidecar: Path,
+    ) -> ArtifactEnvelope:
+        candidate = state.candidate_artifact
+        if candidate is None:
+            raise ValueError("The staged update has no verified artifact identity.")
+        envelope = verify_bundle_artifact(
+            bundle,
+            expected_profile=candidate.profile,
+            expected_artifact=candidate,
+            sidecar=sidecar,
         )
         if (
             state.candidate_signing_channel
@@ -1758,14 +2425,14 @@ class LocalUpdateInstaller:
             )
         if sys.platform == "darwin":
             self._run(
-                ["codesign", "--verify", "--deep", "--strict", str(pending_app)],
+                ["codesign", "--verify", "--deep", "--strict", str(bundle)],
                 check=True,
                 text=True,
                 capture_output=True,
             )
             if envelope.signing_channel == "local":
                 if _codesign_leaf_sha256(
-                    pending_app,
+                    bundle,
                     run=self._run,
                     scratch_root=self.root,
                 ) != _codesign_leaf_sha256(
@@ -1777,7 +2444,7 @@ class LocalUpdateInstaller:
                         "The staged local artifact signing certificate changed."
                     )
             details = self._run(
-                ["codesign", "-dv", "--verbose=4", str(pending_app)],
+                ["codesign", "-dv", "--verbose=4", str(bundle)],
                 check=False,
                 text=True,
                 capture_output=True,
@@ -1794,11 +2461,11 @@ class LocalUpdateInstaller:
             )
             if envelope.signing_channel == "developer-id":
                 _validate_official_bundle_metadata(
-                    pending_app,
+                    bundle,
                     signature_output,
                 )
                 self._run(
-                    ["xcrun", "stapler", "validate", str(pending_app)],
+                    ["xcrun", "stapler", "validate", str(bundle)],
                     check=True,
                     text=True,
                     capture_output=True,
@@ -1810,23 +2477,48 @@ class LocalUpdateInstaller:
                         "--type",
                         "execute",
                         "--verbose=4",
-                        str(pending_app),
+                        str(bundle),
                     ],
                     check=True,
                     text=True,
                     capture_output=True,
                 )
-        if current_app.suffix != ".app" or not current_app.is_dir():
-            raise ValueError("The installed application bundle could not be resolved.")
+        return envelope
 
-    def _wait_for_health(self, marker: Path, process: object, timeout: float) -> bool:
+    def _wait_for_health(
+        self,
+        marker: Path,
+        process: object,
+        timeout: float,
+        expected_payload: dict[str, object],
+    ) -> bool:
         deadline = self._clock() + timeout
         while self._clock() < deadline:
-            if marker.is_file():
-                return marker.read_text(encoding="utf-8").strip() == "ok"
             poll = getattr(process, "poll", None)
             if callable(poll) and poll() is not None:
                 return False
+            if marker.is_file():
+                try:
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    return False
+                if not isinstance(payload, dict) or payload != expected_payload:
+                    return False
+                self._sleep(
+                    min(
+                        HEALTH_STABILITY_SECONDS,
+                        max(0.01, deadline - self._clock()),
+                    )
+                )
+                if callable(poll) and poll() is not None:
+                    return False
+                try:
+                    stable_payload = json.loads(
+                        marker.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    return False
+                return stable_payload == expected_payload
             self._sleep(min(0.2, max(0.01, timeout)))
         return False
 
@@ -1890,6 +2582,9 @@ class LocalUpdateInstaller:
         state.candidate_migration_team_id = ""
         state.canary_result = "failed"
         state.activation_kind = ""
+        state.activation_transaction_id = ""
+        state.activation_journal = None
+        state.activation_journal_invalid = False
         state.schema_snapshot = (
             str(database_snapshot)
             if database_snapshot is not None and database_snapshot.is_dir()
@@ -1902,10 +2597,25 @@ class LocalUpdateInstaller:
         self.store.save(state)
 
     def _launch_previous(self, current_app: Path) -> None:
+        self._launch_bundle(current_app)
+
+    def _launch_activated(self, current_app: Path) -> None:
+        self._launch_bundle(current_app)
+
+    def _launch_bundle(self, current_app: Path) -> None:
         executable = current_app / "Contents" / "MacOS" / "GamGUI"
         if not executable.is_file():
             return
         env = os.environ.copy()
+        for key in (
+            "GAMGUI_UPDATE_HEALTH_MARKER",
+            "GAMGUI_INSTALLED_SHA",
+            ACTIVATION_TRANSACTION_ENV,
+            ACTIVATION_PROBE_ENV,
+            ACTIVATION_CURRENT_APP_ENV,
+            ACTIVATION_RECOVERY_ENV,
+        ):
+            env.pop(key, None)
         env["GAMGUI_SKIP_UPDATE_ONCE"] = "1"
         try:
             self._popen([str(executable)], env=env)
@@ -1930,12 +2640,16 @@ def snapshot_databases(data_root: Path, destination: Path) -> list[Path]:
         relative = source.relative_to(data_root)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
+        _owner_only_directory(target.parent)
+        _prepare_owner_only_file(target)
         with closing(
-            sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
         ) as source_db, closing(sqlite3.connect(target)) as target_db:
             source_db.backup(target_db)
         _owner_only(target)
+        _fsync_file(target)
         copied.append(target)
+    _fsync_tree(destination)
     return copied
 
 
@@ -1943,16 +2657,46 @@ def restore_databases(data_root: Path, snapshot: Path) -> None:
     """Restore the matching pre-update database set after a failed startup."""
     data_root = Path(data_root)
     snapshot = Path(snapshot)
-    for current in list(_database_files(data_root)):
-        current.unlink()
     if not snapshot.is_dir():
         return
-    for source in _database_files(snapshot, exclude_updates=False):
+    snapshot_files = tuple(
+        source
+        for source in _database_files(snapshot, exclude_updates=False)
+        if not source.name.lower().endswith(("-wal", "-shm"))
+    )
+    restored_relatives = {
+        source.relative_to(snapshot)
+        for source in snapshot_files
+    }
+    for source in snapshot_files:
         relative = source.relative_to(snapshot)
         target = data_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        _owner_only(target)
+        _owner_only_directory(target.parent)
+        for companion in (Path(f"{target}-wal"), Path(f"{target}-shm")):
+            if companion.is_file() and not companion.is_symlink():
+                companion.unlink()
+        temporary = target.with_name(
+            f".{target.name}.{secrets.token_hex(16)}.restore"
+        )
+        _prepare_owner_only_file(temporary)
+        try:
+            shutil.copyfile(source, temporary)
+            _owner_only(temporary)
+            _fsync_file(temporary)
+            os.replace(temporary, target)
+            _owner_only(target)
+            _fsync_directory(target.parent)
+        finally:
+            try:
+                if temporary.is_file() and not temporary.is_symlink():
+                    temporary.unlink()
+            except OSError:
+                pass
+    for current in tuple(_database_files(data_root)):
+        if current.relative_to(data_root) not in restored_relatives:
+            current.unlink()
+            _fsync_directory(current.parent)
 
 
 def prepare_database_schemas(data_root: Path) -> list[Path]:
@@ -2125,14 +2869,52 @@ def installed_app_path(executable: Optional[Path] = None) -> Optional[Path]:
     return None
 
 
-def write_health_marker_from_environment() -> None:
+def write_health_marker_from_environment(
+    payload: Optional[dict[str, object]] = None,
+) -> None:
     marker = os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER", "")
     if not marker:
         return
     path = Path(marker)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("ok\n", encoding="utf-8")
-    _owner_only(path)
+    evidence = dict(payload or {"ok": True})
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    descriptor = -1
+    try:
+        encoded = (
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("The activation health receipt could not be written.")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        _owner_only(path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            if temporary.is_file() and not temporary.is_symlink():
+                temporary.unlink()
+        except OSError:
+            pass
 
 
 def _artifact_from_state(value: object) -> Optional[ComponentArtifactId]:
@@ -2569,6 +3351,149 @@ def _owner_only(path: Path) -> None:
 def _owner_only_directory(path: Path) -> None:
     if os.name != "nt":
         path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _prepare_owner_only_file(path: Path) -> None:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _owner_only(path)
+
+
+def _fsync_file(path: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes on POSIX activation filesystems."""
+
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_tree(path: Path) -> None:
+    """Flush regular files and directory entries before journaling their paths."""
+
+    root = Path(path)
+    if os.name != "posix":
+        return
+    directories = [root]
+    for item in root.rglob("*"):
+        if item.is_symlink():
+            continue
+        if item.is_file():
+            _fsync_file(item)
+        elif item.is_dir():
+            directories.append(item)
+    for directory in reversed(directories):
+        _fsync_directory(directory)
+
+
+def _atomic_exchange(first: Path, second: Path) -> None:
+    """Atomically swap two bundle paths on supported production filesystems."""
+
+    left = Path(first)
+    right = Path(second)
+    if (
+        left.parent.resolve() != right.parent.resolve()
+        or not left.is_dir()
+        or not right.is_dir()
+        or left.is_symlink()
+        or right.is_symlink()
+    ):
+        raise ValueError("Activation bundles must be real directories on one filesystem.")
+
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError("Atomic application bundle exchange is unavailable.")
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            -2,
+            os.fsencode(left),
+            -2,
+            os.fsencode(right),
+            0x00000002,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                f"{left} <-> {right}",
+            )
+        _fsync_directory(left.parent)
+        return
+
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                -100,
+                os.fsencode(left),
+                -100,
+                os.fsencode(right),
+                0x00000002,
+            )
+            if result == 0:
+                _fsync_directory(left.parent)
+                return
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                f"{left} <-> {right}",
+            )
+
+    # Windows is not a supported deployment target. This fallback exists so
+    # local tooling can exercise recovery semantics; macOS never reaches it.
+    temporary = left.parent / (
+        f".{left.name}.{secrets.token_hex(16)}.exchange"
+    )
+    os.replace(left, temporary)
+    try:
+        os.replace(right, left)
+        os.replace(temporary, right)
+    except BaseException:
+        if not left.exists() and temporary.exists():
+            os.replace(temporary, left)
+        raise
 
 
 def _tree_bytes(root: Path) -> int:

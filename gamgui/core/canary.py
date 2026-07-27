@@ -304,7 +304,14 @@ async def run_live_canary(
     if state is None:
         from ..web.server import AppState
 
-        state = AppState.create(preferred_domain=config.domain if config else "")
+        # The candidate runs against a disposable data root, where the ordinary
+        # first-launch component choice is intentionally unanswered. This explicit
+        # canary-only override allows the bounded read-only proof to resolve the
+        # existing Keychain credentials without mutating that scratch component state.
+        state = AppState.create(
+            preferred_domain=config.domain if config else "",
+            allow_first_run_workspace_access=True,
+        )
 
     drive_service = None
     owned_probe: Optional[CanaryPageProbe] = None

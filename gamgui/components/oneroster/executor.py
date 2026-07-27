@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import secrets
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
@@ -11,6 +13,7 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 from gamgui.core.activity import ActivityBusyError, ActivityRegistry
 from gamgui.core.classroom.models import CourseRosterSnapshot
 from gamgui.core.gam.commands import GAMCommands
+from gamgui.core.processes import current_process_identity
 
 from .models import (
     ClassroomImportManifest,
@@ -82,6 +85,8 @@ class OneRosterExecutor:
         self.connector = connector
         self.activity_registry = activity_registry
         self.batch_size = max(1, min(int(batch_size), MAX_BATCH_COMMANDS))
+        self._operation_owner = f"{os.getpid()}:{secrets.token_urlsafe(12)}"
+        self._operation_identity = current_process_identity()
 
     async def execute(
         self,
@@ -117,6 +122,9 @@ class OneRosterExecutor:
             manifest = self.store.claim_manifest(
                 manifest_id,
                 allow_awaiting_students=prepared_student_release,
+                owner_id=self._operation_owner,
+                owner_pid=os.getpid(),
+                owner_identity=self._operation_identity,
             )
             try:
                 planning = await OneRosterPlanner(self.store, self.connector).plan(
@@ -165,6 +173,7 @@ class OneRosterExecutor:
                     current = self.store.record_prepared_live_hash(
                         manifest.id,
                         prepared_planning.live_hash,
+                        owner_id=self._operation_owner,
                     )
                     status = "awaiting_students"
                     error = "OR-STUDENT-GATE-CLOSED" if blocked_students else ""
@@ -179,6 +188,7 @@ class OneRosterExecutor:
                     status=status,
                     error=error,
                     load_actions=False,
+                    owner_id=self._operation_owner,
                 )
                 if current.status == "completed":
                     self.store.maybe_mark_import_accepted(current.id)
@@ -195,6 +205,7 @@ class OneRosterExecutor:
                     status="interrupted",
                     error="OR-EXECUTION-INTERRUPTED",
                     load_actions=False,
+                    owner_id=self._operation_owner,
                 )
                 raise
             except OneRosterError as exc:
@@ -209,6 +220,7 @@ class OneRosterExecutor:
                     status=status,
                     error=exc.code,
                     load_actions=False,
+                    owner_id=self._operation_owner,
                 )
                 raise
             except BaseException:
@@ -217,6 +229,7 @@ class OneRosterExecutor:
                     status="interrupted",
                     error="OR-EXECUTION-INTERRUPTED",
                     load_actions=False,
+                    owner_id=self._operation_owner,
                 )
                 raise
 
@@ -429,6 +442,7 @@ class OneRosterExecutor:
                 if _priority_kind(kind) == priority
             )
             while True:
+                self._require_claim(manifest_id)
                 chunk = self.store.get_pending_action_batch(
                     manifest_id,
                     kinds=stage_kinds,
@@ -448,6 +462,7 @@ class OneRosterExecutor:
                                 "this course failed."
                             ),
                             load_manifest=False,
+                            owner_id=self._operation_owner,
                         )
                         skipped += 1
                     else:
@@ -472,6 +487,7 @@ class OneRosterExecutor:
         applied = failed = skipped = 0
         blocked_courses: set[str] = set()
         for priority in sorted({_priority(action) for action in actions}):
+            self._require_claim(manifest_id)
             stage = [action for action in actions if _priority(action) == priority]
             runnable: list[ImportAction] = []
             for action in stage:
@@ -482,6 +498,7 @@ class OneRosterExecutor:
                         status="skipped",
                         detail="Skipped because a prerequisite action for this course failed.",
                         load_manifest=False,
+                        owner_id=self._operation_owner,
                     )
                     skipped += 1
                 else:
@@ -505,6 +522,7 @@ class OneRosterExecutor:
         owner_ids: Optional[Mapping[str, str]],
         blocked_courses: set[str],
     ) -> tuple[int, int]:
+        self._require_claim(manifest_id)
         commands = [_command_for(action) for action in chunk]
         batch_failed = False
         try:
@@ -529,6 +547,7 @@ class OneRosterExecutor:
                         else "Verified against live Classroom state."
                     ),
                     load_manifest=False,
+                    owner_id=self._operation_owner,
                 )
                 applied += 1
             else:
@@ -538,6 +557,7 @@ class OneRosterExecutor:
                     status="failed",
                     detail="OR-BATCH-VERIFY-FAILED",
                     load_manifest=False,
+                    owner_id=self._operation_owner,
                 )
                 failed += 1
                 if action.kind in {
@@ -548,6 +568,13 @@ class OneRosterExecutor:
                 }:
                     blocked_courses.add(action.subject.casefold())
         return applied, failed
+
+    def _require_claim(self, manifest_id: str) -> None:
+        if not self.store.owns_claim(manifest_id, self._operation_owner):
+            raise OneRosterError(
+                "OR-MANIFEST-LEASE-LOST",
+                "The OneRoster execution lease was lost; no further changes were attempted.",
+            )
 
     async def _verify(
         self,

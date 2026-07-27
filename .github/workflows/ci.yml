@@ -114,10 +114,21 @@ jobs:
       - name: Offline bundle self-test
         run: dist/GamGUI.app/Contents/MacOS/GamGUI --self-test --json
 
+  macos-build-smoke-required:
+    name: macOS application build smoke
+    if: ${{ always() }}
+    needs: macos-build-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every application profile build
+        env:
+          MATRIX_RESULT: ${{ needs.macos-build-smoke.result }}
+        run: test "$MATRIX_RESULT" = "success"
+
   dispatch-post-merge-validation:
     name: dispatch exact-SHA validation
     if: github.event_name == 'push' && github.ref == 'refs/heads/district-main'
-    needs: [test, gam-compat, gam-latest-preview, macos-build-smoke]
+    needs: [test, gam-compat, gam-latest-preview, macos-build-smoke-required]
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -136,9 +147,9 @@ jobs:
         startsWith(github.ref_name, 'automation/') && (
           needs.test.result != 'success' ||
           needs.gam-compat.result != 'success' ||
-          needs.macos-build-smoke.result != 'success'
+          needs.macos-build-smoke-required.result != 'success'
         ) }}
-    needs: [test, gam-compat, gam-latest-preview, macos-build-smoke]
+    needs: [test, gam-compat, gam-latest-preview, macos-build-smoke-required]
     runs-on: ubuntu-latest
     permissions:
       issues: write

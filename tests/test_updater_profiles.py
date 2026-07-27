@@ -861,6 +861,7 @@ def test_verified_file_signing_migration_requires_durable_team_id(tmp_path):
         signing_authority="Developer ID Application: District Admin (ABCDE12345)",
     )
     envelope = verify_bundle_artifact(pending)
+    transaction = "1" * 32
     state = UpdateState(
         installed_sha="a" * 40,
         candidate_sha=SHA,
@@ -876,11 +877,24 @@ def test_verified_file_signing_migration_requires_durable_team_id(tmp_path):
         candidate_signing_channel="developer-id",
         candidate_signing_authority=envelope.signing_authority,
         canary_result="passed",
+        activation_transaction_id=transaction,
     )
     installer = LocalUpdateInstaller(root=tmp_path / "updates")
 
     with pytest.raises(ValueError, match="without approval"):
-        installer._validate_install_request(state, SHA, pending, current)
+        installer._validate_install_request(
+            state,
+            SHA,
+            pending,
+            current,
+            transaction_id=transaction,
+        )
 
     state.candidate_migration_team_id = "ABCDE12345"
-    installer._validate_install_request(state, SHA, pending, current)
+    installer._validate_install_request(
+        state,
+        SHA,
+        pending,
+        current,
+        transaction_id=transaction,
+    )

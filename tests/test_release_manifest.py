@@ -11,6 +11,7 @@ from gamgui.core import release_manifest
 from gamgui.core.components import (
     CORE_PROFILE,
     ONEROSTER_PROFILE,
+    ComponentError,
     build_profile_payload,
     write_artifact_sidecar,
 )
@@ -26,6 +27,7 @@ from gamgui.core.release_manifest import (
     verify_release_assets,
     write_manifest_and_checksum,
 )
+from gamgui.core.updater import _extract_verified_archive
 
 
 SHA = "a" * 40
@@ -406,22 +408,47 @@ def test_release_archive_preflight_bounds_entry_count_and_expanded_size(
         preflight_release_archive(duplicate)
 
 
-def test_release_archive_extraction_is_bounded_to_the_app(tmp_path):
+def test_official_release_archive_matches_safe_installer_extractor(tmp_path):
     archive = tmp_path / "valid.zip"
     info = zipfile.ZipInfo("GamGUI.app/Contents/MacOS/GamGUI")
     info.create_system = 3
     info.external_attr = (stat.S_IFREG | 0o755) << 16
     with zipfile.ZipFile(archive, "w") as handle:
         handle.writestr(info, b"executable")
-        handle.writestr("__MACOSX/GamGUI.app/Contents/MacOS/._GamGUI", b"metadata")
 
-    destination = tmp_path / "extract"
-    destination.mkdir()
-    bundle = extract_release_archive(archive, destination)
+    verifier_destination = tmp_path / "verifier-extract"
+    verifier_destination.mkdir()
+    bundle = extract_release_archive(archive, verifier_destination)
 
-    assert bundle == destination / "GamGUI.app"
+    assert bundle == verifier_destination / "GamGUI.app"
     assert (bundle / "Contents" / "MacOS" / "GamGUI").read_bytes() == b"executable"
-    assert not (destination / "__MACOSX").exists()
+
+    installer_destination = tmp_path / "installer-extract"
+    installer_destination.mkdir()
+    _extract_verified_archive(archive, installer_destination)
+    assert (
+        installer_destination / "GamGUI.app" / "Contents" / "MacOS" / "GamGUI"
+    ).read_bytes() == b"executable"
+
+
+def test_release_archive_rejects_appledouble_metadata_for_installer_compatibility(
+    tmp_path,
+):
+    archive = tmp_path / "appledouble.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("GamGUI.app/Contents/MacOS/GamGUI", b"executable")
+        handle.writestr(
+            "__MACOSX/GamGUI.app/Contents/MacOS/._GamGUI",
+            b"metadata",
+        )
+
+    with pytest.raises(ReleaseManifestError, match="outside GamGUI.app"):
+        preflight_release_archive(archive)
+
+    destination = tmp_path / "installer-extract"
+    destination.mkdir()
+    with pytest.raises(ComponentError, match="unsafe path"):
+        _extract_verified_archive(archive, destination)
 
 
 def test_selected_profile_verification_does_not_require_other_profile_download(

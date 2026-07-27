@@ -16,6 +16,7 @@ from gamgui.components.oneroster import (
     course_display_name,
     section_alias,
 )
+from gamgui.components.oneroster import ingest as ingest_module
 from tests.test_oneroster_helpers import csv_text, valid_files, zip_bytes
 
 
@@ -357,9 +358,52 @@ def test_component_material_is_owner_only(tmp_path: Path) -> None:
     service = OneRosterService("example.org", root)
     snapshot = service.upload(zip_bytes(valid_files()))
     assert root.stat().st_mode & 0o777 == 0o700
+    assert service.store.snapshots_root.stat().st_mode & 0o777 == 0o700
+    assert service.store.snapshot_dir(snapshot.id).stat().st_mode & 0o777 == 0o700
     assert service.store.state_path.stat().st_mode & 0o777 == 0o600
     assert service.store.raw_path(snapshot.id).stat().st_mode & 0o777 == 0o600
     assert service.store.normalized_path(snapshot.id).stat().st_mode & 0o777 == 0o600
+
+
+def test_ingest_permission_failure_stops_before_upload_pii_is_written(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "snapshot" / "raw.zip"
+
+    def fail_chmod(_path, _mode):
+        raise PermissionError("simulated owner-only failure")
+
+    monkeypatch.setattr(ingest_module.os, "chmod", fail_chmod)
+
+    with pytest.raises(PermissionError, match="owner-only"):
+        ingest_module.copy_upload(
+            b"private roster bytes",
+            target,
+            limits=ingest_module.SafetyLimits(),
+        )
+    assert not target.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are meaningful")
+def test_normalized_database_is_owner_only_before_sqlite_opens(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "snapshot" / "normalized.db"
+    observed_modes = []
+
+    def stop_at_connect(value, **_kwargs):
+        candidate = Path(value)
+        observed_modes.append(candidate.stat().st_mode & 0o777)
+        raise RuntimeError("stop after private pre-create")
+
+    monkeypatch.setattr(ingest_module.sqlite3, "connect", stop_at_connect)
+
+    with pytest.raises(RuntimeError, match="private pre-create"):
+        ingest_module._create_normalized_db(path)
+    assert observed_modes == [0o600]
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_naming_and_alias_are_deterministic() -> None:

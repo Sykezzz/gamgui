@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 
 from ...core.activity import ActivityBusyError
 from ...core.canary import CanaryConfigStore
+from ...core.components import ComponentError
 from ...core.connectors.gam_connector import GAMConnector
 from ...core.setup import SetupService
 from ..activity import (
@@ -26,10 +27,44 @@ from ..server import TEMPLATES
 
 router = APIRouter(prefix="/setup")
 
+SETUP_COMPONENT_GATE_MESSAGE = (
+    "Finish the Optional Features choice and restart GamGUI if requested "
+    "before connecting Google Workspace. No Workspace credentials or GAM "
+    "commands were accessed."
+)
+
 
 def _service(request: Request) -> SetupService:
     st = request.app.state.gamgui
     return SetupService(st.vault, st.runner)
+
+
+def _component_gate_response(request: Request) -> HTMLResponse | None:
+    """Refuse setup mutations until the component choice is settled.
+
+    The browser flow already renders Optional Features first, but this check is
+    intentionally server-side so a direct or stale POST cannot trigger a GAM
+    command or a Workspace Keychain read.
+    """
+
+    st = request.app.state.gamgui
+    ensure_manager = getattr(st, "ensure_component_manager", None)
+    manager = (
+        ensure_manager()
+        if callable(ensure_manager)
+        else getattr(st, "component_manager", None)
+    )
+    if manager is None:
+        # Minimal route test doubles predate the component host. Production
+        # AppState always supplies ensure_component_manager().
+        return None
+    if manager.first_run_choice_pending() or manager.status().restart_required:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": SETUP_COMPONENT_GATE_MESSAGE},
+        )
+    return None
 
 
 @router.get("", response_class=HTMLResponse)
@@ -77,6 +112,8 @@ async def do_import(
     admin: Annotated[str, Form()] = "",
     config_dir: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     domain, admin, config_dir = domain.strip(), admin.strip(), config_dir.strip()
     if not domain or not admin or not config_dir:
         return TEMPLATES.TemplateResponse(
@@ -95,14 +132,16 @@ async def do_import(
     try:
         # A scope proof belongs to the credential set that produced it.  Replacing
         # credentials for the same domain must make OneRoster fail closed until
-        # setup verification succeeds again, even if the import itself fails.
-        scope_invalidator = getattr(
-            st.oneroster_service,
-            "invalidate_scope_readiness",
-            None,
-        )
-        if callable(scope_invalidator):
-            scope_invalidator()
+        # setup verification succeeds again, even if the import itself fails or
+        # the optional component is currently absent/disabled.
+        try:
+            st.ensure_component_manager().invalidate_scope_readiness(domain)
+        except ComponentError as exc:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": str(exc)},
+            )
         try:
             imported = svc.import_dir(config_dir, domain)
         except (ValueError, OSError, RuntimeError) as exc:
@@ -136,6 +175,8 @@ async def fresh(
     domain: Annotated[str, Form()] = "",
     admin: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     svc = _service(request)
     info = svc.setup_commands(admin.strip() or "admin@yourdomain.com")
     return TEMPLATES.TemplateResponse(
@@ -150,6 +191,8 @@ async def verify(
     domain: Annotated[str, Form()] = "",
     admin: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     domain, admin = domain.strip(), admin.strip()
     if not domain or not admin:
         return TEMPLATES.TemplateResponse(

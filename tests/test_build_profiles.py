@@ -17,6 +17,7 @@ def test_exact_sha_build_rejects_untracked_packaged_source():
     script = (ROOT / "scripts" / "build_app.sh").read_text(encoding="utf-8")
     assert "git status --porcelain --untracked-files=all" in script
     assert "PACKAGED_SOURCE_STATUS" in script
+    assert "main.py" in script
     assert "gamgui.spec" in script
     assert "scripts/build_app.sh" in script
     assert "scripts/fetch_gam.sh" in script
@@ -37,7 +38,7 @@ def test_app_build_always_reestablishes_pinned_gam_payload_atomically():
     assert 'mktemp -d "$DEST_PARENT/.gam7-stage.XXXXXX"' in fetch
     assert 'mv -- "$INSTALL_STAGE" "$DEST"' in fetch
     assert "checksum mismatch" in fetch
-    assert "no committed checksum" in fetch
+    assert "no pinned checksum" in fetch
 
 
 def test_pyinstaller_profile_excludes_optional_code_and_assets_from_core():

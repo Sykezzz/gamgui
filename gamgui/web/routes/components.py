@@ -366,11 +366,15 @@ async def core_oneroster_deep_link(request: Request) -> HTMLResponse:
     Core profile; the full profile registers ``routes.oneroster.router`` instead.
     """
 
+    component = await component_context(request)
+    component["error_code"] = (
+        str(component.get("error_code", "") or "") or "CMP-NOT-INSTALLED"
+    )
     return TEMPLATES.TemplateResponse(
         request,
         "components.html",
         {
-            "component": await component_context(request),
+            "component": component,
             "deep_link": True,
         },
     )

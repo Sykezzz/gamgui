@@ -47,13 +47,15 @@ def client(app):
 
 def test_token_bootstrap_sets_the_cookie(app):
     c = TestClient(app)
-    r = c.get("/?token=t")
-    assert r.status_code == 200
+    r = c.get("/?token=t", follow_redirects=False)
+    assert r.status_code in {200, 303}
     assert c.cookies.get(TOKEN_COOKIE) == "t"
     # A session cookie: it must not carry an expiry that outlives the browser session.
     set_cookie = r.headers["set-cookie"]
     assert "Max-Age" not in set_cookie and "Expires" not in set_cookie
     assert "HttpOnly" in set_cookie and "SameSite=strict" in set_cookie
+    if r.is_redirect:
+        assert c.get(r.headers["location"]).status_code == 200
     assert c.get("/users").status_code == 200  # the cookie alone carries the next request
 
 

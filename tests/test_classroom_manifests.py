@@ -4,10 +4,12 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 
 import pytest
 
+from gamgui.core.classroom import manifests as manifests_module
 from gamgui.core.classroom.manifests import RosterManifestStore
 from gamgui.core.classroom.models import RosterDiff
 
@@ -151,3 +153,33 @@ def test_stale_roster_owner_cannot_write_target_or_terminal_status(tmp_path):
     unchanged = store.get(manifest.id)
     assert unchanged.status == "running"
     assert unchanged.targets[0].status == "pending"
+
+
+def test_roster_store_permission_failure_prevents_database_creation(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "private" / "ops.db"
+    original_chmod = manifests_module.os.chmod
+
+    def fail_directory_chmod(candidate, mode):
+        if Path(candidate) == path.parent:
+            raise PermissionError("policy denied")
+        return original_chmod(candidate, mode)
+
+    monkeypatch.setattr(manifests_module.os, "chmod", fail_directory_chmod)
+
+    with pytest.raises(PermissionError, match="policy denied"):
+        RosterManifestStore(path)
+
+    assert not path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owner-only mode assertion")
+def test_roster_store_uses_owner_only_directory_and_database_modes(tmp_path):
+    path = tmp_path / "private" / "ops.db"
+
+    RosterManifestStore(path)
+
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600

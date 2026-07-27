@@ -9,8 +9,8 @@ on:
         type: string
 
 concurrency:
-  group: post-merge-${{ inputs.sha }}
-  cancel-in-progress: false
+  group: post-merge-update-ready
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -137,12 +137,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$VALIDATED_SHA"
-          CURRENT="$(
-            git ls-remote --heads origin refs/heads/update-ready |
-              awk '{print $1}'
-          )"
+          git fetch origin district-main:refs/remotes/origin/district-main
+          test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"
           git push \
-            --force-with-lease="refs/heads/update-ready:${CURRENT}" \
             origin \
             "$VALIDATED_SHA:refs/heads/update-ready"
 

@@ -781,6 +781,43 @@ class ComponentManager:
             ]
         self.store.save(state)
 
+    def runtime_projection(self) -> Optional[object]:
+        """Return the updater's validated candidate view without persisting it."""
+
+        if (
+            self.embedded is None
+            or self._embedded_error is not None
+            or os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") != "1"
+        ):
+            return None
+        loader = getattr(self.store, "load_runtime_projection", None)
+        if not callable(loader):
+            return None
+        if getattr(sys, "frozen", False):
+            runtime = _runtime_bundle_path()
+            requested = os.environ.get("GAMGUI_UPDATE_CURRENT_APP", "")
+            try:
+                if (
+                    runtime is None
+                    or not requested
+                    or runtime.resolve() != Path(requested).resolve()
+                ):
+                    return None
+            except OSError:
+                return None
+        try:
+            return loader(self.embedded, os.environ)
+        except (ComponentError, OSError, RuntimeError, ValueError):
+            return None
+
+    def activating_artifact(self) -> Optional[ComponentArtifactId]:
+        projection = self.runtime_projection()
+        return (
+            getattr(projection, "installed_artifact", None)
+            if projection is not None
+            else None
+        )
+
     def status(self) -> ComponentStatus:
         state = self.store.load()
         if self._embedded_error is not None:
@@ -805,6 +842,39 @@ class ComponentManager:
                 installed_components=installed,
                 signing_channel=str(
                     getattr(state, "installed_signing_channel", "") or ""
+                ),
+            )
+        projection = self.runtime_projection()
+        activating = (
+            getattr(projection, "installed_artifact", None)
+            if projection is not None
+            else None
+        )
+        if activating is not None:
+            installed = tuple(
+                getattr(projection, "installed_components", ()) or ()
+            )
+            enabled_items = tuple(
+                getattr(projection, "enabled_components", ()) or ()
+            )
+            enabled = (
+                ONEROSTER_COMPONENT in installed
+                and ONEROSTER_COMPONENT in enabled_items
+            )
+            if ONEROSTER_COMPONENT not in installed:
+                name = ComponentStatusName.NOT_INSTALLED
+            elif enabled:
+                name = ComponentStatusName.ENABLED
+            else:
+                name = ComponentStatusName.INSTALLED_DISABLED
+            return ComponentStatus(
+                state=name.value,
+                profile=activating.profile,
+                enabled=enabled,
+                artifact=activating.to_json(),
+                installed_components=installed,
+                signing_channel=str(
+                    getattr(state, "candidate_signing_channel", "") or ""
                 ),
             )
         installed_profile = normalize_profile(
@@ -1036,6 +1106,7 @@ class ComponentManager:
                 | {ONEROSTER_COMPONENT}
             )
             state.desired_components = [ONEROSTER_COMPONENT]
+            state.component_prompt_answered = True
             state.component_error_code = ""
             state.last_error = ""
             self.store.save(state)
@@ -1053,6 +1124,50 @@ class ComponentManager:
             state.last_error = ""
             self.store.save(state)
         return self.status()
+
+    def invalidate_scope_readiness(self, domain: str) -> bool:
+        """Delete retained OneRoster scope proof without loading optional code.
+
+        Credential replacement is owned by Core and must fail closed even while
+        the OneRoster component is absent or disabled.  The retained component
+        database is therefore invalidated through this narrow, host-owned schema
+        contract instead of relying on a live optional service instance.
+        """
+
+        normalized = (domain or "").strip().casefold()
+        if not normalized:
+            return False
+        state_path = self.component_data_root / "state.db"
+        _require_component_path(state_path, self.data_root)
+        if not state_path.exists():
+            return False
+        if state_path.is_symlink() or not state_path.is_file():
+            raise ComponentError(
+                "CMP-VERIFY-FAILED",
+                "Retained OneRoster access evidence could not be invalidated; "
+                "Workspace credentials were not changed.",
+            )
+        try:
+            with closing(sqlite3.connect(str(state_path))) as connection, connection:
+                table = connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'scope_readiness'
+                    """
+                ).fetchone()
+                if table is None:
+                    return False
+                result = connection.execute(
+                    "DELETE FROM scope_readiness WHERE domain = ?",
+                    (normalized,),
+                )
+        except (OSError, sqlite3.DatabaseError) as exc:
+            raise ComponentError(
+                "CMP-VERIFY-FAILED",
+                "Retained OneRoster access evidence could not be invalidated; "
+                "Workspace credentials were not changed.",
+            ) from exc
+        return result.rowcount > 0
 
     def data_summary(self) -> dict[str, int]:
         root = self.component_data_root
@@ -1182,7 +1297,11 @@ class ComponentManager:
         known_ids: set[str] = set()
         expired_ids: set[str] = set()
         state_path = self.component_data_root / "state.db"
-        if state_path.is_file() and not state_path.is_symlink():
+        if state_path.exists() or state_path.is_symlink():
+            if state_path.is_symlink() or not state_path.is_file():
+                # An unsafe state path cannot prove which snapshots are tracked.
+                # Treat it like an unreadable database and retain everything.
+                return []
             try:
                 with sqlite3.connect(str(state_path)) as connection:
                     tables = {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ from gamgui.core import setup as setup_mod
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 from gamgui.core.setup import DISTRICT_FEATURE_DWD_SCOPES, SetupService, _root_is_sane
+from gamgui.web.routes import setup as setup_routes
+from gamgui.web.routes.setup import SETUP_COMPONENT_GATE_MESSAGE
 from gamgui.web.server import AppState, create_app
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -36,15 +39,94 @@ def ctx(tmp_path, monkeypatch):
     state = AppState(vault=vault, runner=runner, audit_domain="", connector=None, token="t")
     client = TestClient(create_app(state))
     client.get("/?token=t")  # establish the token cookie
+    state.ensure_component_manager().skip_first_run()
     return client, tmp_path, vault, state
 
 
 def test_setup_page_renders(ctx):
-    client = ctx[0]
+    client, _, _, state = ctx
+    manager = state.ensure_component_manager()
+    saved = manager.store.load()
+    saved.component_prompt_answered = False
+    manager.store.save(saved)
     r = client.get("/setup")
     assert r.status_code == 200
     assert "Choose optional features" in r.text
     assert "Connect Google Workspace" not in r.text
+
+
+@pytest.mark.parametrize(
+    ("path", "data"),
+    (
+        (
+            "/setup/import",
+            {
+                "domain": "private.example",
+                "admin": "admin@private.example",
+                "config_dir": "/private/credential-folder",
+            },
+        ),
+        (
+            "/setup/fresh",
+            {
+                "domain": "private.example",
+                "admin": "admin@private.example",
+            },
+        ),
+        (
+            "/setup/verify",
+            {
+                "domain": "private.example",
+                "admin": "admin@private.example",
+            },
+        ),
+    ),
+)
+@pytest.mark.parametrize("gate_state", ("first-run", "restart-required"))
+def test_setup_posts_refuse_component_gate_without_workspace_access(
+    ctx,
+    monkeypatch,
+    path,
+    data,
+    gate_state,
+):
+    client, base, vault, state = ctx
+    manager = state.ensure_component_manager()
+    saved = manager.store.load()
+    if gate_state == "first-run":
+        saved.component_prompt_answered = False
+        saved.candidate_sha = ""
+        saved.pending_app = ""
+        saved.desired_profile = saved.installed_profile
+    else:
+        saved.component_prompt_answered = True
+        saved.candidate_sha = "b" * 40
+        saved.pending_app = str(base / "candidate.app")
+        saved.installed_profile = "core"
+        saved.desired_profile = "classroom-oneroster"
+    manager.store.save(saved)
+
+    def unexpected_access(*_args, **_kwargs):
+        raise AssertionError("setup component gate allowed Workspace access")
+
+    monkeypatch.setattr(setup_routes, "_service", unexpected_access)
+    for name in ("get", "set", "get_all", "set_all", "list_domains", "has_credentials"):
+        monkeypatch.setattr(vault, name, unexpected_access)
+    for name in (
+        "binary_exists",
+        "run_authenticated",
+        "run_authenticated_to_file",
+        "run_in_cfgdir",
+        "version",
+    ):
+        monkeypatch.setattr(state.runner, name, unexpected_access)
+
+    response = client.post(path, data=data)
+
+    assert response.status_code == 200
+    assert SETUP_COMPONENT_GATE_MESSAGE in response.text
+    assert "private.example" not in response.text
+    assert "/private/credential-folder" not in response.text
 
 
 def test_import_shows_dwd_and_stores_creds(ctx):
@@ -68,9 +150,63 @@ def test_import_replacement_invalidates_oneroster_scope_proof(ctx):
     (cfg / "oauth2service.json").write_text(
         json.dumps({"client_id": "REPLACEMENT.apps", "type": "service_account"})
     )
-    invalidations: list[bool] = []
-    state.oneroster_service = SimpleNamespace(
-        invalidate_scope_readiness=lambda: invalidations.append(True)
+    manager = state.ensure_component_manager()
+    manager.component_data_root.mkdir(parents=True)
+    state_db = manager.component_data_root / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE scope_readiness (
+                domain TEXT PRIMARY KEY,
+                scope_hash TEXT NOT NULL,
+                verified_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO scope_readiness VALUES (?, ?, ?)",
+            ("ex.com", "a" * 64, 123.0),
+        )
+        connection.execute(
+            "INSERT INTO scope_readiness VALUES (?, ?, ?)",
+            ("other.example", "b" * 64, 456.0),
+        )
+    state.oneroster_service = None
+
+    response = client.post(
+        "/setup/import",
+        data={
+            "domain": "ex.com",
+            "admin": "a@ex.com",
+            "config_dir": str(cfg),
+        },
+    )
+
+    assert response.status_code == 200
+    with sqlite3.connect(state_db) as connection:
+        remaining = connection.execute(
+            "SELECT domain FROM scope_readiness ORDER BY domain",
+        ).fetchall()
+    assert remaining == [("other.example",)]
+
+
+def test_failed_import_still_invalidates_oneroster_scope_proof(
+    ctx,
+    monkeypatch,
+):
+    client, base, _vault, state = ctx
+    cfg = base / "broken-replacement"
+    cfg.mkdir()
+    invalidations: list[str] = []
+    manager = state.ensure_component_manager()
+    manager.invalidate_scope_readiness = invalidations.append
+
+    def fail_import(*_args, **_kwargs):
+        raise RuntimeError("controlled import failure")
+
+    monkeypatch.setattr(
+        "gamgui.web.routes.setup.SetupService.import_dir",
+        fail_import,
     )
 
     response = client.post(
@@ -83,39 +219,36 @@ def test_import_replacement_invalidates_oneroster_scope_proof(ctx):
     )
 
     assert response.status_code == 200
-    assert invalidations == [True]
+    assert "controlled import failure" in response.text
+    assert invalidations == ["ex.com"]
 
 
-def test_failed_import_still_invalidates_oneroster_scope_proof(
+def test_import_stops_before_credentials_change_when_scope_proof_cannot_be_invalidated(
     ctx,
-    monkeypatch,
 ):
-    client, base, _vault, state = ctx
-    cfg = base / "broken-replacement"
+    client, base, vault, state = ctx
+    cfg = base / "replacement-with-corrupt-state"
     cfg.mkdir()
-    invalidations: list[bool] = []
-    state.oneroster_service = SimpleNamespace(
-        invalidate_scope_readiness=lambda: invalidations.append(True)
+    (cfg / "oauth2.txt").write_text("replacement-token")
+    (cfg / "oauth2service.json").write_text(
+        json.dumps({"client_id": "REPLACEMENT.apps", "type": "service_account"})
+    )
+    manager = state.ensure_component_manager()
+    manager.component_data_root.mkdir(parents=True)
+    (manager.component_data_root / "state.db").write_bytes(b"not-sqlite")
+
+    response = client.post(
+        "/setup/import",
+        data={
+            "domain": "ex.com",
+            "admin": "a@ex.com",
+            "config_dir": str(cfg),
+        },
     )
 
-    def fail_import(*_args, **_kwargs):
-        raise RuntimeError("controlled import failure")
-
-    monkeypatch.setattr(
-        "gamgui.web.routes.setup.SetupService.import_dir",
-        fail_import,
-    )
-
-    with pytest.raises(RuntimeError, match="controlled import failure"):
-        client.post(
-            "/setup/import",
-            data={
-                "domain": "ex.com",
-                "admin": "a@ex.com",
-                "config_dir": str(cfg),
-            },
-        )
-    assert invalidations == [True]
+    assert response.status_code == 200
+    assert "could not be invalidated" in response.text
+    assert not vault.has_credentials("ex.com")
 
 
 def test_import_requires_fields(ctx):

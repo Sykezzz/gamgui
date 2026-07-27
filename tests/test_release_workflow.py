@@ -97,6 +97,11 @@ def test_release_builds_both_profiles_and_verifies_downloadable_archives():
     assert '--expected-team-id "$EXPECTED_TEAM_ID"' in workflow
     assert "release-manifest.json.sha256" in workflow
     assert ".venv/bin/pytest -q" in workflow
+    assert 'ditto -c -k --norsrc --keepParent "$APP" "$ARCHIVE"' in workflow
+    assert (
+        'ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"'
+        not in workflow
+    )
 
     assert not PACKAGER.exists()
 

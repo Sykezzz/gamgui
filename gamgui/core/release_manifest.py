@@ -106,19 +106,7 @@ def preflight_release_archive(path: Path) -> None:
                         "Release archive contains an encrypted entry."
                     )
 
-                if pure.parts[0] == "GamGUI.app":
-                    pass
-                elif pure.parts[0] == "__MACOSX":
-                    # ditto may add AppleDouble metadata. It is accepted only when
-                    # it corresponds to the single allowlisted application bundle.
-                    if len(pure.parts) < 2 or not (
-                        pure.parts[1] == "GamGUI.app"
-                        or pure.parts[1] == "._GamGUI.app"
-                    ):
-                        raise ReleaseManifestError(
-                            "Release archive contains an unexpected AppleDouble path."
-                        )
-                else:
+                if pure.parts[0] != "GamGUI.app":
                     raise ReleaseManifestError(
                         "Release archive contains content outside GamGUI.app."
                     )

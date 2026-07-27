@@ -15,8 +15,26 @@ from gamgui.components.oneroster import (
     ThresholdProfile,
     evaluate_thresholds,
 )
-from gamgui.components.oneroster.store import action_sequence_hash
+from gamgui.components.oneroster.store import _issue_from_record, action_sequence_hash
 from tests.test_oneroster_helpers import valid_files, zip_bytes
+
+
+def test_persisted_manifest_exclusion_rehydrates_as_import_issue() -> None:
+    issue = _issue_from_record(
+        {
+            "code": "OR-REFERENCE",
+            "severity": "error",
+            "message": "Missing referenced user.",
+            "entity_kind": "enrollment",
+            "source_id": "enrollment-1",
+            "row_number": 7,
+            "blocking": True,
+        }
+    )
+
+    assert issue.code == "OR-REFERENCE"
+    assert issue.row_number == 7
+    assert issue.blocking is True
 
 
 def test_thresholds_hold_on_count_percent_baseline_and_blackout() -> None:
@@ -137,6 +155,8 @@ def test_manifest_basis_is_immutable_results_are_resumable_and_limited_filters(
     )
     assert [item.id for item in manifest.actions] == ["add"]
     digest = manifest.manifest_hash
+    service.store.confirm_manifest(manifest.id, import_id)
+    service.store.claim_manifest(manifest.id)
     updated = service.mark_action_result(
         manifest.id, "add", status="applied", detail="verified"
     )
@@ -185,6 +205,8 @@ def test_manifest_store_streams_pending_hash_counts_and_bounded_batches(
     assert len(batch) == 50
     assert all(action.kind == "teacher_add" for action in batch)
 
+    service.store.confirm_manifest(manifest.id, import_id)
+    service.store.claim_manifest(manifest.id)
     for action in batch:
         service.store.mark_action_result(
             manifest.id,

@@ -59,7 +59,6 @@ class OneRosterService:
         self.store = OneRosterStore(domain, root)
         self.safety_limits = safety_limits
         self.activity_registry = activity_registry
-        self.store.mark_running_interrupted()
 
     @property
     def domain(self) -> str:

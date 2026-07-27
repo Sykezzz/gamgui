@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -26,7 +27,14 @@ from gamgui.core.components import (
     verify_bundle_artifact,
     write_artifact_sidecar,
 )
-from gamgui.core.updater import UpdateState, UpdateStateStore
+from gamgui.core.updater import (
+    ACTIVATION_CURRENT_APP_ENV,
+    ACTIVATION_PROBE_ENV,
+    ACTIVATION_TRANSACTION_ENV,
+    INSTALLED_SOURCE_EVIDENCE,
+    UpdateState,
+    UpdateStateStore,
+)
 
 SHA = "a" * 40
 
@@ -158,6 +166,7 @@ def test_component_manager_first_run_enable_disable_and_purge(tmp_path):
     assert manager.first_run_choice_pending()
     assert manager.status().state == "installed-disabled"
     assert manager.enable().state == "enabled"
+    assert not manager.first_run_choice_pending()
     assert manager.disable().state == "installed-disabled"
     assert manager.skip_first_run().state == "installed-disabled"
     assert not manager.first_run_choice_pending()
@@ -178,6 +187,135 @@ def test_component_manager_first_run_enable_disable_and_purge(tmp_path):
     summary = manager.purge_data("OneRoster")
     assert summary["files"] == 1
     assert not manager.component_data_root.exists()
+
+
+def test_candidate_profile_is_visible_only_during_exact_updater_health_start(
+    tmp_path,
+    monkeypatch,
+):
+    store = UpdateStateStore(tmp_path / "data" / "updates" / "state.json")
+    embedded = EmbeddedProfile.from_json(
+        build_profile_payload(
+            ONEROSTER_PROFILE,
+            source_sha=SHA,
+            version="1",
+            architecture="arm64",
+            minimum_macos_version="12.0",
+            packaging_revision="1",
+        )
+    )
+    candidate = embedded.artifact
+    transaction = "1" * 32
+    pending = (
+        store.path.parent
+        / "pending"
+        / SHA
+        / ONEROSTER_PROFILE
+        / "GamGUI.app"
+    )
+    current = tmp_path / "Applications" / "GamGUI.app"
+    for bundle in (pending, current):
+        executable = bundle / "Contents" / "MacOS" / "GamGUI"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("binary", encoding="utf-8")
+    store.save(
+        UpdateState(
+            installed_sha=SHA,
+            candidate_sha=SHA,
+            pending_app=str(pending),
+            installed_profile=CORE_PROFILE,
+            desired_profile=ONEROSTER_PROFILE,
+            desired_components=[ONEROSTER_COMPONENT],
+            candidate_artifact=candidate,
+            activation_kind="component-swap",
+            component_prompt_answered=True,
+            required_check_evidence=[INSTALLED_SOURCE_EVIDENCE],
+            activation_transaction_id=transaction,
+        )
+    )
+    manager = ComponentManager(
+        store=store,
+        registry=ActivityRegistry(),
+        data_root=tmp_path / "data",
+        embedded=embedded,
+    )
+
+    assert manager.status().profile == CORE_PROFILE
+    monkeypatch.setenv("GAMGUI_SKIP_UPDATE_ONCE", "1")
+    monkeypatch.setenv(ACTIVATION_PROBE_ENV, "1")
+    monkeypatch.setenv(ACTIVATION_TRANSACTION_ENV, transaction)
+    monkeypatch.setenv(ACTIVATION_CURRENT_APP_ENV, str(current))
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", SHA)
+    monkeypatch.setenv(
+        "GAMGUI_UPDATE_HEALTH_MARKER",
+        str(store.path.parent / "health" / f"{transaction}.json"),
+    )
+    activating = manager.status()
+    assert activating.profile == ONEROSTER_PROFILE
+    assert activating.enabled
+
+    monkeypatch.setenv("GAMGUI_INSTALLED_SHA", "b" * 40)
+    assert manager.status().profile == CORE_PROFILE
+
+
+def test_runtime_projection_rehashes_the_live_candidate_bundle(tmp_path):
+    store = UpdateStateStore(tmp_path / "data" / "updates" / "state.json")
+    pending = _embedded_bundle(
+        store.path.parent / "pending" / SHA / ONEROSTER_PROFILE,
+        ONEROSTER_PROFILE,
+    )
+    envelope = verify_bundle_artifact(
+        pending,
+        sidecar=write_artifact_sidecar(
+            pending,
+            signing_channel="local",
+            signing_authority="GamGUI Local",
+        ),
+    )
+    current = tmp_path / "Applications" / "GamGUI.app"
+    shutil.copytree(pending, current)
+    embedded = EmbeddedProfile.from_json(
+        build_profile_payload(
+            ONEROSTER_PROFILE,
+            source_sha=SHA,
+            version="1.2.3",
+            architecture="arm64",
+            minimum_macos_version="12.0",
+            packaging_revision="7",
+        )
+    )
+    transaction = "4" * 32
+    store.save(
+        UpdateState(
+            installed_sha=SHA,
+            candidate_sha=SHA,
+            pending_app=str(pending),
+            installed_profile=CORE_PROFILE,
+            desired_profile=ONEROSTER_PROFILE,
+            desired_components=[ONEROSTER_COMPONENT],
+            candidate_artifact=envelope.artifact,
+            activation_kind="component-swap",
+            required_check_evidence=[INSTALLED_SOURCE_EVIDENCE],
+            activation_transaction_id=transaction,
+        )
+    )
+    environment = {
+        "GAMGUI_SKIP_UPDATE_ONCE": "1",
+        ACTIVATION_PROBE_ENV: "1",
+        ACTIVATION_TRANSACTION_ENV: transaction,
+        ACTIVATION_CURRENT_APP_ENV: str(current),
+        "GAMGUI_INSTALLED_SHA": SHA,
+        "GAMGUI_UPDATE_HEALTH_MARKER": str(
+            store.path.parent / "health" / f"{transaction}.json"
+        ),
+    }
+
+    assert store.load_runtime_projection(embedded, environment) is not None
+    (current / "Contents" / "MacOS" / "GamGUI").write_text(
+        "tampered",
+        encoding="utf-8",
+    )
+    assert store.load_runtime_projection(embedded, environment) is None
 
 
 def test_core_cleanup_marks_tracked_snapshot_expired(tmp_path):
@@ -233,6 +371,34 @@ def test_core_cleanup_marks_tracked_snapshot_expired(tmp_path):
             "SELECT state FROM imports WHERE id = ?",
             ("1" * 32,),
         ).fetchone()[0] == "expired"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation is privileged on Windows")
+def test_core_cleanup_fails_closed_for_symlinked_state_database(tmp_path):
+    manager = ComponentManager(
+        store=UpdateStateStore(tmp_path / "updates.json"),
+        registry=ActivityRegistry(),
+        data_root=tmp_path / "data",
+        embedded=EmbeddedProfile.from_json(
+            build_profile_payload(
+                CORE_PROFILE,
+                source_sha=SHA,
+                version="1",
+                architecture="arm64",
+                minimum_macos_version="12.0",
+                packaging_revision="1",
+            )
+        ),
+    )
+    snapshot = manager.component_data_root / "snapshots" / ("1" * 32)
+    snapshot.mkdir(parents=True)
+    os.utime(snapshot, (1.0, 1.0))
+    target = tmp_path / "untrusted.db"
+    target.write_bytes(b"not a trusted component database")
+    (manager.component_data_root / "state.db").symlink_to(target)
+
+    assert manager.cleanup_expired_snapshots(now=31 * 86400 + 2) == []
+    assert snapshot.is_dir()
 
 
 def test_retained_data_summary_counts_scope_and_denial_evidence(tmp_path):

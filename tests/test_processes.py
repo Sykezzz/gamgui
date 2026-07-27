@@ -22,6 +22,6 @@ def test_nonlinux_process_identity_forces_stable_locale_and_timezone(monkeypatch
     identity = processes._posix_process_identity(123)
 
     assert identity == "posix:Thu Jul 23 05:29:03 2026"
-    assert observed["argv"] == ["ps", "-o", "lstart=", "-p", "123"]
+    assert observed["argv"] == ["/bin/ps", "-o", "lstart=", "-p", "123"]
     assert observed["env"]["LC_ALL"] == "C"
     assert observed["env"]["TZ"] == "UTC0"

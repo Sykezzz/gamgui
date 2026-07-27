@@ -27,6 +27,7 @@ fi
 SOURCE_SHA="$(git rev-parse HEAD)"
 PACKAGED_SOURCE_STATUS="$(
   git status --porcelain --untracked-files=all -- \
+    main.py \
     gamgui \
     gamgui.spec \
     Makefile \

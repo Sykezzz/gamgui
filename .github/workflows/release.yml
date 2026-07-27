@@ -487,7 +487,9 @@ jobs:
             SIDECAR="$OFFICIAL_DIST/$ASSET_STEM.artifact.json"
             EVIDENCE="$OFFICIAL_DIST/$ASSET_STEM.evidence.json"
             cp "$APP.artifact.json" "$SIDECAR"
-            ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
+            # Official install archives intentionally omit AppleDouble metadata.
+            # The signed bundle contents are verified again after archive extraction.
+            ditto -c -k --norsrc --keepParent "$APP" "$ARCHIVE"
             .venv/bin/python scripts/release_manifest.py record \
               --profile "$PROFILE" \
               --bundle "$APP" \
