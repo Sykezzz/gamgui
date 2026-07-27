@@ -866,11 +866,20 @@ async def test_run_subscribe_bounds_its_log_at_scale():
     emails = [f"u{i}@example.com" for i in range(500)]
     conn = types.SimpleNamespace(subscribe_calendar_for=lambda e, c: _subscribe_result(e))
     job = BatchJob(id="x", total=len(emails))
-    await _run_subscribe(job, conn, "c@group.calendar.google.com", emails)
+    released: list[bool] = []
+    lease = types.SimpleNamespace(release=lambda: released.append(True))
+    await _run_subscribe(
+        job,
+        conn,
+        "c@group.calendar.google.com",
+        emails,
+        lease=lease,
+    )
     assert job.done == 500 and job.applied == 490 and len(job.failed) == 10
     assert len(job.log) == _SUBSCRIBE_LOG_WINDOW
     assert job.log[-1].endswith("u499@example.com")
     assert job.finished and job.current == ""
+    assert released == [True]
 
 
 async def _subscribe_result(email: str):

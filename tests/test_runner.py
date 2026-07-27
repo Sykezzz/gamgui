@@ -4,13 +4,14 @@ import asyncio
 import os
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
 from gamgui.core.gam.errors import GAMError, GAMErrorKind
-from gamgui.core.gam.runner import GAMRunner
+from gamgui.core.gam.runner import GAMRunner, secure_remove_private_file
 
 
 async def test_version(runner):
@@ -119,6 +120,103 @@ async def test_spool_is_removed_when_consumer_fails(vault, tmp_path, domain):
     assert list(tmp_path.glob("gamcfg-*")) == []
 
 
+def test_secure_private_remove_retries_transient_unlink_failure(
+    tmp_path,
+    monkeypatch,
+):
+    private = tmp_path / "private.tmp"
+    private.write_bytes(b"sensitive")
+    original_unlink = Path.unlink
+    calls = 0
+
+    def transient(self, *args, **kwargs):
+        nonlocal calls
+        if self == private and calls < 2:
+            calls += 1
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", transient)
+
+    assert secure_remove_private_file(private)
+    assert calls == 2
+    assert not private.exists()
+
+
+def test_secure_private_remove_reports_persistent_lock(tmp_path, monkeypatch):
+    private = tmp_path / "private.tmp"
+    private.write_bytes(b"sensitive")
+    original_unlink = Path.unlink
+
+    def locked(self, *args, **kwargs):
+        if self == private:
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+
+    assert not secure_remove_private_file(private, attempts=2)
+    assert private.exists()
+
+
+async def test_spool_cleanup_failure_never_masks_consumer_failure(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def cleanup_failed(_path):
+        return False
+
+    monkeypatch.setattr(
+        "gamgui.core.gam.runner.await_secure_remove_private_file",
+        cleanup_failed,
+    )
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "print('private output')"],
+        ):
+            raise RuntimeError("consumer failed")
+
+
+async def test_spool_cleanup_failure_surfaces_after_success(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def cleanup_failed(_path):
+        return False
+
+    monkeypatch.setattr(
+        "gamgui.core.gam.runner.await_secure_remove_private_file",
+        cleanup_failed,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be removed securely"):
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "print('private output')"],
+        ):
+            pass
+
+
 async def test_cancelling_spooled_command_stops_process_and_removes_files(
     vault, tmp_path, domain
 ):
@@ -190,3 +288,130 @@ async def test_cancelling_buffered_command_kills_and_reaps_process(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert process.killed and process.waited and process.returncode == -9
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="pass_fds is a POSIX subprocess contract",
+)
+async def test_runner_inherits_active_durable_descriptor_for_all_spawn_paths(
+    vault,
+    tmp_path,
+    monkeypatch,
+):
+    class Registry:
+        def __init__(self):
+            self.calls = 0
+
+        @contextmanager
+        def subprocess_pass_fds(self):
+            self.calls += 1
+            yield (91,)
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    spawned = []
+
+    async def create_process(*args, **kwargs):
+        spawned.append((args, kwargs))
+        return Process()
+
+    binary = tmp_path / "gam"
+    binary.write_text("mock", encoding="utf-8")
+    registry = Registry()
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=binary,
+        base_dir=tmp_path,
+        activity_registry=registry,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    await runner._exec(["version"], tmp_path, 15)
+    await runner._exec_to_file(
+        ["print", "users"],
+        tmp_path,
+        15,
+        tmp_path / "stdout.tmp",
+    )
+
+    assert registry.calls == 2
+    assert len(spawned) == 2
+    for _args, options in spawned:
+        assert options["close_fds"] is True
+        assert options["pass_fds"] == (91,)
+
+
+async def test_runner_does_not_add_posix_spawn_options_without_durable_lease(
+    vault,
+    tmp_path,
+    monkeypatch,
+):
+    class Registry:
+        @contextmanager
+        def subprocess_pass_fds(self):
+            yield ()
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    spawned = []
+
+    async def create_process(*args, **kwargs):
+        spawned.append(kwargs)
+        return Process()
+
+    binary = tmp_path / "gam"
+    binary.write_text("mock", encoding="utf-8")
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=binary,
+        base_dir=tmp_path,
+        activity_registry=Registry(),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    await runner._exec(["version"], tmp_path, 15)
+
+    assert len(spawned) == 1
+    assert "pass_fds" not in spawned[0]
+
+
+async def test_runner_refuses_spawn_when_durable_descriptor_validation_fails(
+    vault,
+    tmp_path,
+    monkeypatch,
+):
+    class Registry:
+        @contextmanager
+        def subprocess_pass_fds(self):
+            raise RuntimeError("durable lock unavailable")
+            yield ()
+
+    called = False
+
+    async def create_process(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("unprotected GAM must not be spawned")
+
+    binary = tmp_path / "gam"
+    binary.write_text("mock", encoding="utf-8")
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=binary,
+        base_dir=tmp_path,
+        activity_registry=Registry(),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(RuntimeError, match="durable lock unavailable"):
+        await runner._exec(["version"], tmp_path, 15)
+    assert not called

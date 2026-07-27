@@ -15,6 +15,7 @@ unit tests pin today's intended form so drift is caught early.
 
 from __future__ import annotations
 
+import shlex
 from typing import List, Optional, Sequence
 
 # The GAM7 version GamGUI is pinned to and tested against — the SINGLE SOURCE OF TRUTH.
@@ -69,6 +70,9 @@ COURSE_INDEX_FIELDS = (
 COURSE_DETAIL_FIELDS = COURSE_INDEX_FIELDS + (
     "descriptionHeading", "description",
 )
+# OneRoster planning resolves every source identity from one Directory snapshot.
+# Do not add profile, security, recovery, or organizational fields to this projection.
+ONEROSTER_DIRECTORY_FIELDS = ("id", "primaryEmail", "aliases", "suspended")
 COURSE_STATES = ("active", "archived", "provisioned", "declined", "suspended")
 COURSE_ROSTER_ROLES = ("teachers", "students")
 # Superset fetched once and cached to serve the users list (needs title), reports, AND the detail
@@ -186,6 +190,17 @@ class GAMCommands:
 
     # --- Classroom --------------------------------------------------------------------
     @staticmethod
+    def print_oneroster_directory() -> List[str]:
+        """Read only identity fields needed for a district OneRoster plan."""
+        return [
+            "print",
+            "users",
+            "fields",
+            ",".join(ONEROSTER_DIRECTORY_FIELDS),
+            "formatjson",
+        ]
+
+    @staticmethod
     def print_courses(
         states: Optional[Sequence[str]] = None,
         teacher: str = "",
@@ -203,6 +218,31 @@ class GAMCommands:
             argv += ["states", ",".join(_validate_course_state(state) for state in states)]
         argv += ["fields", ",".join(fields or COURSE_INDEX_FIELDS), "formatjson"]
         return argv
+
+    @staticmethod
+    def print_oneroster_courses_file(path: str) -> List[str]:
+        """Resolve exact managed aliases from one private GAM ``CourseEntity`` file.
+
+        ``aliases`` is intentionally enabled for this exact-set read.  GAM returns
+        each successful course's aliases, which lets the connector associate sparse
+        results with their requested ``Section_<ID>`` without recursively launching
+        more GAM processes.
+        """
+
+        value = str(path or "")
+        if not value or any(character in value for character in "\r\n\x00"):
+            raise ValueError("invalid managed Classroom selector path")
+        return [
+            "print",
+            "courses",
+            "course",
+            "file",
+            value,
+            "aliases",
+            "fields",
+            ",".join(COURSE_INDEX_FIELDS),
+            "formatjson",
+        ]
 
     @staticmethod
     def info_course(
@@ -269,6 +309,31 @@ class GAMCommands:
         ]
 
     @staticmethod
+    def update_course_roster_metadata(
+        course_id: str,
+        *,
+        name: str,
+        section: str = "",
+        room: str = "",
+    ) -> List[str]:
+        """Update only fields controlled by a OneRoster snapshot.
+
+        Descriptions are intentionally omitted so district rostering never clears
+        teacher-authored content.
+        """
+        return [
+            "update",
+            "course",
+            course_id,
+            "name",
+            name,
+            "section",
+            section,
+            "room",
+            room,
+        ]
+
+    @staticmethod
     def update_course_state(course_id: str, state: str) -> List[str]:
         return ["update", "course", course_id, "state", _validate_course_state(state)]
 
@@ -285,12 +350,77 @@ class GAMCommands:
         ]
 
     @staticmethod
+    def print_course_participants_many(
+        course_ids: Sequence[str],
+        role: str = "all",
+    ) -> List[str]:
+        """Read rosters for an exact bounded course set in one GAM process."""
+        selected = [str(course_id).strip() for course_id in course_ids]
+        if not selected or len(selected) > 50:
+            raise ValueError("course_ids must contain between 1 and 50 courses")
+        if any(not course_id or any(ch in course_id for ch in "\r\n\x00") for course_id in selected):
+            raise ValueError("course_ids contain an invalid Classroom course reference")
+        normalized_role = str(role or "").strip().casefold()
+        if normalized_role not in {"all", "teachers", "students"}:
+            raise ValueError("invalid Classroom roster role")
+        argv = ["print", "course-participants"]
+        for course_id in selected:
+            argv += ["course", course_id]
+        return argv + ["show", normalized_role, "formatjson"]
+
+    @staticmethod
+    def print_course_participants_file(
+        path: str,
+        role: str = "all",
+    ) -> List[str]:
+        """Read exact course rosters from one private GAM ``CourseEntity`` file."""
+
+        value = str(path or "")
+        if not value or any(character in value for character in "\r\n\x00"):
+            raise ValueError("invalid Classroom roster selector path")
+        normalized_role = str(role or "").strip().casefold()
+        if normalized_role not in {"all", "teachers", "students"}:
+            raise ValueError("invalid Classroom roster role")
+        return [
+            "print",
+            "course-participants",
+            "course",
+            "file",
+            value,
+            "show",
+            normalized_role,
+            "formatjson",
+        ]
+
+    @staticmethod
     def add_course_participant(course_id: str, role: str, email: str) -> List[str]:
         return ["course", course_id, "add", _validate_course_role(role), email]
 
     @staticmethod
     def remove_course_participant(course_id: str, role: str, email: str) -> List[str]:
         return ["course", course_id, "remove", _validate_course_role(role), email]
+
+    @staticmethod
+    def batch_file(path: str, *, show_commands: bool = False) -> List[str]:
+        """Run one private, locally generated GAM batch file."""
+        value = str(path or "")
+        if not value or any(character in value for character in "\r\n\x00"):
+            raise ValueError("invalid GAM batch path")
+        return ["batch", value, "showcmds", "true" if show_commands else "false"]
+
+    @staticmethod
+    def batch_line(argv: Sequence[str]) -> str:
+        """Serialize one allowlisted argv vector as a GAM batch line.
+
+        ``shlex.join`` quotes each argument independently. Newlines and NUL bytes
+        are rejected before serialization so no value can inject a second command.
+        """
+        command = [str(argument) for argument in argv]
+        if not command:
+            raise ValueError("a GAM batch command cannot be empty")
+        if any(any(character in argument for character in "\r\n\x00") for argument in command):
+            raise ValueError("GAM batch arguments cannot contain control-line characters")
+        return "gam " + shlex.join(command)
 
     # --- users (mutating) -------------------------------------------------------------
     @staticmethod

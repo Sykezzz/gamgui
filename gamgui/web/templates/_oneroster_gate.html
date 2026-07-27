@@ -1,0 +1,49 @@
+{% if notice %}<div class="mb-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>{% endif %}
+{% if gate.hold_code %}
+<div class="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="alert">
+  <p>{{ gate.hold_detail | default("The gate is held pending review.") }}</p>
+  <p class="mt-1 text-xs">Hold code: <code class="font-mono">{{ gate.hold_code }}</code></p>
+</div>
+{% endif %}
+<dl class="grid gap-3 text-sm sm:grid-cols-2">
+  <div><dt class="text-brand-blueink">State</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ gate.state | default("CLOSED") }}</dd></div>
+  <div><dt class="text-brand-blueink">Timezone</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ gate.timezone | default("America/Chicago") }}</dd></div>
+  {% if gate.manifest_id %}<div><dt class="text-brand-blueink">Manifest</dt><dd class="mt-0.5 font-mono text-xs text-brand-black">{{ gate.manifest_id }}</dd></div>{% endif %}
+  {% if gate.release_at %}<div><dt class="text-brand-blueink">Release</dt><dd class="mt-0.5 tabular-nums text-brand-black">{{ gate.release_at }}</dd></div>{% endif %}
+</dl>
+{% if gate.manifest_id %}
+<button type="button"
+        class="mt-3 rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+        hx-get="/classroom/imports/manifest/{{ gate.manifest_id }}"
+        hx-target="#oneroster-workspace"
+        hx-swap="innerHTML">View release manifest</button>
+{% endif %}
+<details class="mt-4 rounded-xl border border-brand-gray/40 p-3">
+  <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Change gate state</summary>
+  <div class="mt-3 space-y-4">
+    <form hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
+      <input type="hidden" name="target_state" value="CLOSED" />
+      <button type="submit" class="rounded-lg border border-brand-gray/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Close gate</button>
+    </form>
+    <form class="space-y-2 border-t border-brand-gray/30 pt-3" hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
+      <input type="hidden" name="target_state" value="ARMED" />
+      <p class="text-sm font-semibold text-brand-black">Arm a scheduled release</p>
+      <input name="manifest_id" required placeholder="Approved manifest ID" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <input name="manifest_hash" required placeholder="Approved manifest hash" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 font-mono text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <label class="block text-sm font-medium text-brand-black">Release time (America/Chicago)
+        <input type="datetime-local" name="release_at" required class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <button type="submit" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Arm gate</button>
+    </form>
+    <form class="space-y-2 border-t border-brand-gray/30 pt-3" hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
+      <input type="hidden" name="target_state" value="OPEN" />
+      <p class="text-sm font-semibold text-brand-black">Open immediately after server-side revalidation</p>
+      <p class="text-xs text-brand-blueink">The server re-reads source, thresholds, Directory, and Classroom for the exact armed manifest. Browser-supplied hashes are never accepted as current evidence.</p>
+      <input name="manifest_id" required value="{{ gate.manifest_id | default('') }}" placeholder="Armed manifest ID" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <label class="block text-sm font-medium text-brand-black">Type <span class="font-mono">OPEN</span>
+        <input name="confirmation" required autocomplete="off" class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 text-sm focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-500/30" />
+      </label>
+      <button type="submit" class="rounded-lg bg-amber-800 px-3 py-1.5 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Revalidate and open gate</button>
+    </form>
+  </div>
+</details>

@@ -7,7 +7,8 @@ import hashlib
 import io
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 COURSE_STATES = ("ACTIVE", "ARCHIVED", "PROVISIONED", "DECLINED", "SUSPENDED")
 ROSTER_ROLES = ("teachers", "students")
@@ -187,6 +188,123 @@ class CourseParticipant:
     @property
     def label(self) -> str:
         return self.full_name or self.email or self.user_id
+
+
+@dataclass(frozen=True)
+class CourseRosterSnapshot(Sequence[CourseParticipant]):
+    """Compact rosters plus proof that every requested course was represented.
+
+    GAM's bulk roster export emits one row per course, including an explicit row
+    with empty participant arrays.  Keeping that coverage evidence separate from
+    the flattened participants prevents an omitted course from being mistaken for
+    a genuinely empty roster.  Only deduplicated emails are retained; participant
+    objects are generated lazily for compatibility so million-member imports do
+    not keep a dataclass and raw mapping per membership in memory.
+    """
+
+    rosters: Mapping[str, Tuple[frozenset[str], frozenset[str]]]
+    seen_course_ids: frozenset[str]
+
+    def __post_init__(self) -> None:
+        compact: Dict[str, Tuple[frozenset[str], frozenset[str]]] = {}
+        for raw_course_id, roles in self.rosters.items():
+            course_id = str(raw_course_id).strip()
+            if not course_id or not isinstance(roles, tuple) or len(roles) != 2:
+                raise ValueError("invalid compact Classroom roster snapshot")
+            compact[course_id] = (
+                frozenset(normalize_email(email) for email in roles[0] if normalize_email(email)),
+                frozenset(normalize_email(email) for email in roles[1] if normalize_email(email)),
+            )
+        object.__setattr__(self, "rosters", MappingProxyType(compact))
+        object.__setattr__(
+            self,
+            "seen_course_ids",
+            frozenset(
+                str(course_id).strip()
+                for course_id in self.seen_course_ids
+                if str(course_id).strip()
+            ),
+        )
+
+    @classmethod
+    def empty(cls, course_ids: Iterable[str] = ()) -> "CourseRosterSnapshot":
+        seen = frozenset(
+            str(course_id).strip()
+            for course_id in course_ids
+            if str(course_id).strip()
+        )
+        return cls(
+            {course_id: (frozenset(), frozenset()) for course_id in seen},
+            seen,
+        )
+
+    @classmethod
+    def from_participants(
+        cls,
+        participants: Iterable[CourseParticipant],
+        seen_course_ids: Iterable[str],
+    ) -> "CourseRosterSnapshot":
+        grouped: Dict[str, Tuple[set[str], set[str]]] = {}
+        for participant in participants:
+            course_id = str(participant.course_id).strip()
+            email = normalize_email(participant.email)
+            if not course_id or not email:
+                continue
+            teachers, students = grouped.setdefault(course_id, (set(), set()))
+            role = str(participant.role).strip().casefold()
+            if role in {"teacher", "teachers"}:
+                teachers.add(email)
+            elif role in {"student", "students"}:
+                students.add(email)
+        return cls(
+            {
+                course_id: (frozenset(teachers), frozenset(students))
+                for course_id, (teachers, students) in grouped.items()
+            },
+            frozenset(seen_course_ids),
+        )
+
+    def for_course(self, course_id: str) -> Tuple[frozenset[str], frozenset[str]]:
+        return self.rosters.get(
+            str(course_id).strip(),
+            (frozenset(), frozenset()),
+        )
+
+    def __iter__(self) -> Iterator[CourseParticipant]:
+        for course_id in sorted(self.rosters):
+            teachers, students = self.rosters[course_id]
+            for email in sorted(teachers):
+                yield CourseParticipant(
+                    course_id=course_id,
+                    email=email,
+                    role="teachers",
+                )
+            for email in sorted(students):
+                yield CourseParticipant(
+                    course_id=course_id,
+                    email=email,
+                    role="students",
+                )
+
+    def __len__(self) -> int:
+        return sum(
+            len(teachers) + len(students)
+            for teachers, students in self.rosters.values()
+        )
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> CourseParticipant | Tuple[CourseParticipant, ...]:
+        return tuple(self)[index]
+
+    def covers(self, course_ids: Iterable[str]) -> bool:
+        requested = {
+            str(course_id).strip()
+            for course_id in course_ids
+            if str(course_id).strip()
+        }
+        return requested <= self.seen_course_ids
 
 
 @dataclass(frozen=True)

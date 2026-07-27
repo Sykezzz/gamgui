@@ -1,0 +1,60 @@
+{% set profile = thresholds %}
+{% set limits = profile.limits | default({}) %}
+{% set blackout = profile.blackouts[0] if profile.blackouts else {} %}
+{% if notice %}<div class="mb-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>{% endif %}
+{% if not profile.configured %}
+<div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="status">
+  Full apply remains locked until the district threshold profile is configured.
+</div>
+{% endif %}
+<form class="mt-3 space-y-4" hx-post="/classroom/imports/thresholds" hx-target="#oneroster-thresholds" hx-swap="innerHTML">
+  <fieldset>
+    <legend class="text-sm font-semibold text-brand-black">Import mode</legend>
+    <div class="mt-2 flex flex-wrap gap-4 text-sm text-brand-blueink">
+      <label><input type="radio" name="mode" value="normal" {% if not profile.limited_import %}checked{% endif %} /> Normal</label>
+      <label><input type="radio" name="mode" value="limited" {% if profile.limited_import %}checked{% endif %} /> Limited Import (additions only)</label>
+    </div>
+  </fieldset>
+  <div class="max-h-96 overflow-auto rounded-xl border border-brand-gray/40">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">Per-action threshold settings</caption>
+      <thead class="sticky top-0 bg-paper text-xs uppercase tracking-wider text-brand-blueink"><tr><th class="px-3 py-2" scope="col">Action</th><th class="px-3 py-2" scope="col">Max count</th><th class="px-3 py-2" scope="col">Max percent</th><th class="px-3 py-2" scope="col">No limit</th></tr></thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for key, label in (
+          ("course_create", "Course creations"), ("course_update", "Course updates"), ("course_archive", "Course archives"),
+          ("teacher_add", "Teacher additions"), ("teacher_remove", "Teacher removals"),
+          ("student_add", "Student additions"), ("student_remove", "Student removals"),
+          ("owner_mismatch", "Owner mismatches"), ("record_rejected", "Rejected records")
+        ) %}
+        {% set limit = limits.get(key, {}) %}
+        {% set max_count = limit.get("max_count") %}
+        {% set max_percent = limit.get("max_percent") %}
+        <tr>
+          <th class="px-3 py-2 font-medium text-brand-black" scope="row">{{ label }}</th>
+          <td class="px-3 py-2"><input class="w-28 rounded-lg border border-brand-gray/60 px-2 py-1.5 tabular-nums focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" type="number" min="0" step="1" name="{{ key }}_count" value="{{ max_count if max_count is not none else '' }}" aria-label="{{ label }} maximum count" /></td>
+          <td class="px-3 py-2"><input class="w-28 rounded-lg border border-brand-gray/60 px-2 py-1.5 tabular-nums focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" type="number" min="0" max="100" step="0.1" name="{{ key }}_percent" value="{{ max_percent if max_percent is not none else '' }}" aria-label="{{ label }} maximum percent" /></td>
+          <td class="px-3 py-2 text-center"><input type="checkbox" name="{{ key }}_disabled" value="true" {% if profile.configured and max_count is none and max_percent is none %}checked{% endif %} aria-label="{{ label }} has no district limit" /></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="grid gap-3 sm:grid-cols-2">
+    <label class="text-sm font-medium text-brand-black">Blackout starts
+      <input type="datetime-local" name="blackout_start" value="{{ blackout.starts_at[:16] if blackout.starts_at else '' }}" class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+    </label>
+    <label class="text-sm font-medium text-brand-black">Blackout ends
+      <input type="datetime-local" name="blackout_end" value="{{ blackout.ends_at[:16] if blackout.ends_at else '' }}" class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+    </label>
+  </div>
+  <label class="block text-sm font-medium text-brand-black">Additional blackout periods
+    <textarea name="additional_blackouts" rows="4"
+              placeholder="2026-08-01T08:00 | 2026-08-01T17:00 | Registration freeze"
+              class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 font-mono text-xs focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">{% for window in profile.blackouts[1:] %}{{ window.starts_at[:16] }} | {{ window.ends_at[:16] }} | {{ window.label }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+  </label>
+  <p class="text-xs text-brand-blueink">One period per line: <code>start | end | optional label</code>. Up to 10 total; all times use America/Chicago.</p>
+  <p class="text-xs text-brand-blueink">Timezone: America/Chicago. Enter the district’s actual Roster Server thresholds before full apply.</p>
+  <p class="text-xs text-brand-blueink">Every action row must have a count or percentage threshold, or an explicit No limit selection.</p>
+  <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Save threshold profile</button>
+</form>

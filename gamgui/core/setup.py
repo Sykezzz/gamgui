@@ -346,10 +346,14 @@ def _home_root() -> Optional[Path]:
 
 ADMIN_CONSOLE_DWD_URL = "https://admin.google.com/ac/owl/domainwidedelegation"
 _REQUIRED = ("oauth2service", "oauth2")
-DISTRICT_FEATURE_DWD_SCOPES = (
+ONEROSTER_DWD_SCOPES = (
+    "https://www.googleapis.com/auth/admin.directory.user.readonly",
     "https://www.googleapis.com/auth/classroom.courses",
     "https://www.googleapis.com/auth/classroom.rosters",
     "https://www.googleapis.com/auth/classroom.profile.emails",
+)
+DISTRICT_FEATURE_DWD_SCOPES = (
+    *ONEROSTER_DWD_SCOPES,
     "https://www.googleapis.com/auth/drive",
 )
 
@@ -713,17 +717,17 @@ class SetupService:
             return VerifyResult(ok=False, summary=exc.message, raw=exc.stderr)
         feature_lines = _parse_check(feature_out)
         feature_up = feature_out.upper()
+        missing = _scopes_without_explicit_pass(
+            feature_lines,
+            DISTRICT_FEATURE_DWD_SCOPES,
+        )
         feature_failed = (
             ("FAILED" in feature_up)
             or ("DISABLED!" in feature_up)
             or any(status == "FAIL" for _, status in feature_lines)
             or not feature_lines
+            or bool(missing)
         )
-        missing = [
-            label
-            for label, status in feature_lines
-            if status == "FAIL" and label.startswith("https://")
-        ]
         combined_lines = lines + [item for item in feature_lines if item not in lines]
         combined_raw = "\n".join(part for part in (out, feature_out) if part)
         return VerifyResult(
@@ -739,9 +743,69 @@ class SetupService:
             missing_feature_scopes=missing,
         )
 
+    async def verify_scopes(
+        self,
+        domain: str,
+        admin: str,
+        scopes: Tuple[str, ...],
+    ) -> VerifyResult:
+        """Verify one allowlisted feature scope set with no unrelated capability."""
+
+        if not self.is_ready(domain):
+            return VerifyResult(ok=False, summary="No credentials imported yet.")
+        exact_scopes = tuple(dict.fromkeys(str(scope).strip() for scope in scopes))
+        if not exact_scopes or any(not scope.startswith("https://") for scope in exact_scopes):
+            return VerifyResult(ok=False, summary="The requested scope set is invalid.")
+        try:
+            output = await self.runner.run_authenticated(
+                domain,
+                GAMCommands.check_svcacct(admin, exact_scopes),
+            )
+        except GAMError as exc:
+            return VerifyResult(ok=False, summary=exc.message, raw=exc.stderr)
+        lines = _parse_check(output)
+        upper = output.upper()
+        missing = _scopes_without_explicit_pass(lines, exact_scopes)
+        failed = (
+            "FAILED" in upper
+            or "DISABLED!" in upper
+            or any(status == "FAIL" for _, status in lines)
+            or not lines
+            or bool(missing)
+        )
+        return VerifyResult(
+            ok=not failed,
+            summary=(
+                "All requested feature scopes are authorized."
+                if not failed
+                else "OneRoster delegation is missing required access."
+            ),
+            lines=lines,
+            raw=output,
+            missing_feature_scopes=missing,
+        )
+
 
 _STATUS_RE = re.compile(r"\b(PASS|FAIL)\b")
 _AUTH_URL_RE = re.compile(r"https://(?:gam-shortn\.appspot\.com|admin\.google\.com)/\S+")
+
+
+def _scopes_without_explicit_pass(
+    lines: List[Tuple[str, str]],
+    scopes: Tuple[str, ...],
+) -> List[str]:
+    """Return requested scopes without an unambiguous exact PASS result."""
+
+    statuses_by_scope: Dict[str, set[str]] = {scope: set() for scope in scopes}
+    for label, status in lines:
+        if label in statuses_by_scope:
+            statuses_by_scope[label].add(status)
+    return [
+        scope
+        for scope in scopes
+        if "PASS" not in statuses_by_scope[scope]
+        or "FAIL" in statuses_by_scope[scope]
+    ]
 
 
 def _parse_check(stdout: str) -> List[Tuple[str, str]]:

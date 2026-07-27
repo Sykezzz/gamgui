@@ -14,6 +14,7 @@ from ...core import signatures as sig
 from ...core.gam.commands import SIGNATURE_USER_FIELDS
 from ...core.gam.errors import GAMError
 from ...core.signatures import SignatureStore
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/signatures")
@@ -157,7 +158,7 @@ def _prune_jobs(st, keep: int = 10) -> None:
         st.jobs.pop(jid, None)
 
 
-async def _run_apply(job: ApplyJob, conn, matched, template: str) -> None:
+async def _run_apply(job: ApplyJob, conn, matched, template: str, lease=None) -> None:
     """Background task: set each user's signature, updating ``job`` as it goes."""
     try:
         for u in matched:
@@ -173,6 +174,8 @@ async def _run_apply(job: ApplyJob, conn, matched, template: str) -> None:
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 @router.get("", response_class=HTMLResponse)
@@ -305,20 +308,36 @@ async def apply(
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": "Not connected."})
     try:
         scope_type, scope_value = _validated_scope(scope_type, scope_value)
-        matched = await _matched(st, scope_type, scope_value)
     except ValueError as exc:
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": str(exc)})
+    lease = try_acquire_admin_activity(st, "signature-batch-apply")
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request, _APPLY_PARTIAL, {"error": ADMIN_ACTIVITY_BUSY_MESSAGE}
+        )
+    try:
+        matched = await _matched(st, scope_type, scope_value)
     except Exception as exc:
+        lease.release()
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": _friendly(exc)})
     if not matched:
+        lease.release()
         return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"error": "No active users match this scope."})
 
     # Run the (potentially minutes-long) per-user loop in the background and report progress by polling,
     # so the UI never looks frozen on a large apply.
-    job = ApplyJob(id=secrets.token_urlsafe(8), total=len(matched))
-    _prune_jobs(st)
-    st.jobs[job.id] = job
-    job.task = asyncio.create_task(_run_apply(job, st.connector, matched, template))
+    try:
+        job = ApplyJob(id=secrets.token_urlsafe(8), total=len(matched))
+        _prune_jobs(st)
+        st.jobs[job.id] = job
+        job.task = asyncio.create_task(
+            _run_apply(job, st.connector, matched, template, lease)
+        )
+    except Exception:
+        lease.release()
+        if "job" in locals():
+            st.jobs.pop(job.id, None)
+        raise
     return TEMPLATES.TemplateResponse(request, _APPLY_PARTIAL, {"job": job})
 
 
@@ -347,15 +366,36 @@ async def save_template(
     # `template` rides in via hx-include="#sig-form" — the CURRENT editor content — while `name`
     # comes from the save form's own input.
     store = _store(request)
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "signature-template-edit")
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _TEMPLATES_PARTIAL,
+            _tctx(store, error=ADMIN_ACTIVITY_BUSY_MESSAGE),
+        )
     try:
         store.save(name, template)
     except ValueError as exc:
         return TEMPLATES.TemplateResponse(request, _TEMPLATES_PARTIAL, _tctx(store, error=str(exc)))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _TEMPLATES_PARTIAL, _tctx(store, saved=name.strip()))
 
 
 @router.post("/templates/delete", response_class=HTMLResponse)
 async def delete_template(request: Request, name: Annotated[str, Form()] = "") -> HTMLResponse:
     store = _store(request)
-    store.delete(name)
+    st = request.app.state.gamgui
+    lease = try_acquire_admin_activity(st, "signature-template-edit")
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _TEMPLATES_PARTIAL,
+            _tctx(store, error=ADMIN_ACTIVITY_BUSY_MESSAGE),
+        )
+    try:
+        store.delete(name)
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _TEMPLATES_PARTIAL, _tctx(store))

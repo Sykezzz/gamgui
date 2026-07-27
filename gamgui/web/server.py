@@ -11,20 +11,28 @@ HTTP layer offline.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.calendar_index import CalendarIndex, default_index_path
+from ..core.activity import (
+    ActivityBusyError,
+    ActivityRegistry,
+    activity_registry as global_activity_registry,
+)
 from ..core.classroom.index import CourseIndex, default_course_index_path
 from ..core.classroom.manifests import (
     RosterManifestStore,
@@ -32,6 +40,12 @@ from ..core.classroom.manifests import (
 )
 from ..core.classroom.service import ClassroomService
 from ..core.connectors.gam_connector import GAMConnector
+from ..core.components import (
+    ComponentManager,
+    ONEROSTER_COMPONENT,
+    ONEROSTER_PROFILE,
+    component_ids_for_profile,
+)
 from ..core.directory_index import (
     DEFAULT_STALE_SECONDS,
     DirectoryIndex,
@@ -48,9 +62,16 @@ from ..core.drive import (
     ServiceAccountTokenProvider,
 )
 from ..core.secrets.ephemeral import sweep_stale_configs
-from ..core.secrets.vault import SecretsVault
-from ..core.updater import UpdateStateStore
+from ..core.secrets.vault import InMemoryBackend, SecretsVault
+from ..core.updater import (
+    ACTIVATION_PROBE_ENV,
+    ACTIVATION_TRANSACTION_ENV,
+    UpdateStateStore,
+    activation_evidence_valid,
+    candidate_is_blocked,
+)
 from ..core.usercache import UserCache
+from .limits import RequestBodyLimitMiddleware
 
 _WEB_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
@@ -63,8 +84,13 @@ def _local_update_notice() -> str:
         state = UpdateStateStore().load()
     except (OSError, RuntimeError):
         return ""
-    if state.pending_app and state.candidate_sha:
-        return "A verified update is ready and will install after the app closes."
+    if (
+        state.pending_app
+        and state.candidate_sha
+        and activation_evidence_valid(state)
+        and not candidate_is_blocked(state)
+    ):
+        return "A verified update is ready. Quit and reopen GamGUI to install it."
     if state.last_error:
         return "The automatic update could not be prepared. This version is still running normally."
     return ""
@@ -92,6 +118,18 @@ class AppState:
     classroom_manifest_tasks: dict = field(default_factory=dict, repr=False)
     classroom_manifest_errors: dict = field(default_factory=dict, repr=False)
     drive_service: Optional[DriveService] = None
+    component_manager: Optional[ComponentManager] = None
+    oneroster_service: object = None
+    oneroster_error_code: str = ""
+    oneroster_manifest_tasks: dict = field(default_factory=dict, repr=False)
+    oneroster_manifest_errors: dict = field(default_factory=dict, repr=False)
+    oneroster_gate_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    oneroster_gate_error: str = ""
+    activation_probe_mode: bool = False
+    activity_registry: ActivityRegistry = field(
+        default_factory=lambda: global_activity_registry,
+        repr=False,
+    )
     cal_index_job_id: str = ""  # the in-flight index-rebuild job, if any (guards double-rebuilds)
     catalog: object = None  # the GAM command catalog (lazy-loaded by the Builder route)
     builder_sequence: list = field(default_factory=list)  # the working drag-built command sequence
@@ -102,9 +140,358 @@ class AppState:
     _directory_refresh_tasks: Dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        self.ensure_component_manager()
+        if self.activation_probe_mode:
+            # The activation page needs only sealed component metadata. Binding
+            # optional services here would perform redundant projection work
+            # before the page-loaded health decision.
+            return
         if self.connector is not None:
             self.ensure_directory_index()
             self.ensure_workspace_services()
+        self.ensure_component_services()
+
+    def ensure_component_manager(self) -> ComponentManager:
+        """Create the local-only component facade without reading Workspace secrets."""
+
+        if self.component_manager is not None:
+            return self.component_manager
+        if self.runner.base_dir is not None:
+            data_root = Path(self.runner.base_dir)
+            store = UpdateStateStore(data_root / "updates" / "state.json")
+        else:
+            data_root = None
+            store = UpdateStateStore()
+        self.component_manager = ComponentManager(
+            store=store,
+            registry=self.activity_registry,
+            data_root=data_root,
+        )
+        return self.component_manager
+
+    def embedded_profile(self) -> str:
+        manager = self.ensure_component_manager()
+        embedded = getattr(manager, "embedded", None)
+        artifact = getattr(embedded, "artifact", None)
+        return str(getattr(artifact, "profile", "") or "core")
+
+    def oneroster_enabled(self) -> bool:
+        """Return the sealed-profile/local-preference decision only."""
+
+        if self.embedded_profile() != ONEROSTER_PROFILE:
+            return False
+        status = self.ensure_component_manager().status()
+        return bool(
+            status.enabled
+            and ONEROSTER_COMPONENT in status.installed_components
+        )
+
+    def update_activation_ready(self) -> bool:
+        """Require the swapped candidate profile to initialize before health."""
+
+        return self.update_activation_health_payload() is not None
+
+    def update_activation_health_payload(self) -> Optional[dict[str, object]]:
+        """Return transaction-bound health evidence, or ``None`` when unsafe."""
+
+        marker_value = os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER", "")
+        if not marker_value:
+            return None
+        manager = self.ensure_component_manager()
+        embedded = getattr(manager, "embedded", None)
+        if embedded is None:
+            return None
+        projection = manager.runtime_projection()
+        if projection is not None:
+            activating = getattr(projection, "installed_artifact", None)
+            if activating is None:
+                return None
+            installed_components = set(
+                getattr(projection, "installed_components", ()) or ()
+            )
+            enabled_components = set(
+                getattr(projection, "enabled_components", ()) or ()
+            )
+            if (
+                embedded.artifact.profile != activating.profile
+                or embedded.artifact.component_set_digest
+                != activating.component_set_digest
+                or installed_components
+                != set(component_ids_for_profile(activating.profile))
+            ):
+                return None
+            if activating.profile == ONEROSTER_PROFILE:
+                if self.oneroster_error_code == "CMP-INCOMPATIBLE":
+                    return None
+                if (
+                    ONEROSTER_COMPONENT in enabled_components
+                    and self.audit_domain
+                    and self.oneroster_service is None
+                ):
+                    return None
+            return {
+                "ok": True,
+                "transaction_id": os.environ.get(
+                    ACTIVATION_TRANSACTION_ENV,
+                    "",
+                ),
+                "sha": activating.source_sha,
+                "profile": activating.profile,
+                "component_set_digest": activating.component_set_digest,
+            }
+
+        # The installed legacy updater predates transaction-bound profiles. It
+        # may bootstrap Core only; any optional-profile transition requires the
+        # validated projection above.
+        state = manager.store.load()
+        expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+        try:
+            expected_marker = (
+                Path(manager.store.path).parent
+                / "health"
+                / f"{expected_sha}.ok"
+            ).resolve()
+            marker_matches = Path(marker_value).resolve() == expected_marker
+        except (AttributeError, OSError, ValueError):
+            marker_matches = False
+        if (
+            os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") != "1"
+            or os.environ.get(ACTIVATION_PROBE_ENV)
+            or embedded.artifact.profile != "core"
+            or embedded.artifact.source_sha != expected_sha
+            or state.candidate_sha != expected_sha
+            or not marker_matches
+            or state.canary_result != "passed"
+            or "update-ready" not in state.required_check_evidence
+            or candidate_is_blocked(state)
+        ):
+            return None
+        return {
+            "ok": True,
+            "transaction_id": "",
+            "sha": expected_sha,
+            "profile": embedded.artifact.profile,
+            "component_set_digest": embedded.artifact.component_set_digest,
+        }
+
+    def activation_probe_pending(self) -> bool:
+        transaction_probe = os.environ.get(ACTIVATION_PROBE_ENV) == "1"
+        legacy_health_start = bool(
+            os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
+            and os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1"
+        )
+        if not transaction_probe and not legacy_health_start:
+            return False
+        expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+        state = self.ensure_component_manager().store.load()
+        return bool(
+            state.candidate_sha == expected_sha
+            or state.installed_sha != expected_sha
+        )
+
+    async def _wait_for_activation_commit(self) -> None:
+        """Enable background work only after the helper commits candidate state."""
+
+        for _attempt in range(600):
+            if not self.activation_probe_pending():
+                state = self.ensure_component_manager().store.load()
+                expected_sha = os.environ.get("GAMGUI_INSTALLED_SHA", "").lower()
+                if state.installed_sha == expected_sha and not state.candidate_sha:
+                    if self.activation_probe_mode:
+                        if not await self._rehydrate_after_activation():
+                            return
+                    self._schedule_oneroster_gate()
+                return
+            await asyncio.sleep(0.1)
+
+    async def _rehydrate_after_activation(self) -> bool:
+        """Bind the committed app to Workspace only after activation is durable."""
+
+        if not self.activation_probe_mode:
+            return True
+        try:
+            hydrated = await asyncio.to_thread(
+                type(self).create,
+                token=self.token,
+            )
+        except Exception:
+            self.oneroster_gate_error = "CMP-AUTH-REQUIRED"
+            return False
+        for descriptor in dataclass_fields(self):
+            setattr(self, descriptor.name, getattr(hydrated, descriptor.name))
+        return True
+
+    def _schedule_activation_commit_watch(self) -> None:
+        if not self.activation_probe_pending():
+            self._schedule_oneroster_gate()
+            return
+        try:
+            asyncio.get_running_loop().create_task(
+                self._wait_for_activation_commit(),
+                name="activation-commit-watch",
+            )
+        except RuntimeError:
+            pass
+
+    def ensure_component_services(self) -> None:
+        """Bind optional local services without accessing GAM, Google, or Keychain."""
+
+        if not self.oneroster_enabled():
+            if isinstance(self.oneroster_gate_task, asyncio.Task):
+                self.oneroster_gate_task.cancel()
+            self.oneroster_gate_task = None
+            self.oneroster_service = None
+            self.oneroster_error_code = ""
+            return
+        domain = (self.audit_domain or "").strip().casefold()
+        if not domain:
+            self.oneroster_service = None
+            self.oneroster_error_code = "CMP-AUTH-REQUIRED"
+            return
+        existing = self.oneroster_service
+        if (
+            existing is not None
+            and str(getattr(existing, "domain", "")).casefold() == domain
+        ):
+            self.oneroster_error_code = ""
+            return
+        try:
+            module = importlib.import_module("gamgui.components.oneroster")
+            service_type = getattr(module, "OneRosterService")
+            root = self.ensure_component_manager().component_data_root
+            self.oneroster_service = service_type(
+                domain,
+                root,
+                activity_registry=self.activity_registry,
+            )
+            self.oneroster_error_code = ""
+            self._schedule_oneroster_gate()
+        except Exception:
+            self.oneroster_service = None
+            self.oneroster_error_code = "CMP-INCOMPATIBLE"
+
+    def rebind_component_services(self) -> None:
+        """Discard optional service handles and recreate them from retained local state."""
+
+        if isinstance(self.oneroster_gate_task, asyncio.Task):
+            self.oneroster_gate_task.cancel()
+        self.oneroster_gate_task = None
+        self.oneroster_service = None
+        self.oneroster_error_code = ""
+        self.ensure_component_services()
+
+    def _schedule_oneroster_gate(self) -> None:
+        """Start the local scheduler without reading Workspace data at discovery time."""
+
+        if self.activation_probe_pending():
+            return
+        if self.oneroster_service is None or self.connector is None:
+            return
+        current = self.oneroster_gate_task
+        if isinstance(current, asyncio.Task) and not current.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.oneroster_gate_task = loop.create_task(
+            self._run_oneroster_gate_scheduler(),
+            name="oneroster-student-release",
+        )
+
+    async def _run_oneroster_gate_scheduler(self) -> None:
+        """Open and finish only a previously confirmed, due student manifest."""
+
+        while True:
+            try:
+                await self._process_due_oneroster_gate()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.oneroster_gate_error = str(
+                    getattr(exc, "code", "") or "OR-GATE-SCHEDULER"
+                )
+            await asyncio.sleep(30)
+
+    async def _process_due_oneroster_gate(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Run one scheduler tick; exposed as a deterministic test seam."""
+
+        service = self.oneroster_service
+        connector = self.connector
+        if service is None or connector is None:
+            return False
+        enabled_check = getattr(self, "oneroster_enabled", None)
+        if callable(enabled_check) and not enabled_check():
+            return False
+        gate = service.get_gate()
+        state = str(getattr(getattr(gate, "state", ""), "value", getattr(gate, "state", "")))
+        manifest_id = str(getattr(gate, "manifest_id", "") or "")
+        if not manifest_id:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        if state == "ARMED":
+            from gamgui.components.oneroster.models import parse_aware_datetime
+
+            release_at = parse_aware_datetime(str(getattr(gate, "release_at", "") or ""))
+            if moment < release_at:
+                return False
+            try:
+                await service.revalidate_scheduled_gate(
+                    connector,
+                    manifest_id,
+                    now=moment,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if (
+                    self.oneroster_service is not service
+                    or self.connector is not connector
+                    or (callable(enabled_check) and not enabled_check())
+                ):
+                    return False
+                hold_failure = getattr(
+                    service,
+                    "hold_scheduled_gate_failure",
+                    None,
+                )
+                if not callable(hold_failure):
+                    raise
+                held = hold_failure(manifest_id, exc, now=moment)
+                self.oneroster_gate_error = str(
+                    getattr(held, "hold_code", "")
+                    or getattr(exc, "code", "")
+                    or "OR-GATE-REVALIDATION-FAILED"
+                )
+                return False
+            if (
+                self.oneroster_service is not service
+                or self.connector is not connector
+                or (callable(enabled_check) and not enabled_check())
+            ):
+                return False
+            gate = service.get_gate()
+            state = str(
+                getattr(getattr(gate, "state", ""), "value", getattr(gate, "state", ""))
+            )
+        if state != "OPEN":
+            return False
+        if (
+            self.oneroster_service is not service
+            or self.connector is not connector
+            or (callable(enabled_check) and not enabled_check())
+        ):
+            return False
+        manifest = service.get_manifest_header(manifest_id)
+        if str(getattr(manifest, "status", "")) != "awaiting_students":
+            return False
+        await service.execute_manifest(connector, manifest_id, now=moment)
+        self.oneroster_gate_error = ""
+        return True
 
     def ensure_directory_index(self) -> Optional[DirectoryIndex]:
         if self.connector is None:
@@ -133,6 +520,18 @@ class AppState:
             raise RuntimeError(
                 "Finish or stop the active administrative operation before reconnecting."
             )
+        try:
+            lease = self.activity_registry.acquire("connector-rebind")
+        except ActivityBusyError as exc:
+            raise RuntimeError(
+                "Finish or stop the active administrative operation before reconnecting."
+            ) from exc
+        try:
+            self._activate_connector_unlocked(connector)
+        finally:
+            lease.release()
+
+    def _activate_connector_unlocked(self, connector: GAMConnector) -> None:
         domain = connector.domain.strip().casefold()
         if not domain:
             raise RuntimeError("The verified Workspace domain was blank.")
@@ -183,6 +582,7 @@ class AppState:
             ) from exc
 
         old_drive = self.drive_service
+        old_oneroster = self.oneroster_service
         old_refresh_tasks = list(self._directory_refresh_tasks.values())
         old_classroom_refresh = self.classroom_refresh_task
         (
@@ -207,6 +607,18 @@ class AppState:
         self.builder_sequence.clear()
         self.classroom_manifest_tasks.clear()
         self.classroom_manifest_errors.clear()
+        for task in self.oneroster_manifest_tasks.values():
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+        self.oneroster_manifest_tasks.clear()
+        self.oneroster_manifest_errors.clear()
+        if isinstance(self.oneroster_gate_task, asyncio.Task):
+            self.oneroster_gate_task.cancel()
+        self.oneroster_gate_task = None
+        self.oneroster_gate_error = ""
+        invalidator = getattr(old_oneroster, "invalidate_scope_readiness", None)
+        if callable(invalidator):
+            invalidator()
         self.classroom_refresh_task = None
         self.classroom_refresh_error = ""
         self._directory_refresh_tasks = {}
@@ -215,10 +627,14 @@ class AppState:
                 task.cancel()
         if old_drive is not None and old_drive is not self.drive_service:
             self._schedule_drive_close(old_drive)
+        self.ensure_component_services()
+        self._schedule_oneroster_gate()
 
     def has_active_admin_jobs(self) -> bool:
         """Return whether rebinding services could interrupt an administrative mutation."""
 
+        if self.activity_registry.is_active():
+            return True
         terminal = {"completed", "failed", "cancelled", "interrupted"}
         for job in self.jobs.values():
             task = getattr(job, "task", None)
@@ -239,9 +655,14 @@ class AppState:
             done = getattr(task, "done", None)
             if callable(done) and not done():
                 return True
+        for task in self.oneroster_manifest_tasks.values():
+            done = getattr(task, "done", None)
+            if callable(done) and not done():
+                return True
         stores = (
             self.classroom_manifests,
             getattr(self.drive_service, "operations", None),
+            getattr(self.oneroster_service, "store", None),
         )
         for store in stores:
             checker = getattr(store, "has_active_jobs", None)
@@ -318,6 +739,13 @@ class AppState:
         )
         tasks.extend(
             task
+            for task in self.oneroster_manifest_tasks.values()
+            if isinstance(task, asyncio.Task)
+        )
+        if isinstance(self.oneroster_gate_task, asyncio.Task):
+            tasks.append(self.oneroster_gate_task)
+        tasks.extend(
+            task
             for job in self.jobs.values()
             if isinstance((task := getattr(job, "task", None)), asyncio.Task)
         )
@@ -331,6 +759,11 @@ class AppState:
             close = getattr(self.drive_service.client, "aclose", None)
             if callable(close):
                 await close()
+        close_oneroster = getattr(self.oneroster_service, "close", None)
+        if callable(close_oneroster):
+            result = close_oneroster()
+            if asyncio.iscoroutine(result):
+                await result
 
     async def users(self, force: bool = False) -> list:
         """The cached user list (one ``gam print users`` shared by the list + reports)."""
@@ -466,15 +899,32 @@ class AppState:
         vault: Optional[SecretsVault] = None,
         token: Optional[str] = None,
         preferred_domain: str = "",
+        allow_first_run_workspace_access: bool = False,
     ) -> "AppState":
         sweep_stale_configs()  # clean up any credential temp dirs orphaned by a prior crash/kill
         vault = vault or SecretsVault()
         runner = GAMRunner(vault=vault)
-        domains = vault.list_domains()
-        requested = (preferred_domain or "").strip().casefold()
-        domain = requested if requested in {str(item).casefold() for item in domains} else ""
-        if not domain:
-            domain = domains[0] if domains else ""
+        component_manager = ComponentManager(
+            registry=global_activity_registry,
+        )
+        # First launch deliberately presents Optional Features before touching the
+        # Workspace Keychain. Choosing Skip or staging the full profile records the
+        # preference; subsequent launches may discover existing Workspace credentials.
+        if (
+            component_manager.first_run_choice_pending()
+            and not allow_first_run_workspace_access
+        ):
+            domain = ""
+        else:
+            domains = vault.list_domains()
+            requested = (preferred_domain or "").strip().casefold()
+            domain = (
+                requested
+                if requested in {str(item).casefold() for item in domains}
+                else ""
+            )
+            if not domain:
+                domain = domains[0] if domains else ""
         connector = GAMConnector(runner=runner, domain=domain) if domain else None
         return cls(
             vault=vault,
@@ -484,6 +934,29 @@ class AppState:
             token=token or secrets.token_urlsafe(24),
             calendar_index=CalendarIndex(default_index_path()),
             directory_index=DirectoryIndex(default_directory_index_path(), domain) if domain else None,
+            component_manager=component_manager,
+            activity_registry=global_activity_registry,
+        )
+
+    @classmethod
+    def create_activation_probe(
+        cls,
+        token: Optional[str] = None,
+    ) -> "AppState":
+        """Create a sealed-profile health state with no Keychain or GAM access."""
+
+        vault = SecretsVault(backend=InMemoryBackend(), cache_ttl=0)
+        runner = GAMRunner(vault=vault)
+        component_manager = ComponentManager(
+            registry=global_activity_registry,
+        )
+        return cls(
+            vault=vault,
+            runner=runner,
+            token=token or secrets.token_urlsafe(24),
+            component_manager=component_manager,
+            activity_registry=global_activity_registry,
+            activation_probe_mode=True,
         )
 
 
@@ -579,9 +1052,38 @@ class PrivacyTimingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class ActivationProbeGateMiddleware(BaseHTTPMiddleware):
+    """Keep the health-start process read-only until activation is committed."""
+
+    def __init__(self, app, state: AppState) -> None:
+        super().__init__(app)
+        self._state = state
+
+    async def dispatch(self, request: Request, call_next):
+        probe_active = (
+            self._state.activation_probe_mode
+            or self._state.activation_probe_pending()
+        )
+        method = request.method.upper()
+        path = request.url.path
+        if probe_active and not (
+            method in {"GET", "HEAD", "OPTIONS"}
+            and path in {"/", "/healthz"}
+        ):
+            return JSONResponse(
+                {
+                    "error": "The verified update is finishing activation.",
+                    "code": "CMP-ACTIVE-JOB",
+                },
+                status_code=409,
+            )
+        return await call_next(request)
+
+
 def create_app(state: AppState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        state._schedule_activation_commit_watch()
         yield
         await state.aclose()
 
@@ -592,7 +1094,15 @@ def create_app(state: AppState) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.gamgui = state
+    # The request cap sits inside the token gate but outside FastAPI's multipart
+    # parser, so unauthenticated requests are rejected before their body is read.
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        path="/classroom/imports/upload",
+        maximum_bytes=(250 * 1024 * 1024) + (1024 * 1024),
+    )
     app.add_middleware(PrivacyTimingMiddleware)
+    app.add_middleware(ActivationProbeGateMiddleware, state=state)
     app.add_middleware(TokenGateMiddleware, token=state.token)
     # Ensure the dir exists before mounting — a fresh clone or a stripped bundle may lack it,
     # and StaticFiles raises on a missing directory.
@@ -605,8 +1115,28 @@ def create_app(state: AppState) -> FastAPI:
         return JSONResponse({"ok": True})
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> HTMLResponse:
+    async def index(request: Request):
         st: AppState = request.app.state.gamgui
+        if st.activation_probe_mode:
+            return HTMLResponse(
+                """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="2">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GamGUI update</title></head>
+<body><main><h1>Finishing verified update</h1>
+<p>GamGUI is validating the installed profile. Workspace access remains paused.</p>
+</main></body></html>"""
+            )
+        manager = st.ensure_component_manager()
+        component_status = manager.status()
+        if (
+            manager.first_run_choice_pending()
+            or component_status.restart_required
+        ):
+            # First-launch optional-feature selection must precede every Workspace
+            # Keychain read. The setup route has a component-only rendering mode.
+            return RedirectResponse("/setup", status_code=303)
         try:
             version = (await st.runner.version()).splitlines()[0] if st.runner.binary_exists() else ""
         except Exception:
@@ -631,6 +1161,10 @@ def create_app(state: AppState) -> FastAPI:
     from .routes.builder import router as builder_router
     from .routes.calendars import router as calendars_router
     from .routes.classroom import router as classroom_router
+    from .routes.components import (
+        core_deep_link_router,
+        router as components_router,
+    )
     from .routes.drive import router as drive_router
     from .routes.groups import router as groups_router
     from .routes.lifecycle import router as lifecycle_router
@@ -647,6 +1181,45 @@ def create_app(state: AppState) -> FastAPI:
     app.include_router(signatures_router)
     app.include_router(calendars_router)
     app.include_router(classroom_router)
+    app.include_router(components_router)
+    if state.embedded_profile() == ONEROSTER_PROFILE:
+        try:
+            oneroster_module = importlib.import_module(
+                "gamgui.web.routes.oneroster"
+            )
+            component = next(
+                (
+                    item
+                    for item in state.ensure_component_manager().embedded.components
+                    if item.component_id == ONEROSTER_COMPONENT
+                ),
+                None,
+            )
+            if component is None:
+                raise RuntimeError("The embedded OneRoster manifest is missing.")
+            registered_paths = tuple(
+                str(getattr(route, "path", "") or "")
+                for route in oneroster_module.router.routes
+            )
+            if not registered_paths or any(
+                not any(
+                    path == prefix or path.startswith(prefix + "/")
+                    for prefix in component.route_prefixes
+                )
+                for path in registered_paths
+            ):
+                raise RuntimeError(
+                    "The optional router registered a path outside its embedded allowlist."
+                )
+            app.include_router(oneroster_module.router)
+        except Exception:
+            # Optional-code corruption cannot prevent Core from starting. The
+            # permanent Components page remains available for recovery.
+            state.oneroster_service = None
+            state.oneroster_error_code = "CMP-INCOMPATIBLE"
+            app.include_router(core_deep_link_router)
+    else:
+        app.include_router(core_deep_link_router)
     app.include_router(drive_router)
     app.include_router(lifecycle_router)
     app.include_router(onboarding_router)

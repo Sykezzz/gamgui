@@ -9,6 +9,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ...core.gam.errors import GAMError
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
 
 _GROUPS_PAGE = "groups.html"
@@ -147,13 +148,28 @@ async def members_mutate(
     email: Annotated[str, Form()],
     op: Annotated[str, Form()] = "add",
 ) -> HTMLResponse:
-    conn = request.app.state.gamgui.connector
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return TEMPLATES.TemplateResponse(
             request,
             _BOARD_MEMBERS_PARTIAL,
             {"group": group, "page": None, "error": "Not connected."},
         )
-    result = await (conn.remove_group_member(group, email) if op == "remove" else conn.add_group_member(group, email))
-    error = "" if result.ok else result.detail
-    return await _members_partial(request, conn, group, error=error)
+    lease = try_acquire_admin_activity(st, "group-membership-change")
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            _BOARD_MEMBERS_PARTIAL,
+            {"group": group, "page": None, "error": ADMIN_ACTIVITY_BUSY_MESSAGE},
+        )
+    try:
+        result = await (
+            conn.remove_group_member(group, email)
+            if op == "remove"
+            else conn.add_group_member(group, email)
+        )
+        error = "" if result.ok else result.detail
+        return await _members_partial(request, conn, group, error=error)
+    finally:
+        lease.release()

@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse
 from ...core import guard
 from ...core.gam.errors import GAMError, GAMErrorKind
 from ...core.signatures import smart_quote_warning
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..jobs import start_job
 from ..server import TEMPLATES
 
@@ -201,10 +202,17 @@ async def set_signature(
     signature: Annotated[str, Form()] = "",
     html: Annotated[str, Form()] = "off",
 ) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.set_signature(email, signature, html=(html == "on"))
+    lease = try_acquire_admin_activity(st, "user-signature-set")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.set_signature(email, signature, html=(html == "on"))
+    finally:
+        lease.release()
     note = smart_quote_warning(signature) if result.ok else ""
     message = ("Signature updated." + (" " + note if note else "")) if result.ok else result.detail
     return TEMPLATES.TemplateResponse(
@@ -215,10 +223,17 @@ async def set_signature(
 
 @router.post("/signout", response_class=HTMLResponse)
 async def signout_user(request: Request, email: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.signout_user(email)
+    lease = try_acquire_admin_activity(st, "user-signout")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.signout_user(email)
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_action_result.html",
         {"ok": result.ok, "message": f"Signed {email} out of all sessions." if result.ok else result.detail},
@@ -261,49 +276,77 @@ async def _groups_partial(request: Request, conn, email: str) -> HTMLResponse:
 
 @router.post("/groups/add", response_class=HTMLResponse)
 async def groups_add(request: Request, email: Annotated[str, Form()], group: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.add_group_member(group.strip(), email)
-    if not result.ok:
-        return _err(request, f"Couldn't add to group: {result.detail}")
-    return await _groups_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-group-membership")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.add_group_member(group.strip(), email)
+        if not result.ok:
+            return _err(request, f"Couldn't add to group: {result.detail}")
+        return await _groups_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/groups/remove", response_class=HTMLResponse)
 async def groups_remove(request: Request, email: Annotated[str, Form()], group: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.remove_group_member(group.strip(), email)
-    if not result.ok:
-        return _err(request, f"Couldn't remove from group: {result.detail}")
-    return await _groups_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-group-membership")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.remove_group_member(group.strip(), email)
+        if not result.ok:
+            return _err(request, f"Couldn't remove from group: {result.detail}")
+        return await _groups_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/delegate/add", response_class=HTMLResponse)
 async def add_delegate(request: Request, email: Annotated[str, Form()], delegate: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     delegate = delegate.strip()
     if not delegate:
         return _err(request, "Enter a delegate email.")
-    result = await conn.add_delegate(email, delegate)
-    if not result.ok:
-        return _err(request, f"Couldn't add delegate: {result.detail}")
-    return await _delegates_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-delegate-change")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.add_delegate(email, delegate)
+        if not result.ok:
+            return _err(request, f"Couldn't add delegate: {result.detail}")
+        return await _delegates_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/delegate/remove", response_class=HTMLResponse)
 async def remove_delegate(request: Request, email: Annotated[str, Form()], delegate: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.remove_delegate(email, delegate.strip())
-    if not result.ok:
-        return _err(request, f"Couldn't remove delegate: {result.detail}")
-    return await _delegates_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-delegate-change")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.remove_delegate(email, delegate.strip())
+        if not result.ok:
+            return _err(request, f"Couldn't remove delegate: {result.detail}")
+        return await _delegates_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/organization", response_class=HTMLResponse)
@@ -316,10 +359,16 @@ async def set_organization(
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     title, department = title.strip(), department.strip()
-    result = await conn.set_organization(email, title=title, department=department)
-    if not result.ok:
-        return _err(request, f"Couldn't update role/store: {result.detail}")
-    st.invalidate_users()  # title/department changed -> cached directory is stale
+    lease = try_acquire_admin_activity(st, "user-organization-set")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.set_organization(email, title=title, department=department)
+        if not result.ok:
+            return _err(request, f"Couldn't update role/store: {result.detail}")
+        st.invalidate_users()  # title/department changed -> cached directory is stale
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_org_form.html", {"email": email, "title": title, "department": department, "saved": True}
     )
@@ -337,7 +386,7 @@ async def _bulk_targets(st, group: str, emails_raw: str):
     return [u for u in users if u.primary_email.lower() in wanted and not u.suspended]
 
 
-async def _run_bulk_store(job, st, conn, targets, store: str) -> None:
+async def _run_bulk_store(job, st, conn, targets, store: str, lease=None) -> None:
     """Background task: set department=store per user, KEEPING each existing title."""
     try:
         for u in targets:
@@ -358,6 +407,8 @@ async def _run_bulk_store(job, st, conn, targets, store: str) -> None:
         job.current = ""
         job.finished = True
         st.invalidate_users()  # departments changed -> cached directory is stale
+        if lease is not None:
+            lease.release()
 
 
 @router.get("/bulk", response_class=HTMLResponse)
@@ -401,8 +452,19 @@ async def bulk_apply(request: Request, store: Annotated[str, Form()] = "", group
         return _err(request, _friendly(exc))
     if not targets:
         return _err(request, "No matching active users to update.")
-    job = start_job(st.jobs, len(targets))
-    job.task = asyncio.create_task(_run_bulk_store(job, st, conn, targets, store))
+    lease = try_acquire_admin_activity(st, "users-bulk-store")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        job = start_job(st.jobs, len(targets))
+        job.task = asyncio.create_task(
+            _run_bulk_store(job, st, conn, targets, store, lease)
+        )
+    except Exception:
+        lease.release()
+        if "job" in locals():
+            st.jobs.pop(job.id, None)
+        raise
     return TEMPLATES.TemplateResponse(request, "_bulk_apply.html", {"job": job})
 
 
@@ -453,27 +515,41 @@ async def calendar_get(request: Request, email: str) -> HTMLResponse:
 async def calendar_add(
     request: Request, email: Annotated[str, Form()], target: Annotated[str, Form()], role: Annotated[str, Form()] = "reader"
 ) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     target = target.strip()
     if not target:
         return _err(request, "Enter an email to share with.")
-    result = await conn.add_calendar_acl(email, target, role=role)
-    if not result.ok:
-        return _err(request, f"Couldn't share calendar: {result.detail}")
-    return await _calendar_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-calendar-share")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.add_calendar_acl(email, target, role=role)
+        if not result.ok:
+            return _err(request, f"Couldn't share calendar: {result.detail}")
+        return await _calendar_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/calendar/remove", response_class=HTMLResponse)
 async def calendar_remove(request: Request, email: Annotated[str, Form()], scope: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.remove_calendar_acl(email, scope.strip())
-    if not result.ok:
-        return _err(request, f"Couldn't remove access: {result.detail}")
-    return await _calendar_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-calendar-share")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.remove_calendar_acl(email, scope.strip())
+        if not result.ok:
+            return _err(request, f"Couldn't remove access: {result.detail}")
+        return await _calendar_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 # --- delete account (irreversible — guarded, type-the-email confirm) ---------------------
@@ -495,7 +571,8 @@ async def delete_confirm(request: Request, email: Annotated[str, Form()]) -> HTM
 
 @router.post("/delete/apply", response_class=HTMLResponse)
 async def delete_apply(request: Request, email: Annotated[str, Form()], confirm: Annotated[str, Form()] = "") -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     if confirm.strip().lower() != email.strip().lower():
@@ -503,10 +580,16 @@ async def delete_apply(request: Request, email: Annotated[str, Form()], confirm:
             request, _DELETE_ZONE,
             {"email": email, "confirming": True, "error": "Type the exact email address to confirm."},
         )
-    result = await conn.delete_user(email)
-    if not result.ok:
-        return _err(request, f"Couldn't delete the account: {result.detail}")
-    request.app.state.gamgui.invalidate_users()
+    lease = try_acquire_admin_activity(st, "user-delete")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.delete_user(email)
+        if not result.ok:
+            return _err(request, f"Couldn't delete the account: {result.detail}")
+        st.invalidate_users()
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _DELETE_ZONE, {"email": email, "deleted": True})
 
 
@@ -538,28 +621,42 @@ async def vacation_set(
     start: Annotated[str, Form()] = "",
     end: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.set_vacation(
-        email, subject, message, html=True,
-        start=start.strip() or None, end=end.strip() or None,
-        contacts_only=(contactsonly == "on"), domain_only=(domainonly == "on"),
-    )
-    if not result.ok:
-        return _err(request, f"Couldn't set auto-reply: {result.detail}")
-    return await _vacation_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-vacation-set")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.set_vacation(
+            email, subject, message, html=True,
+            start=start.strip() or None, end=end.strip() or None,
+            contacts_only=(contactsonly == "on"), domain_only=(domainonly == "on"),
+        )
+        if not result.ok:
+            return _err(request, f"Couldn't set auto-reply: {result.detail}")
+        return await _vacation_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.post("/vacation/off", response_class=HTMLResponse)
 async def vacation_off(request: Request, email: Annotated[str, Form()]) -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
-    result = await conn.clear_vacation(email)
-    if not result.ok:
-        return _err(request, f"Couldn't turn off auto-reply: {result.detail}")
-    return await _vacation_partial(request, conn, email)
+    lease = try_acquire_admin_activity(st, "user-vacation-set")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = await conn.clear_vacation(email)
+        if not result.ok:
+            return _err(request, f"Couldn't turn off auto-reply: {result.detail}")
+        return await _vacation_partial(request, conn, email)
+    finally:
+        lease.release()
 
 
 @router.get("/suspend/zone", response_class=HTMLResponse)
@@ -583,18 +680,24 @@ async def suspend_preview(request: Request, email: Annotated[str, Form()]) -> HT
 
 @router.post("/suspend/apply", response_class=HTMLResponse)
 async def suspend_apply(request: Request, email: Annotated[str, Form()], suspend: Annotated[str, Form()] = "on") -> HTMLResponse:
-    conn = _conn(request)
+    st = request.app.state.gamgui
+    conn = st.connector
     if conn is None:
         return _err(request, _NOT_CONNECTED)
     want_suspend = suspend == "on"
+    lease = try_acquire_admin_activity(st, "user-suspension-change")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         results = await conn.apply(conn.plan_suspend([email], suspend=want_suspend))
+        if not (results and all(r.ok for r in results)):
+            detail = results[0].detail if results else "no change applied"
+            return _err(request, f"Failed: {detail}")
+        st.invalidate_users()  # status changed -> cached list is stale
     except Exception as exc:
         return _err(request, _friendly(exc))
-    if not (results and all(r.ok for r in results)):
-        detail = results[0].detail if results else "no change applied"
-        return _err(request, f"Failed: {detail}")
-    request.app.state.gamgui.invalidate_users()  # status changed -> cached list is stale
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_suspend_zone.html", {"email": email, "suspended": want_suspend}
     )

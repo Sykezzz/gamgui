@@ -10,6 +10,10 @@ from __future__ import annotations
 import asyncio
 import csv
 import heapq
+import json
+import os
+import sys
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +21,12 @@ from typing import Iterator, List, Optional, Sequence, Set, Tuple
 
 from ..audit import AuditLog
 from ..classroom.index import CourseIndex
-from ..classroom.models import CourseDetail, CourseParticipant, CourseSummary
+from ..classroom.models import (
+    CourseDetail,
+    CourseParticipant,
+    CourseRosterSnapshot,
+    CourseSummary,
+)
 from ..directory_index import DirectoryIndex, Page
 from ..gam.commands import GAMCommands, SIGNATURE_USER_FIELDS, build_user_query
 from ..gam.errors import GAMError, GAMErrorKind
@@ -33,7 +42,12 @@ from ..gam.models import (
 )
 from ..calendar_index import IndexedCalendar
 from ..gam.parser import iter_records_file, parse_one, parse_records
-from ..gam.runner import GAMRunner
+from ..gam.runner import (
+    GAMRunner,
+    await_secure_remove_private_file,
+    secure_remove_private_file,
+)
+from ..secrets.ephemeral import private_runtime_spool_dir
 from .base import (
     Capability,
     ChangePreview,
@@ -45,6 +59,8 @@ from .base import (
     RiskLevel,
 )
 from .person import ConnectorAccount, Person
+
+MAX_ONEROSTER_BULK_ROSTER_MEMBERS = 500_000
 
 
 def _parse_signature(text: str) -> str:
@@ -152,6 +168,106 @@ def _bounded_group_member(record: dict) -> Optional[GroupMember]:
     )
 
 
+def _is_allowed_classroom_batch_command(argv: Sequence[str]) -> bool:
+    """Fail closed around the only mutation shapes OneRoster may batch."""
+    command = tuple(str(argument) for argument in argv)
+    if not command or any(any(ch in item for ch in "\r\n\x00") for item in command):
+        return False
+    if len(command) >= 8 and command[:2] == ("create", "course"):
+        attributes = command[2:]
+        if len(attributes) % 2:
+            return False
+        keys = attributes[::2]
+        allowed = {
+            "alias",
+            "name",
+            "teacher",
+            "section",
+            "room",
+            "descriptionheading",
+            "description",
+            "state",
+        }
+        values = dict(zip(keys, attributes[1::2]))
+        return (
+            len(set(keys)) == len(keys)
+            and set(keys) <= allowed
+            and {"alias", "name", "teacher", "state"} <= set(keys)
+            and values["state"].casefold() == "provisioned"
+            and values["alias"].startswith("Section_")
+            and _safe_batch_email(values["teacher"])
+        )
+    if len(command) >= 5 and command[:2] == ("update", "course"):
+        if not command[2].startswith("d:Section_"):
+            return False
+        attributes = command[3:]
+        if len(attributes) == 2 and attributes[0] == "state":
+            return attributes[1].casefold() in {"active", "archived"}
+        if len(attributes) == 2 and attributes[0] == "teacher":
+            return _safe_batch_email(attributes[1])
+        return (
+            (len(attributes) == 6 and attributes[::2] == ("name", "section", "room"))
+            or (
+                len(attributes) == 10
+                and attributes[::2]
+                == ("name", "section", "room", "descriptionheading", "description")
+            )
+        )
+    if (
+        len(command) == 5
+        and command[0] == "course"
+        and command[1].startswith("d:Section_")
+        and command[2] in {"add", "remove"}
+        and command[3] in {"teachers", "students"}
+        and _safe_batch_email(command[4])
+    ):
+        return True
+    return False
+
+
+def _safe_batch_email(value: str) -> bool:
+    email = str(value or "")
+    return (
+        3 <= len(email) <= 254
+        and "@" in email
+        and not any(character.isspace() for character in email)
+    )
+
+
+def _remove_private_batch(path: Path) -> bool:
+    """Overwrite then remove a temporary selector or roster batch file."""
+
+    return secure_remove_private_file(path)
+
+
+async def _await_private_batch_removal(path: Path) -> bool:
+    """Finish private-file cleanup even if the caller is cancelled again."""
+
+    return await await_secure_remove_private_file(path)
+
+
+async def _parse_private_spool_off_loop(reader, *args):
+    """Keep a runner-owned spool alive until its worker-thread parser has exited."""
+    worker = asyncio.create_task(asyncio.to_thread(reader, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            worker.result()
+        except Exception:
+            # Cancellation is the caller-visible result. Retrieving a parser failure prevents an
+            # unobserved-task warning before the runner securely removes its private spool.
+            pass
+        raise cancellation
+
+
 def _read_group_member_spool(
     path: Path,
     limit: Optional[int],
@@ -231,6 +347,303 @@ def _read_signature_user_spool(
     return users
 
 
+def _read_oneroster_directory_spool(path: Path) -> dict[str, GAMUser]:
+    """Build a primary-and-alias lookup without retaining full Directory records."""
+    snapshot: dict[str, GAMUser] = {}
+    for record in iter_records_file(path):
+        parsed = GAMUser.from_json(record)
+        primary = _safe_email(parsed.primary_email).casefold()
+        if not primary:
+            continue
+        aliases = list(
+            dict.fromkeys(
+                alias
+                for value in parsed.aliases
+                if (alias := _safe_email(value).casefold()) and alias != primary
+            )
+        )
+        canonical = GAMUser(
+            primary_email=primary,
+            suspended=bool(parsed.suspended),
+            aliases=aliases,
+            user_id=str(parsed.user_id or "").strip(),
+        )
+        for identifier in (primary, *aliases):
+            existing = snapshot.get(identifier)
+            if existing is not None and existing.primary_email != primary:
+                raise ValueError(
+                    "OneRoster directory snapshot contains an ambiguous email identifier."
+                )
+            snapshot[identifier] = canonical
+    return snapshot
+
+
+def _without_course_raw(
+    detail: CourseDetail,
+    aliases: Optional[Sequence[str]] = None,
+) -> CourseDetail:
+    """Retain planner fields while dropping the duplicate source-record dictionary."""
+    return CourseDetail(
+        id=detail.id,
+        name=detail.name,
+        section=detail.section,
+        room=detail.room,
+        owner_id=detail.owner_id,
+        course_state=detail.course_state,
+        creation_time=detail.creation_time,
+        update_time=detail.update_time,
+        alternate_link=detail.alternate_link,
+        owner_email=detail.owner_email,
+        description_heading=detail.description_heading,
+        description=detail.description,
+        aliases=tuple(detail.aliases if aliases is None else aliases),
+    )
+
+
+def _read_oneroster_course_aliases(record: dict) -> tuple[str, ...]:
+    value = record.get("JSON-aliases")
+    if value in (None, ""):
+        value = record.get("aliases", record.get("Aliases", ()))
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as exc:
+            raise ValueError(
+                "Exact managed course lookup returned invalid alias data."
+            ) from exc
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "Exact managed course lookup returned invalid alias data."
+        )
+    aliases: list[str] = []
+    for item in value:
+        raw = item.get("alias", "") if isinstance(item, dict) else item
+        alias = str(raw or "").strip()
+        if alias.startswith("d:"):
+            alias = alias[2:]
+        if alias.startswith("Section_") and len(alias) > len("Section_"):
+            aliases.append(f"d:{alias}")
+    return tuple(dict.fromkeys(aliases))
+
+
+def _read_oneroster_course_lookup_spool(
+    path: Path,
+    requested_aliases: Sequence[str],
+) -> List[CourseDetail]:
+    """Map sparse exact-set results by returned alias, never by row position."""
+
+    requested_by_fold = {
+        alias.casefold(): alias
+        for alias in requested_aliases
+    }
+    if len(requested_by_fold) != len(requested_aliases):
+        raise ValueError("managed Classroom aliases must be unique")
+    courses_by_alias: dict[str, CourseDetail] = {}
+    for record in iter_records_file(path):
+        detail = _without_course_raw(CourseDetail.from_json(record), ())
+        if not detail.id:
+            continue
+        matches = [
+            requested_by_fold[alias.casefold()]
+            for alias in _read_oneroster_course_aliases(record)
+            if alias.casefold() in requested_by_fold
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Exact managed course lookup returned an ambiguous alias result."
+            )
+        matched = matches[0]
+        key = matched.casefold()
+        if key in courses_by_alias:
+            raise ValueError(
+                "Exact managed course lookup returned a duplicate alias result."
+            )
+        courses_by_alias[key] = _without_course_raw(detail, (matched,))
+    return [
+        courses_by_alias[alias.casefold()]
+        for alias in requested_aliases
+        if alias.casefold() in courses_by_alias
+    ]
+
+
+def _managed_course_alias(value: object) -> str:
+    alias = str(value or "").strip()
+    if alias.startswith("d:"):
+        alias = alias[2:]
+    if (
+        not alias.startswith("Section_")
+        or len(alias) == len("Section_")
+        or len(alias) > 512
+        or any(character in alias for character in "\r\n\x00")
+    ):
+        raise ValueError("aliases contain an invalid managed Classroom alias")
+    return f"d:{alias}"
+
+
+def _write_private_selector(
+    values: Sequence[str],
+    *,
+    prefix: str,
+    spool_dir: Optional[Path] = None,
+) -> Path:
+    fd, raw_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".txt",
+        dir=str(spool_dir or private_runtime_spool_dir()),
+    )
+    path = Path(raw_path)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            fd = -1
+            for value in values:
+                stream.write(value)
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        _remove_private_batch(path)
+        raise
+
+
+def _participant_role(record: dict, parsed: CourseParticipant) -> str:
+    value = parsed.role
+    if not value:
+        for key in ("participantRole", "courseRole", "userRole", "type", "Type"):
+            if record.get(key) not in (None, ""):
+                value = str(record[key])
+                break
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"teacher", "teachers"}:
+        return "teachers"
+    if normalized in {"student", "students"}:
+        return "students"
+    return ""
+
+
+def _participant_array(record: dict, key: str) -> List[dict]:
+    """Decode one GAM ``formatjson`` roster cell without retaining the source row."""
+    value = record.get(key)
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"OneRoster roster snapshot contains invalid {key} data."
+            ) from exc
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"OneRoster roster snapshot contains invalid {key} data.")
+    return value
+
+
+def _bounded_oneroster_participant(
+    record: dict,
+    course_id: str,
+    role: str,
+) -> CourseParticipant:
+    parsed = CourseParticipant.from_json(
+        {**record, "courseId": course_id},
+        role=role,
+    )
+    if not parsed.email:
+        raise ValueError("OneRoster roster snapshot contains a participant without an email.")
+    return CourseParticipant(
+        course_id=course_id,
+        email=parsed.email,
+        user_id=parsed.user_id,
+        role=role,
+        full_name=parsed.full_name,
+    )
+
+
+def _read_oneroster_participants_spool(
+    path: Path,
+    course_ids: Set[str],
+    role: str,
+) -> CourseRosterSnapshot:
+    grouped: dict[str, Tuple[Set[str], Set[str]]] = {}
+    seen_course_ids: Set[str] = set()
+    member_records = 0
+
+    def retain(record: dict, course_id: str, parsed_role: str) -> None:
+        nonlocal member_records
+        member_records += 1
+        if member_records > MAX_ONEROSTER_BULK_ROSTER_MEMBERS:
+            raise ValueError(
+                "OneRoster roster snapshot exceeds the safe membership limit."
+            )
+        participant = _bounded_oneroster_participant(
+            record,
+            course_id,
+            parsed_role,
+        )
+        interned_email = sys.intern(participant.email)
+        teachers, students = grouped.setdefault(
+            course_id,
+            (set(), set()),
+        )
+        if parsed_role == "teachers":
+            teachers.add(interned_email)
+        else:
+            students.add(interned_email)
+
+    for record in iter_records_file(path):
+        course_id = sys.intern(
+            str(
+                record.get("courseId")
+                or record.get("courseID")
+                or record.get("Course ID")
+                or ""
+            ).strip()
+        )
+        if not course_id:
+            raise ValueError("OneRoster roster snapshot contains a participant without a course ID.")
+        if course_id not in course_ids:
+            continue
+        seen_course_ids.add(course_id)
+        grouped.setdefault(course_id, (set(), set()))
+
+        # GAM's `print course-participants ... formatjson` output is a streaming CSV
+        # with one course per row and JSON arrays in these two columns. Keep support
+        # for flat records as a compatibility boundary for older/mock GAM versions.
+        nested = "JSON-teachers" in record or "JSON-students" in record
+        if nested:
+            for parsed_role, key in (
+                ("teachers", "JSON-teachers"),
+                ("students", "JSON-students"),
+            ):
+                if role != "all" and parsed_role != role:
+                    continue
+                for member in _participant_array(record, key):
+                    retain(member, course_id, parsed_role)
+            continue
+
+        parsed = CourseParticipant.from_json(record)
+        parsed_role = _participant_role(record, parsed)
+        if not parsed_role:
+            raise ValueError("OneRoster roster snapshot contains a participant without a valid role.")
+        if role != "all" and parsed_role != role:
+            continue
+        retain(record, course_id, parsed_role)
+    missing = course_ids - seen_course_ids
+    if missing:
+        raise ValueError(
+            "OneRoster roster snapshot omitted one or more requested courses."
+        )
+    return CourseRosterSnapshot(
+        rosters={
+            course_id: (frozenset(teachers), frozenset(students))
+            for course_id, (teachers, students) in grouped.items()
+        },
+        seen_course_ids=frozenset(seen_course_ids),
+    )
+
+
 class GAMConnector(Connector):
     id = ConnectorID.GOOGLE_WORKSPACE
     capabilities = {
@@ -268,6 +681,15 @@ class GAMConnector(Connector):
         argv = GAMCommands.print_users(query=query, fields=fields)
         stdout = await self.runner.run_authenticated(self.domain, argv)
         return [GAMUser.from_json(r) for r in parse_records(stdout)]
+
+    async def list_oneroster_directory(self) -> dict[str, GAMUser]:
+        """Return one alias-resolvable Directory snapshot from one private GAM spool."""
+        argv = GAMCommands.print_oneroster_directory()
+        async with self.runner.run_authenticated_to_file(self.domain, argv) as result:
+            return await _parse_private_spool_off_loop(
+                _read_oneroster_directory_spool,
+                result.path,
+            )
 
     async def get_user(self, email: str, fields: Optional[Sequence[str]] = None) -> GAMUser:
         argv = GAMCommands.info_user(email, fields=fields)
@@ -410,6 +832,67 @@ class GAMConnector(Connector):
         stdout = await self.runner.run_authenticated(self.domain, argv)
         return [CourseDetail.from_json(record) for record in parse_records(stdout)]
 
+    async def list_oneroster_managed_courses(
+        self,
+        aliases: Sequence[str],
+    ) -> List[CourseDetail]:
+        """Resolve one exact managed-alias set in a single streamed GAM process."""
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        for raw in aliases:
+            alias = _managed_course_alias(raw)
+            key = alias.casefold()
+            if key not in seen:
+                seen.add(key)
+                selected.append(alias)
+        if not selected:
+            return []
+
+        selector_path = _write_private_selector(
+            selected,
+            prefix="gamgui-oneroster-course-selector-",
+            spool_dir=private_runtime_spool_dir(
+                getattr(self.runner, "base_dir", None)
+            ),
+        )
+        operation_succeeded = False
+        try:
+            timeout = min(
+                21600.0,
+                max(
+                    float(getattr(self.runner, "timeout", 120.0)),
+                    0.5 * len(selected),
+                ),
+            )
+            async with self.runner.run_authenticated_to_file(
+                self.domain,
+                GAMCommands.print_oneroster_courses_file(str(selector_path)),
+                timeout=timeout,
+                serialize=True,
+            ) as result:
+                courses = await _parse_private_spool_off_loop(
+                    _read_oneroster_course_lookup_spool,
+                    result.path,
+                    selected,
+                )
+            operation_succeeded = True
+        finally:
+            cleaned = await _await_private_batch_removal(selector_path)
+            if not cleaned and operation_succeeded:
+                raise RuntimeError(
+                    "Private Classroom selector could not be removed securely."
+                )
+
+        course_ids: set[str] = set()
+        for course in courses:
+            if course.id in course_ids:
+                raise ValueError(
+                    "More than one managed alias resolves to the same Classroom course."
+                )
+            course_ids.add(course.id)
+        return courses
+
     async def refresh_course_index(self, index: CourseIndex) -> int:
         """Stream the tenant-wide cheap course projection into ``index`` off-loop."""
 
@@ -497,6 +980,170 @@ class GAMConnector(Connector):
             CourseParticipant.from_json(record, role=role)
             for record in parse_records(stdout)
         ]
+
+    async def list_course_participants_many(
+        self,
+        course_ids: Sequence[str],
+        role: str = "all",
+    ) -> CourseRosterSnapshot:
+        """Read an exact course-roster set in one streamed GAM process."""
+
+        selected = list(
+            dict.fromkeys(
+                str(course_id).strip()
+                for course_id in course_ids
+                if str(course_id).strip()
+            )
+        )
+        normalized_role = str(role or "").strip().casefold()
+        if normalized_role not in {"all", "teachers", "students"}:
+            raise ValueError("invalid Classroom roster role")
+        if not selected:
+            return CourseRosterSnapshot.empty()
+        if any(
+            len(course_id) > 512
+            or any(character in course_id for character in "\r\n\x00")
+            for course_id in selected
+        ):
+            raise ValueError("course_ids contain an invalid Classroom course reference")
+
+        selector_path = _write_private_selector(
+            selected,
+            prefix="gamgui-oneroster-roster-selector-",
+            spool_dir=private_runtime_spool_dir(
+                getattr(self.runner, "base_dir", None)
+            ),
+        )
+        operation_succeeded = False
+        try:
+            timeout = min(
+                21600.0,
+                max(
+                    float(getattr(self.runner, "timeout", 120.0)),
+                    2.0 * len(selected),
+                ),
+            )
+            async with self.runner.run_authenticated_to_file(
+                self.domain,
+                GAMCommands.print_course_participants_file(
+                    str(selector_path),
+                    normalized_role,
+                ),
+                timeout=timeout,
+                serialize=True,
+            ) as result:
+                participants = await _parse_private_spool_off_loop(
+                    _read_oneroster_participants_spool,
+                    result.path,
+                    set(selected),
+                    normalized_role,
+                )
+            operation_succeeded = True
+        finally:
+            cleaned = await _await_private_batch_removal(selector_path)
+            if not cleaned and operation_succeeded:
+                raise RuntimeError(
+                    "Private Classroom selector could not be removed securely."
+                )
+        return participants
+
+    async def list_course_participants_many_bounded(
+        self,
+        course_ids: Sequence[str],
+        role: str = "all",
+    ) -> List[CourseParticipant]:
+        """Retain the older exact-course subprocess behavior for non-OneRoster callers."""
+        selected = [
+            str(course_id).strip()
+            for course_id in course_ids
+            if str(course_id).strip()
+        ]
+        normalized_role = str(role or "").strip().casefold()
+        roles = ("teachers", "students") if normalized_role == "all" else (normalized_role,)
+        participants: List[CourseParticipant] = []
+        for offset in range(0, len(selected), 50):
+            chunk = selected[offset : offset + 50]
+            for selected_role in roles:
+                stdout = await self.runner.run_authenticated(
+                    self.domain,
+                    GAMCommands.print_course_participants_many(chunk, selected_role),
+                )
+                participants.extend(
+                    CourseParticipant.from_json(record, role=selected_role)
+                    for record in parse_records(stdout)
+                )
+        return participants
+
+    async def run_classroom_batch(
+        self,
+        commands: Sequence[Sequence[str]],
+        *,
+        max_commands: int = 50,
+    ) -> None:
+        """Execute one bounded, allowlisted OneRoster mutation batch.
+
+        The batch exists only as an owner-readable temporary file. GAM's opaque
+        ``clear`` and ``sync`` operations are deliberately not accepted.
+        Callers must verify every requested result against live Classroom state.
+        """
+        cap = max(1, min(int(max_commands), 50))
+        selected = [list(command) for command in commands]
+        if not selected or len(selected) > cap:
+            raise ValueError(f"Classroom batch must contain between 1 and {cap} commands.")
+        if not all(_is_allowed_classroom_batch_command(command) for command in selected):
+            raise ValueError("Classroom batch contains a non-allowlisted GAM mutation.")
+
+        fd, raw_path = tempfile.mkstemp(
+            prefix="gamgui-oneroster-",
+            suffix=".batch",
+            dir=str(
+                private_runtime_spool_dir(
+                    getattr(self.runner, "base_dir", None)
+                )
+            ),
+        )
+        batch_path = Path(raw_path)
+        operation_succeeded = False
+        try:
+            os.chmod(batch_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                for command in selected:
+                    stream.write(GAMCommands.batch_line(command))
+                    stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            fd = -1
+            timeout = min(1800.0, max(float(self.runner.timeout), 30.0 * len(selected)))
+            await self.runner.run_authenticated(
+                self.domain,
+                GAMCommands.batch_file(str(batch_path), show_commands=False),
+                timeout=timeout,
+                serialize=True,
+            )
+            self.audit.record(
+                "oneroster_classroom_batch",
+                target=f"{len(selected)} actions",
+                argv=GAMCommands.batch_file("<private-batch>", show_commands=False),
+                ok=True,
+            )
+            operation_succeeded = True
+        except Exception as exc:
+            self.audit.record(
+                "oneroster_classroom_batch",
+                target=f"{len(selected)} actions",
+                argv=GAMCommands.batch_file("<private-batch>", show_commands=False),
+                ok=False,
+                extra={"error": str(exc)},
+            )
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            cleaned = await _await_private_batch_removal(batch_path)
+            if not cleaned and operation_succeeded:
+                raise RuntimeError(
+                    "Private Classroom batch could not be removed securely."
+                )
 
     async def create_course(
         self,
@@ -610,7 +1257,7 @@ class GAMConnector(Connector):
     ) -> dict:
         """Return a bounded usage leaderboard from a private streamed GAM spool.
 
-        Usage data lags roughly 2â€“3 days, so walk backward to the first date with data. GAM still
+        Usage data lags roughly 2–3 days, so walk backward to the first date with data. GAM still
         produces a tenant report, but stdout is never buffered in the process and CSV reduction is
         performed off the event loop while the runner owns secure spool cleanup.
         """

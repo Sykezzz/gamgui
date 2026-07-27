@@ -1,0 +1,55 @@
+<div class="overflow-hidden rounded-xl border border-brand-gray/40">
+  <div class="flex flex-wrap items-end justify-between gap-3 border-b border-brand-gray/30 bg-brand-white px-4 py-3">
+    <div>
+      <p class="font-semibold text-brand-black">{{ kind | replace("_", " ") | title }}</p>
+      <p class="text-xs text-brand-blueink"><span class="tabular-nums">{{ total }}{% if not total_exact %}+{% endif %}</span> result{{ "" if total_exact and total == 1 else "s" }} · showing at most {{ limit }}</p>
+    </div>
+    <form class="flex items-end gap-2" hx-get="/classroom/imports/import/{{ import_id }}/preview" hx-target="#oneroster-preview" hx-swap="innerHTML" hx-sync="this:replace">
+      <input type="hidden" name="kind" value="{{ kind }}" />
+      <label class="text-xs font-medium text-brand-black">Search
+        <input type="search" name="q" value="{{ query }}" maxlength="200"
+               class="ml-1 rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-1.5 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <button type="submit" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Search</button>
+    </form>
+  </div>
+  {% if rows %}
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-left text-sm">
+      <caption class="sr-only">{{ kind | title }} import preview</caption>
+      <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
+        <tr>
+          {% for column in columns %}<th class="px-3 py-2 font-semibold" scope="col">{{ column | replace("_", " ") | title }}</th>{% endfor %}
+          {% if kind == "sessions" %}<th class="px-3 py-2 font-semibold" scope="col">Selection</th>{% endif %}
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-brand-gray/20">
+        {% for row in rows %}
+        <tr>
+          {% for column in columns %}<td class="max-w-80 truncate px-3 py-2 text-brand-blueink">{{ row.get(column, "") }}</td>{% endfor %}
+          {% if kind == "sessions" %}
+          <td class="px-3 py-2">
+            <form hx-post="/classroom/imports/import/{{ import_id }}/session" hx-target="#oneroster-workspace" hx-swap="innerHTML">
+              <input type="hidden" name="session_id" value="{{ row.get('_session_id', '') }}" />
+              <button type="submit" {% if not row.get('_session_id') %}disabled{% endif %} class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue disabled:cursor-not-allowed disabled:opacity-50">Use this session</button>
+            </form>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="px-4 py-6 text-center text-sm text-brand-blueink">No {{ kind | replace("_", " ") }} match this view.</p>
+  {% endif %}
+  {% if next_cursor %}
+  <form class="border-t border-brand-gray/30 bg-brand-white px-4 py-3 text-right" hx-get="/classroom/imports/import/{{ import_id }}/preview" hx-target="#oneroster-preview" hx-swap="innerHTML">
+    <input type="hidden" name="kind" value="{{ kind }}" />
+    <input type="hidden" name="q" value="{{ query }}" />
+    <input type="hidden" name="cursor" value="{{ next_cursor }}" />
+    <input type="hidden" name="limit" value="{{ limit }}" />
+    <button type="submit" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Next {{ limit }}</button>
+  </form>
+  {% endif %}
+</div>

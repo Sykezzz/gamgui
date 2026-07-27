@@ -41,6 +41,9 @@ REQUIRED_TOKENS = [
     "todrive",            # export a print command's CSV to a Google Sheet
     "tduser",             # …in a specific user's Drive
     "print groups",
+    "print courses",  # Classroom course snapshot/index
+    "print course-participants",  # bounded OneRoster live-roster snapshots
+    "batch",  # private explicit per-action OneRoster execution manifests
     "create|add group",  # create a Google Group (grammar reads `create|add group`, not `create group`)
     "update group",   # add/remove members
     "calendaracls",   # calendar access view/add/remove

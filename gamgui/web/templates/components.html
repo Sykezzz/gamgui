@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Components — GamGUI Console{% endblock %}
+{% block content %}
+<div class="space-y-8">
+  <header>
+    {% if deep_link %}
+    <p class="eyebrow text-brand-blue">Classroom / OneRoster</p>
+    <h1 class="mt-2 font-serif text-3xl tracking-tight text-brand-black">OneRoster Import Studio is optional</h1>
+    <p class="mt-2 max-w-3xl text-[15px] text-brand-blueink/80">
+      This Core installation does not contain the OneRoster Import Studio. Install the
+      verified first-party component below; ordinary Classroom course and roster tools
+      remain available.
+    </p>
+    <a href="/classroom" class="mt-4 inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Return to Classroom</a>
+    {% else %}
+    <p class="eyebrow text-brand-blue">Settings</p>
+    <h1 class="mt-2 font-serif text-3xl tracking-tight text-brand-black">Components</h1>
+    <p class="mt-2 max-w-3xl text-[15px] text-brand-blueink/80">
+      Add or remove first-party GamGUI capabilities. Component preparation is local and never
+      connects to Google Workspace or reads GAM credentials.
+    </p>
+    {% endif %}
+  </header>
+
+  {% set context = "settings" %}
+  {% include "_component_card.html" %}
+
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="component-safety-heading">
+    <h2 id="component-safety-heading" class="font-serif text-xl text-brand-black">Installation safety</h2>
+    <dl class="mt-4 grid gap-4 text-sm sm:grid-cols-2">
+      <div>
+        <dt class="font-semibold text-brand-black">Verified application profile</dt>
+        <dd class="mt-1 text-brand-blueink/80">The component runs only inside a signed GamGUI application. Arbitrary plug-ins and component URLs are not accepted.</dd>
+      </div>
+      <div>
+        <dt class="font-semibold text-brand-black">Restart and rollback</dt>
+        <dd class="mt-1 text-brand-blueink/80">Install, removal, and update changes activate after restart and use the application updater’s health check and rollback path.</dd>
+      </div>
+      <div>
+        <dt class="font-semibold text-brand-black">Workspace isolation</dt>
+        <dd class="mt-1 text-brand-blueink/80">Installing a component does not run GAM, contact Google, or change Domain-Wide Delegation.</dd>
+      </div>
+      <div>
+        <dt class="font-semibold text-brand-black">Signing channel</dt>
+        <dd class="mt-1 text-brand-blueink/80">GamGUI does not silently switch between a device-local signature and an official Developer ID release.</dd>
+      </div>
+    </dl>
+  </section>
+</div>
+{% endblock %}

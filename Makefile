@@ -1,4 +1,4 @@
-.PHONY: setup gam test run app clean help
+.PHONY: setup gam test run app app-profiles clean help
 
 VENV := .venv
 PY := $(VENV)/bin/python
@@ -10,6 +10,7 @@ UV_VERSION := 0.11.7
 #   make setup PYTHON=/opt/homebrew/bin/python3.13
 PYTHON ?=
 PYTHON_CANDIDATES := python3.14 python3.13 python3.12 python3.11 python3.10 python3
+PROFILE ?= core
 
 help:
 	@echo "make setup   - create venv and install (dev + native window); needs Python 3.10+"
@@ -17,7 +18,9 @@ help:
 	@echo "make gam     - vendor the GAM7 binary into gamgui/resources/gam7"
 	@echo "make test    - run the offline test suite"
 	@echo "make run     - launch the app (native window; falls back to a browser URL)"
-	@echo "make app     - build the standalone macOS .app (PyInstaller, macOS only)"
+	@echo "make app PROFILE=core                 - build the Core macOS .app"
+	@echo "make app PROFILE=classroom-oneroster  - build Core + OneRoster"
+	@echo "make app-profiles                      - build/self-test both profiles serially"
 	@echo "make clean   - remove venv and build artifacts"
 
 setup:
@@ -53,7 +56,18 @@ run:
 	$(PY) -m gamgui.app
 
 app:
-	./scripts/build_app.sh
+	PROFILE="$(PROFILE)" ./scripts/build_app.sh
+
+app-profiles:
+	$(MAKE) app PROFILE=core
+	test -x dist/GamGUI.app/Contents/MacOS/GamGUI
+	dist/GamGUI.app/Contents/MacOS/GamGUI --self-test --json
+	rm -rf dist/GamGUI-core.app
+	mv dist/GamGUI.app dist/GamGUI-core.app
+	mv dist/GamGUI.app.artifact.json dist/GamGUI-core.app.artifact.json
+	$(MAKE) app PROFILE=classroom-oneroster
+	test -x dist/GamGUI.app/Contents/MacOS/GamGUI
+	dist/GamGUI.app/Contents/MacOS/GamGUI --self-test --json
 
 clean:
 	rm -rf $(VENV) build dist *.egg-info .pytest_cache

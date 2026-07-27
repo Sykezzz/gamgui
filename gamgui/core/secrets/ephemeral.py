@@ -61,6 +61,16 @@ def app_runtime_dir() -> Path:
     return base
 
 
+def private_runtime_spool_dir(base_dir: Optional[Path] = None) -> Path:
+    """Owner-only location for short-lived selector and batch files."""
+
+    base = Path(base_dir) if base_dir else app_runtime_dir()
+    spool = base / "spool"
+    spool.mkdir(parents=True, exist_ok=True)
+    os.chmod(spool, 0o700)
+    return spool
+
+
 def _shred_dir(path: Path) -> None:
     """Best-effort zero every file under *path*, then remove the tree. Never raises."""
     try:
@@ -150,6 +160,23 @@ def sweep_stale_configs(base_dir: Optional[Path] = None, max_age_seconds: float 
                     removed += 1
             except OSError:
                 pass
+        spool = base / "spool"
+        if spool.is_dir() and not spool.is_symlink():
+            for child in spool.glob("gamgui-oneroster-*"):
+                try:
+                    if (
+                        child.is_file()
+                        and not child.is_symlink()
+                        and (now - child.stat().st_mtime) > max_age_seconds
+                    ):
+                        try:
+                            os.chmod(child, 0o600)
+                        except OSError:
+                            pass
+                        child.unlink()
+                        removed += 1
+                except OSError:
+                    pass
     except OSError:
         pass
     return removed

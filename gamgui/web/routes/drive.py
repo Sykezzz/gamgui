@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, Response
 
 from ...core.drive import DriveAPIError, DriveSafetyError
 from ...core.drive.models import OperationTarget
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..jobs import start_job
 from ..server import TEMPLATES
 
@@ -175,6 +176,10 @@ async def update_metadata(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-metadata-update")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         await service.update_metadata(
             email.strip(),
@@ -188,6 +193,8 @@ async def update_metadata(
         )
     except Exception as exc:
         return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_drive_detail.html", ctx)
 
 
@@ -229,6 +236,10 @@ async def add_permission(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-permission-add")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         await service.add_permission(
             email.strip(),
@@ -250,6 +261,8 @@ async def add_permission(
             )
         except Exception:
             return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_drive_permissions.html", ctx)
 
 
@@ -264,6 +277,10 @@ async def update_permission(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-permission-update")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         await service.update_permission(
             email.strip(), file_id.strip(), permission_id.strip(), role
@@ -281,6 +298,8 @@ async def update_permission(
             )
         except Exception:
             return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_drive_permissions.html", ctx)
 
 
@@ -294,6 +313,10 @@ async def remove_permission(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-permission-remove")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         await service.remove_permission(
             email.strip(), file_id.strip(), permission_id.strip()
@@ -311,6 +334,8 @@ async def remove_permission(
             )
         except Exception:
             return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_drive_permissions.html", ctx)
 
 
@@ -436,6 +461,11 @@ async def ownership_apply(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    lease = try_acquire_admin_activity(
+        request.app.state.gamgui, "drive-single-owner-transfer"
+    )
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         result = await service.transfer_file_ownership(
             email.strip(),
@@ -445,6 +475,8 @@ async def ownership_apply(
         )
     except Exception as exc:
         return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     message = result.detail
     if result.residual_access:
         message += f" Warning: {result.residual_access}"
@@ -465,12 +497,18 @@ async def folder_manifest(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-folder-manifest-plan")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         manifest = await service.plan_folder_transfer(
             email.strip(), file_id.strip(), destination.strip()
         )
     except Exception as exc:
         return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_drive_manifest.html", {"manifest": manifest, "error": ""}
     )
@@ -485,18 +523,26 @@ async def classroom_manifest(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-classroom-manifest-plan")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         manifest = await service.plan_classroom_claim(
             teacher.strip(), folder_id.strip()
         )
     except Exception as exc:
         return _error(request, _friendly(exc))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_drive_manifest.html", {"manifest": manifest, "error": ""}
     )
 
 
-async def _run_manifest_job(job, service, manifest_id: str, confirmation: str) -> None:
+async def _run_manifest_job(
+    job, service, manifest_id: str, confirmation: str, lease=None
+) -> None:
     async def progress(done: int, total: int, target: OperationTarget) -> None:
         job.done = done
         job.current = target.name or target.file_id
@@ -517,6 +563,8 @@ async def _run_manifest_job(job, service, manifest_id: str, confirmation: str) -
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 @router.post("/manifest/apply", response_class=HTMLResponse)
@@ -528,12 +576,17 @@ async def manifest_apply(
     service = _service(request)
     if service is None:
         return _error(request, _NOT_CONNECTED)
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "drive-ownership-manifest")
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
     try:
         manifest = service.claim_manifest(
             manifest_id.strip(),
             confirmation=confirmation.strip(),
         )
     except Exception as exc:
+        lease.release()
         manifest = service.operations.get(manifest_id.strip(), service.domain)
         if manifest is None:
             return _error(request, _friendly(exc))
@@ -543,18 +596,24 @@ async def manifest_apply(
             {"manifest": manifest, "error": _friendly(exc)},
         )
     if manifest.status == "completed" or manifest.remaining == 0:
+        lease.release()
         return TEMPLATES.TemplateResponse(
             request,
             "_drive_job.html",
             {"job": None, "manifest": manifest},
         )
-    job = start_job(request.app.state.gamgui.jobs, manifest.remaining)
     try:
+        job = start_job(state.jobs, manifest.remaining)
         job.task = asyncio.create_task(
-            _run_manifest_job(job, service, manifest.id, confirmation.strip())
+            _run_manifest_job(
+                job, service, manifest.id, confirmation.strip(), lease
+            )
         )
     except Exception:
         service.interrupt_manifest_claim(manifest.id)
+        lease.release()
+        if "job" in locals():
+            state.jobs.pop(job.id, None)
         raise
     return TEMPLATES.TemplateResponse(
         request, "_drive_job.html", {"job": job, "manifest": manifest}

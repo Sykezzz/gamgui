@@ -11,11 +11,14 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, List, Optional, Sequence
+from typing import AsyncIterator, Optional, Sequence
 
+from ..activity import ActivityRegistry
+from ..activity import activity_registry as global_activity_registry
 from ..secrets.ephemeral import EphemeralConfig
 from ..secrets.vault import SecretsVault
 from .errors import GAMError, GAMErrorKind
@@ -59,6 +62,7 @@ def _strip_cfgdir_noise_file(path: Path, cfgdir: Path) -> None:
     fd, clean_name = tempfile.mkstemp(prefix="gam-output-clean-", dir=str(path.parent))
     clean_path = Path(clean_name)
     os.chmod(clean_path, 0o600)
+    failed = False
     try:
         with os.fdopen(fd, "wb") as target, path.open("rb") as source:
             for line in source:
@@ -66,32 +70,71 @@ def _strip_cfgdir_noise_file(path: Path, cfgdir: Path) -> None:
                     target.write(line)
         os.replace(clean_path, path)
         os.chmod(path, 0o600)
+    except BaseException:
+        failed = True
+        raise
     finally:
+        cleaned = secure_remove_private_file(clean_path)
+        if not cleaned and not failed:
+            raise RuntimeError("Private GAM temporary output could not be removed.")
+
+
+def secure_remove_private_file(path: Path, *, attempts: int = 3) -> bool:
+    """Overwrite and unlink one known private file with bounded retries."""
+
+    target = Path(path)
+    for attempt in range(max(1, min(int(attempts), 5))):
         try:
-            clean_path.unlink()
+            target.lstat()
         except FileNotFoundError:
+            return True
+        except OSError:
             pass
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        try:
+            if not target.is_symlink():
+                size = target.stat().st_size
+                with target.open("r+b", buffering=0) as stream:
+                    zeroes = b"\x00" * min(max(size, 1), 1024 * 1024)
+                    remaining = size
+                    while remaining > 0:
+                        amount = min(remaining, len(zeroes))
+                        stream.write(zeroes[:amount])
+                        remaining -= amount
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except OSError:
+            pass
+        try:
+            target.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt + 1 < attempts:
+                time.sleep(0.02 * (attempt + 1))
+    return not target.exists()
 
 
-def _secure_remove(path: Path) -> None:
-    """Best-effort overwrite followed by reliable removal of a spool file."""
-    try:
-        size = path.stat().st_size
-        with path.open("r+b", buffering=0) as fh:
-            zeroes = b"\x00" * (1024 * 1024)
-            remaining = size
-            while remaining > 0:
-                chunk = min(remaining, len(zeroes))
-                fh.write(zeroes[:chunk])
-                remaining -= chunk
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError:
-        pass
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+async def await_secure_remove_private_file(path: Path) -> bool:
+    """Wait for cleanup to finish even when the caller receives cancellation."""
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(secure_remove_private_file, path)
+    )
+    cancellation: Optional[asyncio.CancelledError] = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    cleaned = worker.result()
+    if cancellation is not None:
+        raise cancellation
+    return cleaned
 
 
 def locate_gam_binary() -> Path:
@@ -118,11 +161,17 @@ class GAMRunner:
         gam_binary: Optional[Path] = None,
         base_dir: Optional[Path] = None,
         timeout: float = DEFAULT_TIMEOUT,
+        activity_registry: Optional[ActivityRegistry] = None,
     ) -> None:
         self.vault = vault
         self.gam_binary = Path(gam_binary) if gam_binary else locate_gam_binary()
         self.base_dir = base_dir
         self.timeout = timeout
+        self.activity_registry = (
+            activity_registry
+            if activity_registry is not None
+            else global_activity_registry
+        )
         # Serializes mutating calls so two writes can't race the same ephemeral GAMCFGDIR.
         self._write_lock = asyncio.Lock()
 
@@ -142,15 +191,33 @@ class GAMRunner:
         env.setdefault("GAM_NO_UPDATE_CHECK", "1")
         return env
 
+    def _subprocess_options(
+        self,
+        pass_fds: tuple[int, ...],
+    ) -> dict[str, object]:
+        if not pass_fds:
+            return {}
+        if os.name != "posix":
+            raise RuntimeError(
+                "Durable administrative activity descriptors cannot be "
+                "inherited on this platform."
+            )
+        return {
+            "close_fds": True,
+            "pass_fds": pass_fds,
+        }
+
     async def _exec(self, argv: Sequence[str], cfgdir: Path, timeout: float) -> RunResult:
         self._require_binary()
-        proc = await asyncio.create_subprocess_exec(
-            str(self.gam_binary),
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._build_env(cfgdir),
-        )
+        with self.activity_registry.subprocess_pass_fds() as pass_fds:
+            proc = await asyncio.create_subprocess_exec(
+                str(self.gam_binary),
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._build_env(cfgdir),
+                **self._subprocess_options(pass_fds),
+            )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -176,13 +243,15 @@ class GAMRunner:
     ) -> RunResult:
         self._require_binary()
         with stdout_path.open("wb", buffering=0) as stdout_file:
-            proc = await asyncio.create_subprocess_exec(
-                str(self.gam_binary),
-                *argv,
-                stdout=stdout_file,
-                stderr=asyncio.subprocess.PIPE,
-                env=self._build_env(cfgdir),
-            )
+            with self.activity_registry.subprocess_pass_fds() as pass_fds:
+                proc = await asyncio.create_subprocess_exec(
+                    str(self.gam_binary),
+                    *argv,
+                    stdout=stdout_file,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=self._build_env(cfgdir),
+                    **self._subprocess_options(pass_fds),
+                )
             try:
                 _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
@@ -255,6 +324,7 @@ class GAMRunner:
                 os.close(fd)
                 spool_path = Path(raw_path)
                 os.chmod(spool_path, 0o600)
+                failed = False
                 try:
                     result = await self._exec_to_file(
                         command, cfgdir, command_timeout, spool_path
@@ -266,8 +336,15 @@ class GAMRunner:
                         path=spool_path,
                         stdout_bytes=spool_path.stat().st_size,
                     )
+                except BaseException:
+                    failed = True
+                    raise
                 finally:
-                    await asyncio.shield(asyncio.to_thread(_secure_remove, spool_path))
+                    cleaned = await await_secure_remove_private_file(spool_path)
+                    if not cleaned and not failed:
+                        raise RuntimeError(
+                            "Private GAM output could not be removed securely."
+                        )
 
         if serialize:
             async with self._write_lock:

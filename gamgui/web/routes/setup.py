@@ -13,12 +13,31 @@ from typing import Annotated
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from ...core.activity import ActivityBusyError, ActivityPathUnavailableError
 from ...core.canary import CanaryConfigStore
+from ...core.components import ComponentError
 from ...core.connectors.gam_connector import GAMConnector
 from ...core.setup import SetupService
+from ..activity import (
+    ADMIN_ACTIVITY_BUSY_MESSAGE,
+    activity_error_message,
+    try_acquire_admin_activity,
+)
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/setup")
+
+SETUP_COMPONENT_GATE_MESSAGE = (
+    "Finish the Optional Features choice and restart GamGUI if requested "
+    "before connecting Google Workspace. No Workspace credentials or GAM "
+    "commands were accessed."
+)
+
+SETUP_ACTIVITY_PATH_MESSAGE = (
+    "GamGUI could not determine the current home directory, so the private "
+    "setup lock and credentials path could not be expanded safely. Restore "
+    "this account's home-folder configuration, reopen setup, and try again."
+)
 
 
 def _service(request: Request) -> SetupService:
@@ -26,14 +45,64 @@ def _service(request: Request) -> SetupService:
     return SetupService(st.vault, st.runner)
 
 
+def _component_gate_response(request: Request) -> HTMLResponse | None:
+    """Refuse setup mutations until the component choice is settled.
+
+    The browser flow already renders Optional Features first, but this check is
+    intentionally server-side so a direct or stale POST cannot trigger a GAM
+    command or a Workspace Keychain read.
+    """
+
+    st = request.app.state.gamgui
+    ensure_manager = getattr(st, "ensure_component_manager", None)
+    manager = (
+        ensure_manager()
+        if callable(ensure_manager)
+        else getattr(st, "component_manager", None)
+    )
+    if manager is None:
+        # Minimal route test doubles predate the component host. Production
+        # AppState always supplies ensure_component_manager().
+        return None
+    if manager.first_run_choice_pending() or manager.status().restart_required:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": SETUP_COMPONENT_GATE_MESSAGE},
+        )
+    return None
+
+
 @router.get("", response_class=HTMLResponse)
 async def setup_page(request: Request) -> HTMLResponse:
     st = request.app.state.gamgui
+    manager = st.ensure_component_manager()
+    component_status = manager.status()
+    component_only = bool(
+        manager.first_run_choice_pending()
+        or component_status.restart_required
+    )
+    if component_only:
+        # The optional-feature decision is deliberately rendered before any setup
+        # service probes or credential discovery. Component preparation must not
+        # touch Workspace Keychain state.
+        return TEMPLATES.TemplateResponse(
+            request,
+            "setup.html",
+            {
+                "component_only": True,
+                "gam_version": "",
+                "gam_version_warning": "",
+                "binary_present": st.runner.binary_exists(),
+                "candidate_dirs": (),
+            },
+        )
     svc = _service(request)
     return TEMPLATES.TemplateResponse(
         request,
         "setup.html",
         {
+            "component_only": False,
             "gam_version": await svc.engine_version(),
             "gam_version_warning": await svc.engine_version_warning(),
             "binary_present": st.runner.binary_exists(),
@@ -49,26 +118,62 @@ async def do_import(
     admin: Annotated[str, Form()] = "",
     config_dir: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     domain, admin, config_dir = domain.strip(), admin.strip(), config_dir.strip()
     if not domain or not admin or not config_dir:
         return TEMPLATES.TemplateResponse(
             request, "_error.html",
             {"message": "Enter the domain and super-admin email, then choose a credentials folder."},
         )
+    st = request.app.state.gamgui
+    try:
+        lease = try_acquire_admin_activity(st, "setup-credential-import")
+    except ActivityPathUnavailableError:
+        # The durable activity lock is resolved before the credential folder.
+        # On macOS that resolution uses the account home directory and can fail
+        # in managed/launchd contexts. Refuse the import without touching
+        # credentials and give the operator a corrective path instead of a 500.
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": SETUP_ACTIVITY_PATH_MESSAGE},
+        )
+    if lease is None:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+        )
     svc = _service(request)
     try:
-        imported = svc.import_dir(config_dir, domain)
-    except (ValueError, OSError, RuntimeError) as exc:
-        # A typo'd or non-directory path is operator error, not a crash — say which, and let them
-        # correct it in place. The import path is written to raise only operator-facing ValueError,
-        # but it stands on the filesystem and on $HOME: an unreadable folder (OSError) or an
-        # environment with no determinable home (RuntimeError from Path.home()/expanduser) are
-        # conditions the operator can act on, and a 500 tells them nothing. Deliberately narrow —
-        # a programming error is not an OSError, and still surfaces as a 500.
-        return TEMPLATES.TemplateResponse(
-            request, "_error.html",
-            {"message": str(exc) or "That folder could not be read — check the path and try again."},
-        )
+        # A scope proof belongs to the credential set that produced it.  Replacing
+        # credentials for the same domain must make OneRoster fail closed until
+        # setup verification succeeds again, even if the import itself fails or
+        # the optional component is currently absent/disabled.
+        try:
+            st.ensure_component_manager().invalidate_scope_readiness(domain)
+        except ComponentError as exc:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": str(exc)},
+            )
+        try:
+            imported = svc.import_dir(config_dir, domain)
+        except (ValueError, OSError, RuntimeError) as exc:
+            # A typo'd or non-directory path is operator error, not a crash — say which, and let
+            # them correct it in place. Deliberately narrow: programming errors still surface.
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {
+                    "message": str(exc)
+                    or "That folder could not be read — check the path and try again."
+                },
+            )
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_dwd.html",
         {
@@ -87,6 +192,8 @@ async def fresh(
     domain: Annotated[str, Form()] = "",
     admin: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     svc = _service(request)
     info = svc.setup_commands(admin.strip() or "admin@yourdomain.com")
     return TEMPLATES.TemplateResponse(
@@ -101,6 +208,8 @@ async def verify(
     domain: Annotated[str, Form()] = "",
     admin: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
+    if blocked := _component_gate_response(request):
+        return blocked
     domain, admin = domain.strip(), admin.strip()
     if not domain or not admin:
         return TEMPLATES.TemplateResponse(
@@ -111,30 +220,41 @@ async def verify(
         return TEMPLATES.TemplateResponse(
             request,
             "_error.html",
-            {
-                "message": (
-                    "Finish or stop the active administrative operation "
-                    "before reconnecting."
-                )
-            },
+            {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
         )
     svc = _service(request)
     result = await svc.verify(domain, admin)
     if result.ok:
         try:
             st.activate_connector(GAMConnector(runner=st.runner, domain=domain))
+        except ActivityBusyError:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+            )
         except RuntimeError as exc:
             return TEMPLATES.TemplateResponse(
                 request,
                 "_error.html",
-                {"message": str(exc)},
+                {"message": activity_error_message(exc)},
             )
         config_path = (
             Path(st.runner.base_dir) / "canary-config.json"
             if st.runner.base_dir is not None
             else None
         )
-        CanaryConfigStore(config_path).save(domain, admin)
+        lease = try_acquire_admin_activity(st, "setup-canary-save")
+        if lease is None:
+            return TEMPLATES.TemplateResponse(
+                request,
+                "_error.html",
+                {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
+            )
+        try:
+            CanaryConfigStore(config_path).save(domain, admin)
+        finally:
+            lease.release()
     return TEMPLATES.TemplateResponse(
         request, "_verify.html", {"result": result, "domain": domain, "admin": admin}
     )

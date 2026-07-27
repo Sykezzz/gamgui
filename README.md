@@ -177,6 +177,24 @@ folder transfers and Classroom ownership claims create persistent exact-file man
 targets serially, and retain per-file status for retry/review. Shared Drive content is
 organization-owned and is never transferred or claimed by these workflows.
 
+### Optional OneRoster component
+
+OneRoster Import Studio is a first-party optional application profile. The `core` profile keeps
+all ordinary Classroom and Drive administration but omits the OneRoster executable package,
+templates, and migrations. The `classroom-oneroster` profile adds validated OneRoster ZIP
+ingestion, import thresholds, immutable district manifests, and the student-enrollment release
+gate.
+
+New installations offer the component during first-run setup. It can also be installed, disabled,
+enabled, or removed from **Settings → Components**. Installing or removing it stages a complete
+matching GamGUI bundle and activates it on restart; GamGUI never loads downloaded Python from
+Application Support. Component discovery and installation do not contact Google or read Workspace
+credentials.
+
+Removing the component preserves its protected audit and import state. Raw and normalized
+OneRoster snapshots retain their 30-day expiry and are purged by Core. Permanent local data removal
+is a separate typed-confirmation action.
+
 ### Enforced bounds and confirmation rules
 
 | Surface | Enforced bound or confirmation |
@@ -186,6 +204,8 @@ organization-owned and is never transferred or claimed by these workflows.
 | Report detail / audit | 50 report rows; 25 audit rows by default and 50 maximum |
 | Classroom roster upload | 1,000,000 bytes maximum |
 | Classroom roster reconciliation | 200 total adds plus removals per preview |
+| OneRoster live planning | 50,000 classes, 300,000 active source enrollments, and 300,000 resulting actions; larger valid snapshots remain inspectable/exportable |
+| OneRoster live roster snapshot | 500,000 deduplicated Classroom memberships |
 | Drive content preview | 10 MiB maximum and only the supported safe MIME types |
 | Drive folder/claim manifest | 500 exact files maximum |
 | Generic action guard | Bulk starts at 10 targets; destructive bulk requires typed confirmation; over 200 is an explicit warning threshold, not an automatic refusal |
@@ -242,9 +262,10 @@ This is the handoff order for a new administrator. Do not skip the approval chec
    Use the commands rendered by the app so the bundled binary path and private `GAMCFGDIR` are
    correct. GamGUI imports the resulting credentials into Keychain.
 4. **Authorize Domain-Wide Delegation.** Preserve the scopes already created by GAM. Add exactly
-   these district feature scopes—do not replace the existing list with only these four:
+   these district feature scopes—do not replace the existing list with only these five:
 
    ```text
+   https://www.googleapis.com/auth/admin.directory.user.readonly
    https://www.googleapis.com/auth/classroom.courses
    https://www.googleapis.com/auth/classroom.rosters
    https://www.googleapis.com/auth/classroom.profile.emails
@@ -254,7 +275,7 @@ This is the handoff order for a new administrator. Do not skip the approval chec
    The setup screen renders the same comma-separated value and the service-account client ID.
    Changing these scopes or any Admin Console policy requires the recorded sign-off from step 2.
 5. **Verify setup.** Click **Verify access**. GamGUI first verifies GAM's existing service-account
-   authorization, then checks those four feature scopes. A passing verification activates the
+   authorization, then checks those five feature scopes. A passing verification activates the
    connector and stores the approved canary subject locally for updater use.
 6. **Approve and run the live acceptance pass.** A live canary requires explicit sign-off even
    though it is read-only:
@@ -304,11 +325,14 @@ fetches the pinned version (`v7.47.00`) from the official releases and records i
 ### Build a standalone `.app` (macOS)
 
 ```bash
-make app       # PyInstaller -> dist/GamGUI.app (bundles Python + the GAM7 binary)
+make app PROFILE=core                 # Core Classroom/Drive administration
+make app PROFILE=classroom-oneroster  # Core plus OneRoster Import Studio
 ```
 
-For distribution to other Macs you must codesign + notarize the bundle (including the embedded gam
-binary); running it yourself needs no signing.
+Each command builds `dist/GamGUI.app` from the selected sealed profile. For distribution to other
+Macs, both profiles must be signed and notarized independently, including the embedded GAM binary;
+running them on the managed development Mac uses the stable local signing identity described
+below.
 
 ### Stop the Keychain prompts
 
@@ -332,10 +356,10 @@ Create it once, either way:
   security import "$D/id.p12" -P gamgui-local -T /usr/bin/codesign && rm -rf "$D"
   ```
 
-Then rebuild (`make app`). The first launch still asks once **per credential** — click **Always
-Allow** on each — and you won't be prompted again, even after future rebuilds. (Override the cert
-name with `CODESIGN_IDENTITY=…`. The cert is local and not trusted for distribution by design — it
-only quiets your own Keychain.)
+Then rebuild the desired profile. The first launch still asks once **per credential** — click
+**Always Allow** on each — and you won't be prompted again, even after future rebuilds. (Override
+the cert name with `CODESIGN_IDENTITY=…`. The cert is local and not trusted for distribution by
+design — it only quiets your own Keychain.)
 
 The app also caches the three secrets in-process for a sliding window (default 5 min) so a burst of
 actions doesn't re-prompt; tune with `GAMGUI_SECRET_CACHE_TTL` (seconds; `0` disables).
@@ -401,8 +425,10 @@ development server does not self-update.
 2. It accepts only a new, non-blocklisted 40-character SHA whose completed check runs include a
    successful `update-ready` for that same SHA.
 3. It clones and checks out that exact SHA detached, requires exactly `uv 0.11.7`, synchronizes the
-   committed frozen lock through `make setup`, then runs `make gam` and `make app`. It requires the
-   local `GamGUI Local` signing identity, verifies the signature, and runs the bundled self-test.
+   committed frozen lock through `make setup`, then runs `make gam` and builds the currently
+   selected profile. It never falls back from `classroom-oneroster` to `core` because one profile
+   failed validation. It requires the local `GamGUI Local` signing identity, verifies the signature,
+   and runs the bundled self-test.
 4. It runs the four bounded, read-only canary probes in a disposable app-data directory. Only
    timing/status evidence is copied to the live updater state. This step contacts Google and
    requires prior administrator approval for the configured canary subject.

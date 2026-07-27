@@ -85,8 +85,9 @@ def _posix_process_identity(pid: int) -> str:
         except (OSError, IndexError, ValueError):
             return ""
     try:
+        ps_executable = "/bin/ps" if sys.platform == "darwin" else "ps"
         result = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            [ps_executable, "-o", "lstart=", "-p", str(pid)],
             check=False,
             capture_output=True,
             text=True,

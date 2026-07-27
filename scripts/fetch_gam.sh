@@ -12,6 +12,7 @@ set -euo pipefail
 REPO="GAM-team/GAM"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/gamgui/resources/gam7"
+DEST_PARENT="$(dirname "$DEST")"
 CATALOG="$DEST/command_catalog.json"
 # Pinned for reproducible builds. Override with `--tag latest` to grab the newest release.
 TAG="v7.47.00"
@@ -35,7 +36,32 @@ else
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+INSTALL_STAGE=""
+INSTALL_BACKUP=""
+cleanup() {
+  local status="$?"
+  if [ -n "$INSTALL_STAGE" ] && [ -d "$INSTALL_STAGE" ]; then
+    case "$INSTALL_STAGE" in
+      "$DEST_PARENT"/.gam7-stage.*) rm -rf -- "$INSTALL_STAGE" ;;
+      *) echo "Refusing to remove an unsafe GAM staging path." >&2; status=1 ;;
+    esac
+  fi
+  if [ -n "$INSTALL_BACKUP" ] && [ -d "$INSTALL_BACKUP" ]; then
+    case "$INSTALL_BACKUP" in
+      "$DEST_PARENT"/.gam7-backup.*)
+        if [ ! -e "$DEST" ]; then
+          mv -- "$INSTALL_BACKUP" "$DEST" || status=1
+        else
+          rm -rf -- "$INSTALL_BACKUP" || status=1
+        fi
+        ;;
+      *) echo "Refusing to remove an unsafe GAM backup path." >&2; status=1 ;;
+    esac
+  fi
+  rm -rf -- "$TMP" || status=1
+  return "$status"
+}
+trap cleanup EXIT
 
 echo "==> Querying $REPO release ($TAG) for a macos/$ARCH asset..."
 # Authenticate when a token is available: unauthenticated api.github.com is capped at 60 req/hr per
@@ -115,15 +141,33 @@ echo "==> Installing into $DEST"
 if [ -f "$CATALOG" ]; then
   cp "$CATALOG" "$TMP/command_catalog.json"
 fi
-rm -rf "$DEST"
-mkdir -p "$DEST"
-cp -R "$GAM_DIR"/. "$DEST"/
-chmod +x "$DEST/gam"
+mkdir -p "$DEST_PARENT"
+INSTALL_STAGE="$(mktemp -d "$DEST_PARENT/.gam7-stage.XXXXXX")"
+cp -R "$GAM_DIR"/. "$INSTALL_STAGE"/
+chmod +x "$INSTALL_STAGE/gam"
 
-printf '%s\n' "$VERSION" > "$DEST/VERSION"
-printf '%s  %s\n' "$SHA" "$ASSET_NAME" > "$DEST/SHA256"
+printf '%s\n' "$VERSION" > "$INSTALL_STAGE/VERSION"
+printf '%s  %s\n' "$SHA" "$ASSET_NAME" > "$INSTALL_STAGE/SHA256"
 if [ -f "$TMP/command_catalog.json" ]; then
-  cp "$TMP/command_catalog.json" "$CATALOG"
+  cp "$TMP/command_catalog.json" "$INSTALL_STAGE/command_catalog.json"
+fi
+
+# Stage completely before replacing the executable payload. If activation fails,
+# the EXIT trap restores the prior directory.
+if [ -e "$DEST" ]; then
+  if [ -L "$DEST" ] || [ ! -d "$DEST" ]; then
+    echo "ERROR: refusing to replace an unsafe GAM destination." >&2
+    exit 1
+  fi
+  INSTALL_BACKUP="$(mktemp -d "$DEST_PARENT/.gam7-backup.XXXXXX")"
+  rmdir "$INSTALL_BACKUP"
+  mv -- "$DEST" "$INSTALL_BACKUP"
+fi
+mv -- "$INSTALL_STAGE" "$DEST"
+INSTALL_STAGE=""
+if [ -n "$INSTALL_BACKUP" ]; then
+  rm -rf -- "$INSTALL_BACKUP"
+  INSTALL_BACKUP=""
 fi
 
 echo "==> Done. Vendored GAM $VERSION."

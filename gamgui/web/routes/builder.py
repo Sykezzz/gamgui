@@ -26,6 +26,7 @@ from ...core.catalog.models import SlotKind
 from ...core.connectors.base import ChangePreview, ConnectorID, RiskLevel
 from ...core.gam.commands import GAMCommands
 from ...core.gam.errors import GAMError
+from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..csvutil import csv_safe
 from ..jobs import start_job
 from ..server import TEMPLATES
@@ -473,10 +474,18 @@ async def run(request: Request, cid: Annotated[str, Form()]) -> HTMLResponse:
         if export:  # send the result to a Google Sheet instead of the in-app table
             owner = (form.get("td_user") or "").strip()
             argv = argv + GAMCommands.todrive_args(owner, (form.get("td_title") or "").strip())
+        lease = None
+        if export:
+            lease = try_acquire_admin_activity(st, "builder-drive-export")
+            if lease is None:
+                return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
         try:
             payload = await _run_bounded_read(conn, argv)
         except Exception as exc:  # noqa: BLE001
             return _err(request, _friendly(exc), _details(exc))
+        finally:
+            if lease is not None:
+                lease.release()
         if export:
             return TEMPLATES.TemplateResponse(request, "_export_result.html",
                                               {"gam": _gam_str(argv),
@@ -491,7 +500,13 @@ async def run(request: Request, cid: Annotated[str, Form()]) -> HTMLResponse:
         return TEMPLATES.TemplateResponse(request, "_builder_preview.html", {
             "cmd": cmd, "gam": _gam_str(argv), "decision": decision, "target": target, "slots": slots,
         })
-    result = (await conn.apply([preview]))[0]
+    lease = try_acquire_admin_activity(st, "builder-command-apply")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        result = (await conn.apply([preview]))[0]
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, "_action_result.html",
                                       {"ok": result.ok, "message": (cmd.name + " — " + ("done" if result.ok else result.detail))})
 
@@ -509,18 +524,30 @@ async def seq_add(request: Request, cid: Annotated[str, Form()]) -> HTMLResponse
     _, argv, target, error = await _assemble(request, cmd)
     if error:
         return _err(request, error)
-    st.builder_sequence.append({
-        "cid": cid, "label": cmd.name, "target": target, "argv": argv,
-        "risk": int(cmd.risk), "gam": _gam_str(argv),
-    })
+    lease = try_acquire_admin_activity(st, "builder-sequence-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        st.builder_sequence.append({
+            "cid": cid, "label": cmd.name, "target": target, "argv": argv,
+            "risk": int(cmd.risk), "gam": _gam_str(argv),
+        })
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _SEQUENCE_PAGE, {"sequence": st.builder_sequence})
 
 
 @router.post("/sequence/remove", response_class=HTMLResponse)
 async def seq_remove(request: Request, index: Annotated[int, Form()]) -> HTMLResponse:
     st = _st(request)
-    if 0 <= index < len(st.builder_sequence):
-        st.builder_sequence.pop(index)
+    lease = try_acquire_admin_activity(st, "builder-sequence-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        if 0 <= index < len(st.builder_sequence):
+            st.builder_sequence.pop(index)
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _SEQUENCE_PAGE, {"sequence": st.builder_sequence})
 
 
@@ -528,14 +555,27 @@ async def seq_remove(request: Request, index: Annotated[int, Form()]) -> HTMLRes
 async def seq_move(request: Request, index: Annotated[int, Form()], to: Annotated[int, Form()]) -> HTMLResponse:
     st = _st(request)
     seq = st.builder_sequence
-    if 0 <= index < len(seq) and 0 <= to < len(seq):
-        seq.insert(to, seq.pop(index))
+    lease = try_acquire_admin_activity(st, "builder-sequence-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        if 0 <= index < len(seq) and 0 <= to < len(seq):
+            seq.insert(to, seq.pop(index))
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _SEQUENCE_PAGE, {"sequence": seq})
 
 
 @router.post("/sequence/clear", response_class=HTMLResponse)
 async def seq_clear(request: Request) -> HTMLResponse:
-    _st(request).builder_sequence.clear()
+    st = _st(request)
+    lease = try_acquire_admin_activity(st, "builder-sequence-edit")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        st.builder_sequence.clear()
+    finally:
+        lease.release()
     return TEMPLATES.TemplateResponse(request, _SEQUENCE_PAGE, {"sequence": []})
 
 
@@ -554,7 +594,7 @@ async def seq_preview(request: Request) -> HTMLResponse:
                                       {"sequence": st.builder_sequence, "decision": decision})
 
 
-async def _run_sequence(job, conn, previews) -> None:
+async def _run_sequence(job, conn, previews, lease=None) -> None:
     try:
         for p in previews:
             job.current = p.summary
@@ -570,6 +610,8 @@ async def _run_sequence(job, conn, previews) -> None:
     finally:
         job.current = ""
         job.finished = True
+        if lease is not None:
+            lease.release()
 
 
 @router.post("/sequence/run", response_class=HTMLResponse)
@@ -593,8 +635,17 @@ async def seq_run(request: Request, confirm: Annotated[str, Form()] = "", confir
             return _needs_confirm("Type confirm to run this destructive bulk sequence.")
     elif decision.requires_confirmation and not confirmed:
         return _needs_confirm()
-    job = start_job(st.jobs, len(previews))
-    job.task = asyncio.create_task(_run_sequence(job, conn, previews))
+    lease = try_acquire_admin_activity(st, "builder-sequence-run")
+    if lease is None:
+        return _err(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        job = start_job(st.jobs, len(previews))
+        job.task = asyncio.create_task(_run_sequence(job, conn, previews, lease))
+    except Exception:
+        lease.release()
+        if "job" in locals():
+            st.jobs.pop(job.id, None)
+        raise
     return TEMPLATES.TemplateResponse(request, "_sequence_run.html", {"job": job})
 
 

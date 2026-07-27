@@ -1,0 +1,200 @@
+{% set context = context | default("settings") %}
+{% set show_card = context != "setup" or component.first_run_pending or component.restart_required or component.error_code %}
+{% if show_card %}
+<section id="component-card-oneroster"
+         class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm"
+         aria-labelledby="oneroster-component-heading">
+  <div class="flex flex-wrap items-start justify-between gap-4">
+    <div class="max-w-3xl">
+      {% if context == "setup" %}
+      <p class="eyebrow text-brand-blue">Optional feature</p>
+      {% elif context == "classroom" %}
+      <p class="eyebrow text-brand-blueink">OneRoster</p>
+      {% else %}
+      <p class="eyebrow text-brand-blueink">First-party component</p>
+      {% endif %}
+      <h2 id="oneroster-component-heading" class="mt-1 font-serif text-2xl text-brand-black">OneRoster Classroom</h2>
+      <p class="mt-2 text-sm text-brand-blueink/80">
+        Validate OneRoster ZIP exports, preview exact course and enrollment changes, apply
+        district thresholds, and keep student enrollment behind an explicit release gate.
+      </p>
+    </div>
+    <div class="rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-right">
+      <p class="text-xs uppercase tracking-wider text-brand-blueink">Status</p>
+      <p class="mt-0.5 text-sm font-semibold text-brand-black" role="status">{{ component.state_label }}</p>
+    </div>
+  </div>
+
+  <ul class="mt-4 grid gap-2 text-sm text-brand-blueink/80 sm:grid-cols-2">
+    <li>Manual OneRoster 1.1 ZIP import and bounded previews</li>
+    <li>Protected raw and normalized student snapshots expire after 30 days</li>
+    <li>Action manifests and audit evidence can contain participant identifiers; they remain after component removal until the separately confirmed <strong>Purge OneRoster data</strong> action</li>
+    <li>Configurable thresholds, blackout periods, and Limited Imports</li>
+    <li>Requires Classroom course and roster read/write plus Admin SDK Directory user read; access is checked only when you explicitly verify it in Import Studio</li>
+    <li>The sealed full application profile activates after restart</li>
+    <li>Local managed installs build from the checkout; verified-file size is checked before staging</li>
+  </ul>
+
+  {% if component.download_size or component.version or component.profile %}
+  <dl class="mt-4 flex flex-wrap gap-x-6 gap-y-2 border-t border-brand-gray/30 pt-4 text-xs text-brand-blueink">
+    {% if component.download_size %}<div><dt class="inline font-semibold">Disk/download estimate:</dt> <dd class="inline tabular-nums">{{ component.download_size }}</dd></div>{% endif %}
+    {% if component.version %}<div><dt class="inline font-semibold">Version:</dt> <dd class="inline tabular-nums">{{ component.version }}</dd></div>{% endif %}
+    {% if component.profile %}<div><dt class="inline font-semibold">Profile:</dt> <dd class="inline font-mono">{{ component.profile }}</dd></div>{% endif %}
+  </dl>
+  {% endif %}
+
+  {% if notice %}
+  <div class="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status">{{ notice }}</div>
+  {% endif %}
+  {% if error or component.error_message or error_code or component.error_code %}
+  <div class="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="alert">
+    {% if error or component.error_message %}<p>{{ error or component.error_message }}</p>{% endif %}
+    {% if error_code or component.error_code %}
+    <p class="mt-1 text-xs">Error code: <code class="font-mono">{{ error_code or component.error_code }}</code></p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div class="mt-5 flex flex-wrap items-center gap-3">
+    {% if context == "setup" %}
+      {% if component.state == "degraded" %}
+      <span class="text-sm text-amber-900">OneRoster could not start. Core setup remains available.</span>
+      {% if component.first_run_pending %}
+      <form hx-post="/components/oneroster/skip" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Continue with Core setup</button>
+      </form>
+      {% endif %}
+      <a href="/components" class="inline-flex rounded-lg border border-amber-400 px-3.5 py-2 text-sm font-medium text-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Open repair settings</a>
+      {% elif not component.installed %}
+      <form hx-post="/components/oneroster/install" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit"
+                class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                {% if not component.available %}disabled aria-disabled="true"{% endif %}>Install OneRoster</button>
+      </form>
+      <form hx-post="/components/oneroster/skip" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Skip</button>
+      </form>
+      {% elif not component.enabled %}
+      <form hx-post="/components/oneroster/enable" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Enable OneRoster and continue</button>
+      </form>
+      <form hx-post="/components/oneroster/skip" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Keep disabled</button>
+      </form>
+      {% else %}
+      <form hx-post="/components/oneroster/skip" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="setup" />
+        <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Continue setup</button>
+      </form>
+      {% endif %}
+    {% elif context == "classroom" %}
+      {% if component.installed and component.enabled %}
+      <a href="/classroom/imports" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Open Import Studio</a>
+      {% else %}
+      <a href="/components" class="inline-flex rounded-lg border border-brand-blue/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Manage component</a>
+      {% endif %}
+    {% else %}
+      {% if not component.installed %}
+      <form hx-post="/components/oneroster/install" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="settings" />
+        <button type="submit"
+                class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
+                {% if not component.available %}disabled aria-disabled="true"{% endif %}>Install OneRoster</button>
+      </form>
+      {% elif component.enabled %}
+      <a href="/classroom/imports" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Open Import Studio</a>
+      <form hx-post="/components/oneroster/disable" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="settings" />
+        <button type="submit" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Disable</button>
+      </form>
+      {% else %}
+      <form hx-post="/components/oneroster/enable" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="settings" />
+        <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Enable</button>
+      </form>
+      {% endif %}
+
+      {% if component.installed %}
+      <form hx-post="/components/oneroster/remove" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+        <input type="hidden" name="context" value="settings" />
+        <button type="submit" class="inline-flex rounded-lg border border-amber-400 px-3.5 py-2 text-sm font-medium text-amber-900 transition-colors hover:bg-amber-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Remove component</button>
+      </form>
+      {% endif %}
+    {% endif %}
+  </div>
+
+  {% if context == "settings" %}
+  {% if component.state == "degraded" %}
+  <details class="mt-4 rounded-xl border border-amber-300 p-4">
+    <summary class="cursor-pointer text-sm font-medium text-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Repair using a matching verified full profile</summary>
+    <form class="mt-3 flex flex-wrap items-end gap-3" hx-post="/components/oneroster/install" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+      <input type="hidden" name="context" value="settings" />
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Full-profile artifact path
+        <input name="source_path" required autocomplete="off" placeholder="/path/to/verified/GamGUI-classroom-oneroster.zip"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Official signer confirmation
+        <input name="signing_channel_confirmation" autocomplete="off" placeholder="10-character Apple Team ID"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus-visible:ring-brand-blue/30" />
+      </label>
+      <button type="submit" class="inline-flex rounded-lg border border-amber-400 px-3.5 py-2 text-sm font-medium text-amber-900 transition-colors hover:bg-amber-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Verify and repair</button>
+    </form>
+  </details>
+  {% endif %}
+  <details class="mt-4 rounded-xl border border-brand-gray/40 p-4">
+    <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">
+      {% if component.installed %}Remove using a verified Core file{% else %}Install from a verified local file{% endif %}
+    </summary>
+    <form class="mt-3 flex flex-wrap items-end gap-3" hx-post="/components/oneroster/{% if component.installed %}remove{% else %}install{% endif %}" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+      <input type="hidden" name="context" value="settings" />
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Artifact path
+        <input name="source_path" required autocomplete="off" placeholder="/path/to/verified/GamGUI.app"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Official signer confirmation
+        <input name="signing_channel_confirmation" autocomplete="off" placeholder="10-character Apple Team ID"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus-visible:ring-brand-blue/30" />
+        <span class="mt-1 block text-xs font-normal text-brand-blueink/70">Required for official files. Verify the Team ID from a trusted release notice, then type it exactly. Local-to-official migration remains explicit; official-to-local migration is refused.</span>
+      </label>
+      <button type="submit" class="inline-flex rounded-lg border border-brand-blue/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">
+        {% if component.installed %}Verify Core and prepare removal{% else %}Verify and prepare{% endif %}
+      </button>
+    </form>
+  </details>
+  <details class="mt-4 rounded-xl border border-brand-gray/40 p-4">
+    <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Update application from a verified release file</summary>
+    <form class="mt-3 flex flex-wrap items-end gap-3" hx-post="/components/oneroster/update" hx-target="#component-card-oneroster" hx-swap="outerHTML">
+      <input type="hidden" name="context" value="settings" />
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Matching-profile artifact path
+        <input name="source_path" required autocomplete="off" placeholder="/path/to/verified/GamGUI.zip"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Official signer confirmation
+        <input name="signing_channel_confirmation" autocomplete="off" placeholder="10-character Apple Team ID"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus-visible:ring-brand-blue/30" />
+        <span class="mt-1 block text-xs font-normal text-brand-blueink/70">The artifact must preserve the installed profile. This explicit update runs the read-only tenant canary and never silently changes signing channels.</span>
+      </label>
+      <button type="submit" class="inline-flex rounded-lg border border-brand-blue/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Verify and stage update</button>
+    </form>
+  </details>
+  {% endif %}
+
+  {% if context == "settings" %}
+  <div class="mt-5 border-t border-brand-gray/30 pt-4">
+    <button type="button"
+            class="text-sm font-medium text-amber-900 underline decoration-amber-400 underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
+            hx-get="/components/oneroster/data/purge"
+            hx-target="#component-purge-panel"
+            hx-swap="innerHTML">Review retained OneRoster data</button>
+    <div id="component-purge-panel" class="mt-3" aria-live="polite"></div>
+  </div>
+  {% endif %}
+</section>
+{% else %}
+<div id="component-card-oneroster"></div>
+{% endif %}

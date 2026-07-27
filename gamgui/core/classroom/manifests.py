@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
+import stat
 import time
 from contextlib import closing
 from dataclasses import dataclass
@@ -72,16 +73,22 @@ class RosterManifestStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_database(self.path)
         self._init()
         self._restrict_perms()
 
     def _conn(self) -> sqlite3.Connection:
+        _prepare_private_database(self.path)
         conn = sqlite3.connect(str(self.path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+            self._restrict_perms()
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def _init(self) -> None:
         with closing(self._conn()) as conn, conn:
@@ -175,16 +182,19 @@ class RosterManifestStore:
                 )
 
     def _restrict_perms(self) -> None:
-        try:
-            os.chmod(str(self.path.parent), 0o700)
-        except OSError:
-            pass
-        for candidate in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
+        _secure_private_directory(self.path.parent)
+        _secure_private_file(self.path)
+        for companion in (
+            Path(str(self.path) + "-wal"),
+            Path(str(self.path) + "-shm"),
+        ):
             try:
-                if candidate.exists():
-                    os.chmod(str(candidate), 0o600)
-            except OSError:
-                pass
+                _secure_private_file(companion)
+            except FileNotFoundError:
+                # SQLite may remove an unused WAL/SHM file between directory
+                # enumeration and hardening. A missing companion contains no
+                # data to expose; every other validation failure stays fatal.
+                continue
 
     def create(self, domain: str, course_id: str, diff: RosterDiff) -> RosterManifest:
         manifest_id = secrets.token_urlsafe(12)
@@ -431,3 +441,57 @@ class RosterManifestStore:
                     "The Classroom roster lease is owned by another executor."
                 )
         self._restrict_perms()
+
+
+def _prepare_private_database(path: Path) -> None:
+    """Create an owner-only SQLite file before any tenant data can be written."""
+
+    path = Path(path)
+    _secure_private_directory(path.parent, create=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError:
+        _secure_private_file(path)
+        return
+    try:
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    _secure_private_file(path)
+
+
+def _secure_private_directory(path: Path, *, create: bool = False) -> None:
+    path = Path(path)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise PermissionError("Classroom operation data directory is not a private directory.")
+    os.chmod(path, 0o700)
+    _verify_owner_only(path, expected_mode=0o700, directory=True)
+
+
+def _secure_private_file(path: Path) -> None:
+    path = Path(path)
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError("Classroom operation data path is not a private file.")
+    os.chmod(path, 0o600)
+    _verify_owner_only(path, expected_mode=0o600, directory=False)
+
+
+def _verify_owner_only(path: Path, *, expected_mode: int, directory: bool) -> None:
+    metadata = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        raise PermissionError("Classroom operation persistence changed type unexpectedly.")
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and int(metadata.st_uid) != int(getuid()):
+        raise PermissionError("Classroom operation persistence is not owned by this user.")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise PermissionError("Classroom operation persistence is not owner-only.")

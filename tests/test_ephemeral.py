@@ -83,14 +83,26 @@ def test_sweep_stale_configs(tmp_path):
     fresh = _make_cfgdir(tmp_path, "gamcfg-fresh")
     other = tmp_path / "keep-me"
     other.mkdir()
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    stale_private = spool / "gamgui-oneroster-old.batch"
+    stale_private.write_text("private", encoding="utf-8")
+    fresh_private = spool / "gamgui-oneroster-fresh.txt"
+    fresh_private.write_text("private", encoding="utf-8")
+    unrelated_private = spool / "keep-private.txt"
+    unrelated_private.write_text("keep", encoding="utf-8")
     past = os.stat(old).st_atime - 3600
     os.utime(old, (past, past))  # backdate so it looks orphaned
+    os.utime(stale_private, (past, past))
 
     removed = sweep_stale_configs(base_dir=tmp_path, max_age_seconds=600)
-    assert removed == 1
+    assert removed == 2
     assert not old.exists()      # orphaned -> swept
     assert fresh.exists()        # too recent, no owner recorded -> kept
     assert other.exists()        # not a gamcfg-* dir -> untouched
+    assert not stale_private.exists()
+    assert fresh_private.exists()
+    assert unrelated_private.exists()
 
 
 def test_sweep_removes_recent_dir_whose_owner_is_dead(tmp_path):

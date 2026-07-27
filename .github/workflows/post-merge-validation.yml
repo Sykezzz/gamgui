@@ -9,8 +9,8 @@ on:
         type: string
 
 concurrency:
-  group: post-merge-${{ inputs.sha }}
-  cancel-in-progress: false
+  group: post-merge-update-ready
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -92,10 +92,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   updater-and-build:
-    name: updater, bundle, and rollback contracts
+    name: updater, bundle, and rollback contracts (${{ matrix.profile }})
     needs: verify-sha
     runs-on: macos-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, classroom-oneroster]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -110,7 +114,7 @@ jobs:
           make setup PYTHON="$(which python)"
           make gam
           .venv/bin/python -m pytest -q tests/test_updater.py tests/test_bump_gam.py
-          make app
+          make app PROFILE="${{ matrix.profile }}"
           dist/GamGUI.app/Contents/MacOS/GamGUI --self-test --json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,11 +123,25 @@ jobs:
     name: update-ready
     needs: [verify-sha, test, gam-contracts, updater-and-build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Record exact commit
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+      - name: Advance authenticated updater ref to the exact validated commit
         env:
           VALIDATED_SHA: ${{ inputs.sha }}
-        run: echo "Validated update candidate $VALIDATED_SHA"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$VALIDATED_SHA"
+          git fetch origin district-main:refs/remotes/origin/district-main
+          test "$(git rev-parse origin/district-main)" = "$VALIDATED_SHA"
+          git push \
+            origin \
+            "$VALIDATED_SHA:refs/heads/update-ready"
 
   report-failure:
     name: report validation failure
