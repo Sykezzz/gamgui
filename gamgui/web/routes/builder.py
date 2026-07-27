@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from ...core import guard as guard_mod
 from ...core.catalog import load_catalog
@@ -26,6 +26,7 @@ from ...core.catalog.models import SlotKind
 from ...core.connectors.base import ChangePreview, ConnectorID, RiskLevel
 from ...core.gam.commands import GAMCommands
 from ...core.gam.errors import GAMError
+from ..csvutil import csv_safe
 from ..jobs import start_job
 from ..server import TEMPLATES
 
@@ -268,11 +269,47 @@ def _render_read(request: Request, payload: _BoundedRead, gam: str) -> HTMLRespo
     """Render an already bounded read payload; no parsing or large-buffer work runs on the loop."""
     context = {"gam": gam, "truncated": payload.truncated}
     if payload.records:
+        _st(request).builder_last_result = {
+            "records": payload.records,
+            "gam": gam,
+            "truncated": payload.truncated,
+        }
         return TEMPLATES.TemplateResponse(
             request, "_records_table.html", {**context, "records": payload.records}
         )
+    _st(request).builder_last_result = None
     return TEMPLATES.TemplateResponse(
         request, "_read_output.html", {**context, "output": payload.output}
+    )
+
+
+@router.get("/export.csv")
+async def export_csv(request: Request) -> Response:
+    """Download the same bounded result set displayed by the most recent read command."""
+    last = _st(request).builder_last_result
+    if not last or not last.get("records"):
+        return Response(
+            "No results to export — run a read command first.",
+            media_type="text/plain",
+            status_code=404,
+        )
+    records = last["records"]
+    columns = list(records[0].keys())
+    seen = set(columns)
+    for record in records[1:]:
+        for key in record:
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([csv_safe(column) for column in columns])
+    for record in records:
+        writer.writerow([csv_safe(record.get(column, "")) for column in columns])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=gam-results.csv"},
     )
 
 

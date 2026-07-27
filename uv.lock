@@ -543,7 +543,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3" },
     { name = "python-multipart", specifier = ">=0.0.31" },
-    { name = "pywebview", marker = "extra == 'desktop'", specifier = ">=5.1" },
+    { name = "pywebview", marker = "extra == 'desktop'", specifier = "==6.2.1" },
     { name = "requests", specifier = ">=2.32" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]

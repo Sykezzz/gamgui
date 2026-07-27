@@ -11,7 +11,7 @@ import asyncio
 import csv
 import io
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
@@ -25,16 +25,8 @@ from ...core.audit import (
     get_audit_index,
     validate_audit_query,
 )
+from ..csvutil import csv_safe
 from ..server import TEMPLATES
-
-# Cells starting with these can be interpreted as a formula if the CSV is opened in Excel/Sheets;
-# prefix with a single quote to neutralise (CSV injection defence).
-_CSV_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
-
-
-def _csv_safe(value: Any) -> str:
-    s = "" if value is None else str(value)
-    return "'" + s if s[:1] in _CSV_FORMULA_LEADS else s
 
 router = APIRouter(prefix="/audit")
 
@@ -57,6 +49,11 @@ def _audit_path(request: Request) -> Path:
     audit = getattr(conn, "audit", None)
     path = getattr(audit, "path", None)
     return path if path is not None else default_audit_path()
+
+
+def _flag(value: str) -> bool:
+    """Parse checkbox-style query values without rejecting an empty pager parameter."""
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _display_row(record: dict) -> dict:
@@ -104,8 +101,8 @@ async def audit_page(request: Request) -> HTMLResponse:
 
 
 @router.get("/rows", response_class=HTMLResponse)
-async def audit_rows(request: Request, q: str = "", failed: int = 0, page: int = 1) -> HTMLResponse:
-    failed_only = bool(failed)
+async def audit_rows(request: Request, q: str = "", failed: str = "", page: int = 1) -> HTMLResponse:
+    failed_only = _flag(failed)
     try:
         query = validate_audit_query(q)
     except ValueError as exc:
@@ -136,7 +133,7 @@ async def audit_rows(request: Request, q: str = "", failed: int = 0, page: int =
 
 
 @router.get("/export.csv")
-async def audit_export(request: Request, q: str = "", failed: int = 0):
+async def audit_export(request: Request, q: str = "", failed: str = ""):
     try:
         query = validate_audit_query(q)
     except ValueError as exc:
@@ -148,7 +145,7 @@ async def audit_export(request: Request, q: str = "", failed: int = 0):
         writer = csv.writer(buf)
         writer.writerow(["ts", "action", "target", "ok", "exit_code", "error", "argv"])
         yield buf.getvalue()
-        for record in index.iter_filtered(q=query, failed=bool(failed)):
+        for record in index.iter_filtered(q=query, failed=_flag(failed)):
             buf.seek(0)
             buf.truncate(0)
             extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
@@ -156,7 +153,7 @@ async def audit_export(request: Request, q: str = "", failed: int = 0):
             argv = " ".join(str(arg) for arg in (record.get("argv") or []))
             writer.writerow(
                 [
-                    _csv_safe(cell)
+                    csv_safe(cell)
                     for cell in (
                         record.get("ts", ""),
                         record.get("action", ""),

@@ -44,16 +44,16 @@ def update_versioned_sources(root: Path, version: str) -> None:
         f'echo "GAM {version} - mock"',
     )
     readme = root / "README.md"
-    text = readme.read_text(encoding="utf-8")
-    text, count = re.subn(
+    _replace_once(
+        readme,
         r"(fetches the pinned version \(`v)[0-9.]+(`\))",
         rf"\g<1>{version}\g<2>",
-        text,
-        count=1,
     )
-    if count != 1:
-        raise RuntimeError("README pinned-version sentence was not found.")
-    readme.write_text(text, encoding="utf-8")
+    _replace_once(
+        readme,
+        r"(The tested pin is currently \*\*GAM )[0-9.]+(\*\*)",
+        rf"\g<1>{version}\g<2>",
+    )
 
 
 def record_checksum(root: Path) -> None:

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
+
 
 def _module():
     path = Path(__file__).parents[1] / "scripts" / "acceptance.py"
@@ -22,7 +24,7 @@ def _module():
 class _Runner:
     async def version(self):
         # The suffix is intentionally sensitive-looking and must never be echoed.
-        return "GAM 7.46.11 tenant=private.example.edu"
+        return f"GAM {EXPECTED_GAM_VERSION} tenant=private.example.edu"
 
 
 class _State:

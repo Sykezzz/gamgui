@@ -30,14 +30,21 @@ def test_update_versioned_sources_changes_every_contract(tmp_path):
     _write(tmp_path, "gamgui/core/gam/commands.py", 'EXPECTED_GAM_VERSION = "1.2.3"\n')
     _write(tmp_path, "scripts/fetch_gam.sh", 'TAG="v1.2.3"\n')
     _write(tmp_path, "tests/fixtures/mock_gam.sh", 'echo "GAM 1.2.3 - mock"\n')
-    _write(tmp_path, "README.md", "fetches the pinned version (`v1.2.3`) from releases.\n")
+    _write(
+        tmp_path,
+        "README.md",
+        "fetches the pinned version (`v1.2.3`) from releases.\n"
+        "The tested pin is currently **GAM 1.2.3**.\n",
+    )
 
     update_versioned_sources(tmp_path, "2.3.4")
 
     assert '"2.3.4"' in (tmp_path / "gamgui/core/gam/commands.py").read_text()
     assert 'TAG="v2.3.4"' in (tmp_path / "scripts/fetch_gam.sh").read_text()
     assert "GAM 2.3.4 - mock" in (tmp_path / "tests/fixtures/mock_gam.sh").read_text()
-    assert "`v2.3.4`" in (tmp_path / "README.md").read_text()
+    readme = (tmp_path / "README.md").read_text()
+    assert "`v2.3.4`" in readme
+    assert "**GAM 2.3.4**" in readme
 
 
 def test_update_versioned_sources_fails_when_marker_drifts(tmp_path):

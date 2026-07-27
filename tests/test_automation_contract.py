@@ -11,8 +11,9 @@ def _workflow(name: str) -> str:
 
 def test_upstream_sync_is_non_forcing_and_targets_district_branch():
     workflow = _workflow("upstream-sync.yml")
-    assert "gh repo sync" in workflow
-    assert "--source goetchstone/gamgui" in workflow
+    assert "git fetch --no-tags upstream main" in workflow
+    assert "https://github.com/goetchstone/gamgui.git" in workflow
+    assert "gh repo sync" not in workflow
     assert "--force" not in workflow
     assert "--base district-main" in workflow
     assert "gh workflow run ci.yml" in workflow
@@ -31,6 +32,8 @@ def test_gam_update_refreshes_every_pinned_contract_before_auto_merge():
     assert "scripts/gam_checksums.txt" in workflow
     assert "command_catalog.json" in workflow
     assert "tests/fixtures/mock_gam.sh" in workflow
+    assert "tests/test_acceptance_privacy.py" in workflow
+    assert "steps.branch.outputs.pr" in workflow
     assert "gh workflow run ci.yml" in workflow
     assert "gh workflow run post-merge-validation.yml" in workflow
     assert "mergeCommit.oid" in workflow
