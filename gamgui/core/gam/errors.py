@@ -10,7 +10,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Pattern, Tuple
+from typing import ClassVar, List, Optional, Pattern, Tuple
 
 
 class GAMErrorKind(enum.Enum):
@@ -24,6 +24,27 @@ class GAMErrorKind(enum.Enum):
     NOT_AUTHENTICATED = "not_authenticated"
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class TokenPersistenceError(Exception):
+    """A refreshed GAM authorization token could not be saved.
+
+    Only the command outcome and its coarse GAM classification are retained. In particular, this
+    exception never stores tenant data, command output, token content, or backend error details.
+    """
+
+    command_succeeded: bool
+    gam_error_kind: Optional[GAMErrorKind] = None
+
+    error_code: ClassVar[str] = "GAM-TOKEN-PERSISTENCE"
+    _MESSAGE: ClassVar[str] = (
+        "The refreshed authorization could not be saved, so the operation was not finalized. "
+        "Return to setup and verify access again before continuing."
+    )
+
+    def __post_init__(self) -> None:
+        super().__init__(self._MESSAGE)
 
 
 # Human remediation text shown alongside the raw error.

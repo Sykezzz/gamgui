@@ -29,6 +29,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import Optional, Type
 
+from keyring.errors import KeyringError
+
+from ..gam.errors import TokenPersistenceError
 from ..paths import app_data_dir
 from .vault import FILENAMES, SecretsVault
 
@@ -210,6 +213,8 @@ class EphemeralConfig:
         self.base_dir = Path(base_dir) if base_dir else app_runtime_dir()
         self.path: Optional[Path] = None
         self._oauth2_hash: Optional[str] = None
+        self.token_persistence_failed = False
+        self.token_persistence_error_raised = False
 
     def __enter__(self) -> Path:
         creds = self.vault.get_all(self.domain)
@@ -248,10 +253,22 @@ class EphemeralConfig:
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:
+        persistence_failed = False
         try:
             self._write_back_refreshed_token()
+        except (KeyringError, OSError, UnicodeError):
+            # Keychain/backend errors can contain tenant identifiers, OSStatus values, and other
+            # private detail. Retain only the fact that persistence failed; callers get the stable
+            # privacy-safe exception below.
+            persistence_failed = True
+            self.token_persistence_failed = True
         finally:
             self._wipe()
+        if persistence_failed and exc_type is None:
+            self.token_persistence_error_raised = True
+            raise TokenPersistenceError(
+                command_succeeded=True,
+            ) from None
 
     # --- internals ---------------------------------------------------------------------
     @staticmethod
@@ -269,13 +286,15 @@ class EphemeralConfig:
         if not self.path:
             return
         token_file = self.path / FILENAMES["oauth2"]
-        if not token_file.exists():
-            return
         try:
             new_value = token_file.read_text(encoding="utf-8")
-        except OSError:
-            return
-        if new_value and _sha(new_value) != self._oauth2_hash:
+        except FileNotFoundError:
+            if self._oauth2_hash is None:
+                return
+            raise
+        if not new_value:
+            raise OSError("GAM left an empty authorization file")
+        if _sha(new_value) != self._oauth2_hash:
             self.vault.set(self.domain, "oauth2", new_value)
             self._oauth2_hash = _sha(new_value)
 

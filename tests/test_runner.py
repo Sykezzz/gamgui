@@ -8,9 +8,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from keyring.errors import PasswordSetError
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
-from gamgui.core.gam.errors import GAMError, GAMErrorKind
+from gamgui.core.gam.errors import GAMError, GAMErrorKind, TokenPersistenceError
 from gamgui.core.gam.runner import GAMRunner, secure_remove_private_file
 
 
@@ -53,6 +54,115 @@ async def test_oauth_token_write_back_through_a_real_run(runner, vault, domain, 
     after = vault.get(domain, "oauth2")
     assert after != before
     assert "refreshed" in after
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+@pytest.mark.parametrize(
+    ("returncode", "expected_succeeded", "expected_kind"),
+    [
+        (0, True, None),
+        (7, False, GAMErrorKind.AUTH_EXPIRED),
+    ],
+    ids=["command-success", "command-failure"],
+)
+async def test_authenticated_token_persistence_failure_preserves_command_outcome_and_cleanup(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+    streamed,
+    returncode,
+    expected_succeeded,
+    expected_kind,
+):
+    refreshed_token = "refreshed-sensitive-token"
+    backend_detail = f"Keychain failure for {domain}: OSStatus -25293 ({refreshed_token})"
+
+    def fail_write_back(_domain: str, _name: str, _value: str) -> None:
+        raise PasswordSetError(backend_detail)
+
+    monkeypatch.setattr(vault, "set", fail_write_back)
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = (
+        "import os,sys;"
+        "from pathlib import Path;"
+        f"Path(os.environ['GAMCFGDIR'],'oauth2.txt').write_text({refreshed_token!r});"
+        f"sys.stderr.write('invalid_grant raw-stderr {domain}');"
+        f"sys.exit({returncode})"
+    )
+
+    with pytest.raises(TokenPersistenceError) as caught:
+        if streamed:
+            async with runner.run_authenticated_to_file(domain, ["-c", script]):
+                pass
+        else:
+            await runner.run_authenticated(domain, ["-c", script])
+
+    error = caught.value
+    assert error.error_code == "GAM-TOKEN-PERSISTENCE"
+    assert error.command_succeeded is expected_succeeded
+    assert error.gam_error_kind is expected_kind
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "operation was not finalized" in str(error)
+    for private_text in (
+        domain,
+        refreshed_token,
+        backend_detail,
+        "raw-stderr",
+        "OSStatus",
+        "-25293",
+    ):
+        assert private_text not in str(error)
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+async def test_token_persistence_failure_never_masks_runner_exception(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+    streamed,
+):
+    def fail_write_back(_domain: str, _name: str, _value: str) -> None:
+        raise PasswordSetError("private backend failure: OSStatus -25293")
+
+    monkeypatch.setattr(vault, "set", fail_write_back)
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def buffered_failure(_argv, cfgdir, _timeout):
+        (cfgdir / "oauth2.txt").write_text("refreshed-sensitive-token", encoding="utf-8")
+        raise TypeError("runner programming defect")
+
+    async def streamed_failure(_argv, cfgdir, _timeout, _stdout_path):
+        (cfgdir / "oauth2.txt").write_text("refreshed-sensitive-token", encoding="utf-8")
+        raise TypeError("runner programming defect")
+
+    monkeypatch.setattr(
+        runner,
+        "_exec_to_file" if streamed else "_exec",
+        streamed_failure if streamed else buffered_failure,
+    )
+
+    with pytest.raises(TypeError, match="runner programming defect"):
+        if streamed:
+            async with runner.run_authenticated_to_file(domain, ["ignored"]):
+                pytest.fail("a failed command must not reach its consumer")
+        else:
+            await runner.run_authenticated(domain, ["ignored"])
+
+    assert list(tmp_path.glob("gamcfg-*")) == []
 
 
 def test_strip_cfgdir_noise_removes_gam_init_banner():
@@ -215,6 +325,37 @@ async def test_spool_cleanup_failure_surfaces_after_success(
             ["-c", "print('private output')"],
         ):
             pass
+
+
+async def test_spool_cleanup_failure_never_masks_command_failure(
+    vault,
+    tmp_path,
+    domain,
+    monkeypatch,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+
+    async def cleanup_failed(_path):
+        return False
+
+    monkeypatch.setattr(
+        "gamgui.core.gam.runner.await_secure_remove_private_file",
+        cleanup_failed,
+    )
+
+    with pytest.raises(GAMError) as caught:
+        async with runner.run_authenticated_to_file(
+            domain,
+            ["-c", "import sys; sys.stderr.write('invalid_grant'); sys.exit(7)"],
+        ):
+            pytest.fail("a failed command must not reach its consumer")
+
+    assert caught.value.kind is GAMErrorKind.AUTH_EXPIRED
 
 
 async def test_cancelling_spooled_command_stops_process_and_removes_files(

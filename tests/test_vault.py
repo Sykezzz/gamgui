@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import os
 import sys
-from ctypes import c_void_p
+from ctypes import c_long, c_void_p
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from keyring.errors import PasswordSetError
@@ -138,6 +141,74 @@ class _FakeSecurityAPI:
             raise _SecurityStatusError(status)
 
 
+class _FakeNativeFunction:
+    def __init__(self, implementation):
+        self._implementation = implementation
+        self.argtypes = None
+        self.restype = None
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self._implementation(*args)
+
+
+class _FakeCoreFoundation:
+    def __init__(self):
+        self.data = {}
+        self.released = []
+        self.CFDataCreate = _FakeNativeFunction(self._create_data)
+        self.CFRelease = _FakeNativeFunction(self._release)
+
+    def _create_data(self, _allocator, byte_pointer, length):
+        reference = 0xC000 + len(self.data)
+        self.data[reference] = ctypes.string_at(byte_pointer, length)
+        return reference
+
+    def _release(self, reference):
+        self.released.append(
+            reference.value if isinstance(reference, c_void_p) else reference
+        )
+
+
+class _FakeMacOSError(Exception):
+    @classmethod
+    def raise_for_status(cls, status):
+        if status:
+            raise cls(status, "Unknown Error")
+
+
+class _FakeMacOSDenied(_FakeMacOSError):
+    pass
+
+
+class _FakeMacOSAPI:
+    error = SimpleNamespace(item_not_found=-25300)
+    OS_status = ctypes.c_int32
+    Error = _FakeMacOSError
+    KeychainDenied = _FakeMacOSDenied
+
+    def __init__(self, update_status=0, add_status=0):
+        self.update_status = update_status
+        self.add_status = add_status
+        self._sec = SimpleNamespace(
+            SecItemUpdate=_FakeNativeFunction(
+                lambda _query, _attributes: self.update_status
+            )
+        )
+        self.SecItemAdd = _FakeNativeFunction(
+            lambda _query, _result: self.add_status
+        )
+
+    @staticmethod
+    def k_(name):
+        return f"constant:{name}"
+
+    @staticmethod
+    def create_query(**attributes):
+        return attributes
+
+
 def test_darwin_password_updates_existing_item_in_place():
     api = _FakeSecurityAPI()
 
@@ -184,6 +255,70 @@ def test_darwin_password_propagates_native_errors_without_destructive_fallback(
         _set_darwin_password(api, "gamgui:a.com", "oauth2", "new-token")
 
     assert [call[0] for call in api.calls] == expected_calls
+
+
+@pytest.mark.parametrize("operation", ["update_generic_password", "add_generic_password"])
+def test_darwin_security_adapter_passes_utf8_cfdata_to_native_writes(operation):
+    macos_api = _FakeMacOSAPI()
+    core_foundation = _FakeCoreFoundation()
+    api = _DarwinSecurityAPI(
+        macos_api=macos_api,
+        core_foundation=core_foundation,
+    )
+    value = "T\u00f8ken \U0001f510\0tail"
+
+    status = getattr(api, operation)("gamgui:a.com", "oauth2", value)
+
+    assert status == 0
+    assert tuple(core_foundation.CFDataCreate.argtypes) == (
+        c_void_p,
+        c_void_p,
+        c_long,
+    )
+    [(data_reference, encoded_value)] = core_foundation.data.items()
+    assert encoded_value == value.encode("utf-8")
+    identity = {
+        "kSecClass": "constant:kSecClassGenericPassword",
+        "kSecAttrService": "gamgui:a.com",
+        "kSecAttrAccount": "oauth2",
+    }
+    if operation == "update_generic_password":
+        [(actual_identity, value_attributes)] = macos_api._sec.SecItemUpdate.calls
+        assert actual_identity == identity
+        assert macos_api.SecItemAdd.calls == []
+    else:
+        assert macos_api._sec.SecItemUpdate.calls == []
+        [(value_attributes, result_pointer)] = macos_api.SecItemAdd.calls
+        assert result_pointer is None
+        assert {
+            key: value
+            for key, value in value_attributes.items()
+            if key != "kSecValueData"
+        } == identity
+
+    data_pointer = value_attributes["kSecValueData"]
+    assert type(data_pointer) is c_void_p
+    assert data_pointer.value == data_reference
+    assert core_foundation.released[0] == data_reference
+    if operation == "update_generic_password":
+        assert core_foundation.released[1:] == [value_attributes, identity]
+    else:
+        assert core_foundation.released[1:] == [value_attributes]
+
+
+def test_darwin_security_adapter_error_does_not_include_password():
+    macos_api = _FakeMacOSAPI(update_status=-50)
+    api = _DarwinSecurityAPI(
+        macos_api=macos_api,
+        core_foundation=_FakeCoreFoundation(),
+    )
+    value = "exception-message-canary"
+
+    status = api.update_generic_password("gamgui:a.com", "oauth2", value)
+    with pytest.raises(PasswordSetError) as exc_info:
+        api.raise_for_status(status)
+
+    assert value not in str(exc_info.value)
 
 
 def _keyring_module(backend):
@@ -251,6 +386,59 @@ def test_darwin_security_adapter_contract():
     assert api.item_not_found == -25300
     assert api.duplicate_item == -25299
     assert tuple(api._update.argtypes) == (c_void_p, c_void_p)
+    assert tuple(api._create_data.argtypes) == (c_void_p, c_void_p, c_long)
+    assert api._create_data.restype is c_void_p
+    assert tuple(api._release.argtypes) == (c_void_p,)
 
     with pytest.raises(PasswordSetError):
         api.raise_for_status(-50)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Security.framework")
+def test_darwin_security_adapter_keychain_roundtrip():
+    api = _DarwinSecurityAPI()
+    service = f"gamgui-contract:{uuid4()}"
+    username = "contract-test"
+    initial_value = "initial-T\u00f8ken-\U0001f510"
+    updated_value = "updated-\u96ea-\U0001f510"
+    unavailable_statuses = {
+        api._api.error.keychain_denied,
+        api._api.error.sec_interaction_not_allowed,
+        -25294,  # errSecNoSuchKeychain
+        -25291,  # errSecNotAvailable
+    }
+    created = False
+    primary_failure = None
+    try:
+        add_status = api.add_generic_password(service, username, initial_value)
+        if add_status in unavailable_statuses:
+            if os.environ.get("CI"):
+                pytest.fail(
+                    "The required macOS Keychain round-trip could not start "
+                    f"(OSStatus {add_status})."
+                )
+            pytest.skip(f"macOS Keychain unavailable (OSStatus {add_status})")
+        created = add_status == 0
+        api.raise_for_status(add_status)
+        assert (
+            api._api.find_generic_password(None, service, username)
+            == initial_value
+        )
+
+        api.raise_for_status(
+            api.update_generic_password(service, username, updated_value)
+        )
+        assert (
+            api._api.find_generic_password(None, service, username)
+            == updated_value
+        )
+    except BaseException as exc:
+        primary_failure = exc
+        raise
+    finally:
+        if created:
+            try:
+                api._api.delete_generic_password(None, service, username)
+            except Exception:
+                if primary_failure is None:
+                    raise
