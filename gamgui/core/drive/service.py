@@ -14,7 +14,7 @@ from ..audit import AuditLog
 from ..gam.commands import GAMCommands
 from ..gam.runner import GAMRunner
 from ..processes import current_process_identity
-from .client import DriveAPIClient, MAX_PREVIEW_BYTES
+from .client import DriveAPIClient, DriveAPIError, MAX_PREVIEW_BYTES
 from .models import (
     DriveFile,
     DrivePage,
@@ -22,16 +22,26 @@ from .models import (
     OperationManifest,
     OperationTarget,
     PreviewStream,
+    TemporaryAccessResult,
     TransferResult,
 )
 from .operations import DriveOperationStore
 
 PREVIEW_MIMES = {
+    "application/json",
     "application/pdf",
     "image/png",
     "image/jpeg",
     "image/webp",
+    "text/csv",
+    "text/markdown",
     "text/plain",
+    "text/tab-separated-values",
+}
+GOOGLE_EXPORT_FALLBACKS = {
+    "application/vnd.google-apps.document": ("text/plain", ".txt"),
+    "application/vnd.google-apps.spreadsheet": ("text/csv", ".csv"),
+    "application/vnd.google-apps.presentation": ("text/plain", ".txt"),
 }
 SHARE_ROLES = {"reader", "commenter", "writer"}
 UPDATE_ROLES = {"reader", "commenter", "writer"}
@@ -350,12 +360,33 @@ class DriveService:
                 "Google does not allow this account to download that file."
             )
         if live.is_google_doc:
-            body = await self.client.download(
-                subject,
-                file_id,
-                export_mime="application/pdf",
-                max_bytes=MAX_PREVIEW_BYTES,
-            )
+            try:
+                body = await self.client.download(
+                    subject,
+                    file_id,
+                    export_mime="application/pdf",
+                    max_bytes=MAX_PREVIEW_BYTES,
+                )
+            except (DriveAPIError, ValueError) as pdf_error:
+                fallback = GOOGLE_EXPORT_FALLBACKS.get(live.mime_type)
+                if fallback is None:
+                    raise
+                fallback_mime, extension = fallback
+                try:
+                    body = await self.client.download(
+                        subject,
+                        file_id,
+                        export_mime=fallback_mime,
+                        max_bytes=MAX_PREVIEW_BYTES,
+                    )
+                except (DriveAPIError, ValueError):
+                    raise pdf_error
+                return PreviewStream(
+                    body=body,
+                    media_type=f"{fallback_mime}; charset=utf-8",
+                    filename=_clean_filename(live.name, extension),
+                    exported=True,
+                )
             return PreviewStream(
                 body=body,
                 media_type="application/pdf",
@@ -369,15 +400,98 @@ class DriveService:
         if live.size is not None and live.size > MAX_PREVIEW_BYTES:
             raise DriveSafetyError("This file is larger than the 10 MB preview limit.")
         body = await self.client.download(subject, file_id, max_bytes=MAX_PREVIEW_BYTES)
-        if live.mime_type == "text/plain":
+        if live.mime_type.startswith("text/") or live.mime_type == "application/json":
             body = body.decode("utf-8", "replace").encode("utf-8")
-            media_type = "text/plain; charset=utf-8"
+            media_type = f"{live.mime_type}; charset=utf-8"
         else:
             media_type = live.mime_type
         return PreviewStream(
             body=body,
             media_type=media_type,
             filename=_clean_filename(live.name),
+        )
+
+    async def grant_temporary_admin_access(
+        self, source: str, file_id: str, admin_email: str
+    ) -> TemporaryAccessResult:
+        """Grant a configured internal admin direct editor access without an owner prompt."""
+
+        admin = await self._internal(admin_email, "user")
+        live = await self.client.get_file(source, file_id)
+        if not live.can_share:
+            raise DriveSafetyError("The delegated owner cannot change sharing for this file.")
+        if admin.email.casefold() == source.strip().casefold():
+            return TemporaryAccessResult(
+                admin.email,
+                "",
+                live.web_view_link,
+                False,
+                "The configured administrator is already the delegated owner.",
+            )
+        permissions = await self.client.list_permissions(source, file_id)
+        existing = next(
+            (
+                permission
+                for permission in permissions
+                if permission.email_address.casefold() == admin.email.casefold()
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.role not in {"writer", "owner", "organizer", "fileOrganizer"}:
+                raise DriveSafetyError(
+                    f"{admin.email} already has {existing.role} access. Change that existing "
+                    "permission in the access list instead of treating it as temporary."
+                )
+            return TemporaryAccessResult(
+                admin.email,
+                existing.id,
+                live.web_view_link,
+                False,
+                f"{admin.email} already had edit access; GamGUI did not change it.",
+            )
+        permission = await self.client.create_permission(
+            source,
+            file_id,
+            principal_type="user",
+            email=admin.email,
+            role="writer",
+        )
+        self.audit.record(
+            "drive_temporary_admin_access",
+            target=file_id,
+            ok=True,
+            actor=source,
+            extra={"admin": admin.email, "permission": permission.id},
+        )
+        return TemporaryAccessResult(
+            admin.email,
+            permission.id,
+            live.web_view_link,
+            True,
+            f"Temporary editor access granted to {admin.email}.",
+        )
+
+    async def revoke_temporary_admin_access(
+        self, source: str, file_id: str, admin_email: str, permission_id: str
+    ) -> None:
+        permissions = await self.client.list_permissions(source, file_id)
+        permission = next((item for item in permissions if item.id == permission_id), None)
+        if (
+            permission is None
+            or permission.email_address.casefold() != admin_email.strip().casefold()
+            or not permission.removable
+        ):
+            raise DriveSafetyError(
+                "That temporary administrator permission no longer exists or cannot be removed."
+            )
+        await self.client.delete_permission(source, file_id, permission.id)
+        self.audit.record(
+            "drive_temporary_admin_access_remove",
+            target=file_id,
+            ok=True,
+            actor=source,
+            extra={"admin": admin_email.strip().casefold(), "permission": permission.id},
         )
 
     async def validate_single_transfer(
@@ -421,6 +535,38 @@ class DriveService:
         except Exception:
             return f"Could not verify or remove {source}'s remaining access."
 
+    async def _restrict_after_transfer(
+        self, destination: str, file_id: str
+    ) -> tuple[int, str]:
+        """Remove every removable non-owner permission, then report anything left."""
+
+        removed = 0
+        failures: list[str] = []
+        permissions = await self.client.list_permissions(destination, file_id)
+        for permission in permissions:
+            if not permission.removable:
+                continue
+            try:
+                await self.client.delete_permission(destination, file_id, permission.id)
+                removed += 1
+            except Exception:
+                failures.append(permission.identity)
+        try:
+            remaining = await self.client.list_permissions(destination, file_id)
+        except Exception:
+            return removed, "Could not verify the restricted access list after transfer."
+        residual = [
+            permission.identity
+            for permission in remaining
+            if permission.role not in {"owner", "organizer"} and permission.identity
+        ]
+        for identity in failures:
+            if identity not in residual:
+                residual.append(identity)
+        if residual:
+            return removed, "Access remains for: " + ", ".join(sorted(set(residual)))
+        return removed, ""
+
     async def transfer_file_ownership(
         self,
         source: str,
@@ -428,6 +574,7 @@ class DriveService:
         destination: str,
         *,
         confirmation: str,
+        restrict_access: bool = False,
     ) -> TransferResult:
         live, destination_user = await self.validate_single_transfer(
             source, file_id, destination
@@ -496,9 +643,15 @@ class DriveService:
                 destination=destination_user.email,
                 detail=detail,
             )
-        residual = await self._remove_previous_owner(
-            destination_user.email, live.id, source
-        )
+        if restrict_access:
+            removed_permissions, residual = await self._restrict_after_transfer(
+                destination_user.email, live.id
+            )
+        else:
+            removed_permissions = 0
+            residual = await self._remove_previous_owner(
+                destination_user.email, live.id, source
+            )
         self.audit.record(
             "drive_transfer_ownership",
             target=live.id,
@@ -508,6 +661,8 @@ class DriveService:
             extra={
                 "destination": destination_user.email,
                 "residual_access": residual,
+                "restricted": restrict_access,
+                "removed_permissions": removed_permissions,
             },
         )
         return TransferResult(
@@ -516,6 +671,8 @@ class DriveService:
             destination=destination_user.email,
             detail="Ownership transferred.",
             residual_access=residual,
+            restricted=restrict_access,
+            removed_permissions=removed_permissions,
         )
 
     async def _walk(

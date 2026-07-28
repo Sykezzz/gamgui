@@ -8,39 +8,31 @@
   <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">Google marked this page incomplete. Narrow the search or retry.</p>
   {% endif %}
   {% if page.items %}
-  <div class="overflow-x-auto rounded-xl border border-brand-gray/30 bg-brand-white">
-    <table class="min-w-full text-left text-sm">
-      <caption class="sr-only">Files owned by {{ email }}</caption>
-      <thead class="bg-brand-blue/5 text-xs uppercase tracking-wide text-brand-blueink">
-        <tr>
-          <th scope="col" class="px-3 py-2">Name</th>
-          <th scope="col" class="px-3 py-2">Type</th>
-          <th scope="col" class="px-3 py-2">Modified</th>
-          <th scope="col" class="px-3 py-2 text-right">Size</th>
-          <th scope="col" class="px-3 py-2"><span class="sr-only">Open details</span></th>
-        </tr>
-      </thead>
-      <tbody class="divide-y divide-brand-gray/20">
-        {% for file in page.items %}
-        <tr class="hover:bg-brand-blue/5">
-          <td class="max-w-[28rem] px-3 py-2">
+  <div class="overflow-hidden rounded-xl border border-brand-gray/30 bg-brand-white">
+    <div class="hidden grid-cols-[minmax(0,1fr)_minmax(8rem,.7fr)_9rem_5rem_2rem] gap-3 bg-brand-blue/5 px-3 py-2 text-xs uppercase tracking-wide text-brand-blueink md:grid" aria-hidden="true">
+      <span>Name</span><span>Type</span><span>Modified</span><span class="text-right">Size</span><span></span>
+    </div>
+    <ul class="divide-y divide-brand-gray/20" aria-label="Files owned by {{ email }}">
+      {% for file in page.items %}
+      <li>
+        <button type="button"
+                class="grid w-full gap-1 px-3 py-3 text-left transition-colors hover:bg-brand-blue/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-blue md:grid-cols-[minmax(0,1fr)_minmax(8rem,.7fr)_9rem_5rem_2rem] md:items-center md:gap-3 md:py-2"
+                aria-controls="drive-detail"
+                hx-get="/drive/file" hx-target="#drive-detail" hx-swap="innerHTML show:#drive-detail:top"
+                hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>
+          <span class="min-w-0">
             <span class="block truncate font-medium text-brand-black" title="{{ file.name }}">{{ file.name or "(untitled)" }}</span>
             {% if file.shared %}<span class="text-xs text-brand-blueink">Shared</span>{% endif %}
-          </td>
-          <td class="px-3 py-2 text-brand-blueink">{{ "Folder" if file.is_folder else file.mime_type }}</td>
-          <td class="whitespace-nowrap px-3 py-2 font-mono text-xs tabular-nums text-brand-blueink">{{ file.modified_time or "—" }}</td>
-          <td class="whitespace-nowrap px-3 py-2 text-right font-mono text-xs tabular-nums text-brand-blueink">{{ file.size if file.size is not none else "—" }}</td>
-          <td class="px-3 py-2 text-right">
-            <button type="button"
-                    class="rounded-md border border-brand-blue px-2.5 py-1.5 text-xs font-medium text-brand-blueink hover:bg-brand-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
-                    aria-controls="drive-detail"
-                    hx-get="/drive/file" hx-target="#drive-detail" hx-swap="innerHTML show:#drive-detail:top"
-                    hx-vals='{"email": {{ email | tojson }}, "file_id": {{ file.id | tojson }}}'>Manage<span class="sr-only"> {{ file.name or "(untitled)" }}</span></button>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+          </span>
+          <span class="truncate text-sm text-brand-blueink" title="{{ "Folder" if file.is_folder else file.mime_type }}">{{ "Folder" if file.is_folder else file.mime_type }}</span>
+          <span class="font-mono text-xs tabular-nums text-brand-blueink">{{ file.modified_time or "—" }}</span>
+          <span class="font-mono text-xs tabular-nums text-brand-blueink md:text-right">{{ file.size if file.size is not none else "—" }}</span>
+          <span class="text-right text-lg leading-none text-brand-blueink" aria-hidden="true">›</span>
+          <span class="sr-only">Manage {{ file.name or "(untitled)" }}</span>
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
   </div>
   {% else %}
   <div class="rounded-xl border border-dashed border-brand-gray/50 bg-brand-white p-6 text-center text-sm text-brand-blueink">No owned files match these filters.</div>

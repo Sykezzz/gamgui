@@ -290,7 +290,9 @@ class FakeDriveClient:
 
     async def create_permission(self, subject, file_id, *, principal_type, email, role):
         self.created.append((subject, file_id, principal_type, email, role))
-        return DrivePermission("new", principal_type, role, email_address=email)
+        permission = DrivePermission("new", principal_type, role, email_address=email)
+        self.permissions.append(permission)
+        return permission
 
     async def update_permission(self, subject, file_id, permission_id, role):
         return DrivePermission(
@@ -387,6 +389,82 @@ async def test_google_doc_preview_exports_pdf(tmp_path):
     assert client.download_calls[0][2]["export_mime"] == "application/pdf"
 
 
+@pytest.mark.anyio
+async def test_google_doc_preview_falls_back_to_safe_text_export(tmp_path):
+    class FallbackClient(FakeDriveClient):
+        async def download(self, subject, file_id, **kwargs):
+            self.download_calls.append((subject, file_id, kwargs))
+            if kwargs.get("export_mime") == "application/pdf":
+                raise ValueError("This file is larger than the 10 MB preview limit.")
+            return b"Readable fallback"
+
+    client = FallbackClient()
+    client.files[("alice@example.com", "file-1")] = DriveFile.from_api(
+        file_data(mimeType="application/vnd.google-apps.document", size=None)
+    )
+    preview = await drive_service(tmp_path, client=client).preview(
+        "alice@example.com", "file-1"
+    )
+    assert preview.media_type == "text/plain; charset=utf-8"
+    assert preview.filename.endswith(".txt")
+    assert [call[2]["export_mime"] for call in client.download_calls] == [
+        "application/pdf",
+        "text/plain",
+    ]
+
+
+@pytest.mark.anyio
+async def test_temporary_admin_access_is_created_and_can_be_removed(tmp_path):
+    client = FakeDriveClient()
+    service = drive_service(tmp_path, client=client)
+    granted = await service.grant_temporary_admin_access(
+        "alice@example.com", "file-1", "admin@example.com"
+    )
+    assert granted.created
+    assert client.created[-1] == (
+        "alice@example.com",
+        "file-1",
+        "user",
+        "admin@example.com",
+        "writer",
+    )
+
+    await service.revoke_temporary_admin_access(
+        "alice@example.com", "file-1", "admin@example.com", granted.permission_id
+    )
+    assert client.deleted[-1] == ("alice@example.com", "file-1", "new")
+
+
+@pytest.mark.anyio
+async def test_temporary_admin_access_preserves_existing_permissions(tmp_path):
+    client = FakeDriveClient()
+    client.permissions.append(
+        DrivePermission(
+            "admin-writer",
+            "user",
+            "writer",
+            email_address="admin@example.com",
+        )
+    )
+    granted = await drive_service(tmp_path, client=client).grant_temporary_admin_access(
+        "alice@example.com", "file-1", "admin@example.com"
+    )
+    assert not granted.created
+    assert not client.created
+
+    client.permissions[-1] = DrivePermission(
+        "admin-reader",
+        "user",
+        "reader",
+        email_address="admin@example.com",
+    )
+    with pytest.raises(DriveSafetyError, match="already has reader access"):
+        await drive_service(tmp_path, client=client).grant_temporary_admin_access(
+            "alice@example.com", "file-1", "admin@example.com"
+        )
+    assert not client.created
+
+
 def test_transfer_and_claim_command_shapes_are_exact():
     assert GAMCommands.transfer_drive_ownership(
         "a@example.com", "abc", "b@example.com"
@@ -435,6 +513,51 @@ async def test_single_transfer_requires_confirmation_norecursion_and_verifies_ow
     assert service.runner.calls[0][2] is True
     # The previous owner's writer permission is absent in this fixture, so no residual warning.
     assert not result.residual_access
+
+
+@pytest.mark.anyio
+async def test_single_transfer_can_restrict_to_new_owner_and_report_inherited_access(
+    tmp_path,
+):
+    client = FakeDriveClient()
+    client.permissions = [
+        DrivePermission(
+            id="new-owner",
+            type="user",
+            role="owner",
+            email_address="bob@example.com",
+        ),
+        DrivePermission(
+            id="old-owner",
+            type="user",
+            role="writer",
+            email_address="alice@example.com",
+        ),
+        DrivePermission(
+            id="group",
+            type="group",
+            role="reader",
+            email_address="staff@example.com",
+        ),
+        DrivePermission(
+            id="inherited",
+            type="group",
+            role="reader",
+            email_address="all@example.com",
+            inherited=True,
+        ),
+    ]
+    result = await drive_service(tmp_path, client=client).transfer_file_ownership(
+        "alice@example.com",
+        "file-1",
+        "bob@example.com",
+        confirmation="bob@example.com",
+        restrict_access=True,
+    )
+    assert result.ok and result.restricted
+    assert result.removed_permissions == 2
+    assert "all@example.com" in result.residual_access
+    assert [item[2] for item in client.deleted] == ["old-owner", "group"]
 
 
 @pytest.mark.anyio
@@ -1031,12 +1154,37 @@ class FakeWebService:
         return self.file, InternalPrincipal(destination, "user")
 
     async def transfer_file_ownership(
-        self, email, file_id, destination, *, confirmation
+        self, email, file_id, destination, *, confirmation, restrict_access=False
     ):
+        self.calls.append(("transfer", restrict_access))
         if confirmation != destination:
             raise DriveSafetyError("Type the exact destination email.")
         return TransferResult(
-            True, file_id, destination, detail="Ownership transferred."
+            True,
+            file_id,
+            destination,
+            detail="Ownership transferred.",
+            restricted=restrict_access,
+            removed_permissions=2 if restrict_access else 0,
+        )
+
+    async def grant_temporary_admin_access(self, email, file_id, admin_email):
+        from gamgui.core.drive.models import TemporaryAccessResult
+
+        self.calls.append(("temporary-access", email, file_id, admin_email))
+        return TemporaryAccessResult(
+            admin_email,
+            "temporary-permission",
+            self.file.web_view_link,
+            True,
+            f"Temporary editor access granted to {admin_email}.",
+        )
+
+    async def revoke_temporary_admin_access(
+        self, email, file_id, admin_email, permission_id
+    ):
+        self.calls.append(
+            ("temporary-remove", email, file_id, admin_email, permission_id)
         )
 
     def claim_manifest(self, operation_id, *, confirmation):
@@ -1073,7 +1221,11 @@ class FakeWebService:
 def drive_web_client(tmp_path):
     service = FakeWebService(tmp_path)
     app = FastAPI()
-    app.state.gamgui = SimpleNamespace(drive_service=service, jobs={})
+    app.state.gamgui = SimpleNamespace(
+        drive_service=service,
+        jobs={},
+        admin_subject="admin@example.com",
+    )
     app.include_router(drive_router)
     return TestClient(app), service
 
@@ -1108,14 +1260,16 @@ def test_drive_manage_exposes_and_focuses_visible_detail_region(drive_web_client
     assert response.status_code == 200
     assert 'aria-label="Selected file management"' in response.text
     assert 'tabindex="-1"' in response.text
-    assert "Select Manage beside a file" in response.text
+    assert "Select any file row" in response.text
     assert 'aria-controls="drive-detail"' in response.text
     assert 'hx-swap="innerHTML show:#drive-detail:top"' in response.text
     assert (
         'hx-on::after-swap="if (event.detail.target === this) '
         'this.focus({preventScroll:true})"'
     ) in response.text
-    assert 'Manage<span class="sr-only"> District plan.pdf</span>' in response.text
+    assert '<button type="button"' in response.text
+    assert '<span class="sr-only">Manage District plan.pdf</span>' in response.text
+    assert "<table" not in response.text
 
 
 def test_drive_detail_loads_acl_only_after_file_selection(drive_web_client):
@@ -1146,7 +1300,7 @@ def test_preview_content_sets_no_store_and_nosniff(drive_web_client):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["content-security-policy"].startswith("sandbox")
+    assert response.headers["content-security-policy"].startswith("default-src 'none'")
     assert response.content == b"%PDF"
 
 
@@ -1226,6 +1380,7 @@ def test_drive_ownership_preview_and_apply_are_typed(drive_web_client):
     assert preview.status_code == 200
     assert "mandatory" in preview.text
     assert "norecursion" in preview.text
+    assert 'name="restrict_access"' in preview.text
     refused = client.post(
         "/drive/ownership/apply",
         data={
@@ -1243,9 +1398,70 @@ def test_drive_ownership_preview_and_apply_are_typed(drive_web_client):
             "file_id": "file-1",
             "destination": "bob@example.com",
             "confirmation": "bob@example.com",
+            "restrict_access": "on",
         },
     )
     assert "Ownership transferred" in applied.text
+    assert "Restricted to the new owner" in applied.text
+    assert ("transfer", True) in _service.calls
+
+
+def test_temporary_admin_access_opens_and_can_be_removed(
+    drive_web_client, monkeypatch
+):
+    client, service = drive_web_client
+    opened = []
+    monkeypatch.setattr(
+        "gamgui.web.routes.drive.webbrowser.open",
+        lambda url, new: opened.append((url, new)) or True,
+    )
+    response = client.post(
+        "/drive/admin-access/open",
+        data={"email": "alice@example.com", "file_id": "file-1"},
+    )
+    assert response.status_code == 200
+    assert "Temporary editor access granted" in response.text
+    assert "Remove temporary admin access" in response.text
+    assert opened == [("https://drive.google.com/open?id=file-1", 2)]
+
+    removed = client.post(
+        "/drive/admin-access/remove",
+        data={
+            "email": "alice@example.com",
+            "file_id": "file-1",
+            "permission_id": "temporary-permission",
+        },
+    )
+    assert "Removed temporary access for admin@example.com" in removed.text
+    assert (
+        "temporary-remove",
+        "alice@example.com",
+        "file-1",
+        "admin@example.com",
+        "temporary-permission",
+    ) in service.calls
+
+
+def test_temporary_admin_access_is_rolled_back_when_browser_open_fails(
+    drive_web_client, monkeypatch
+):
+    client, service = drive_web_client
+    monkeypatch.setattr(
+        "gamgui.web.routes.drive.webbrowser.open",
+        lambda url, new: False,
+    )
+    response = client.post(
+        "/drive/admin-access/open",
+        data={"email": "alice@example.com", "file_id": "file-1"},
+    )
+    assert "system browser could not be opened" in response.text
+    assert (
+        "temporary-remove",
+        "alice@example.com",
+        "file-1",
+        "admin@example.com",
+        "temporary-permission",
+    ) in service.calls
 
 
 def test_manifest_apply_rejects_an_already_running_submission(drive_web_client):
