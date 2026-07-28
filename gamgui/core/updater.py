@@ -740,8 +740,18 @@ class LocalUpdateBuilder:
             ["git", "clone", "--filter=blob:none", "--no-checkout", self.repository_url, str(checkout)],
             env=command_env,
         )
+        # Keep commit ancestry visible: a depth-one fetch marks the candidate as a
+        # shallow root and makes the forward-only merge-base check reject valid updates.
         self._command(
-            ["git", "-C", str(checkout), "fetch", "--depth", "1", "origin", candidate.sha],
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--no-tags",
+                "origin",
+                candidate.sha,
+            ],
             env=command_env,
         )
         self._command(

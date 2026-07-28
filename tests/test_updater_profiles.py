@@ -758,6 +758,73 @@ def test_local_update_builder_rejects_rewound_validated_commit(
     assert not any(command[:2] == ["make", "setup"] for command in commands)
 
 
+def test_local_update_builder_preserves_history_for_forward_ancestry_check(
+    tmp_path,
+    monkeypatch,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args, capture_output=False):
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            check=True,
+            text=True,
+            capture_output=capture_output,
+        )
+
+    subprocess.run(
+        ["git", "init", str(repository)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    git("config", "user.name", "GamGUI Test")
+    git("config", "user.email", "gamgui-test@example.invalid")
+    (repository / "history.txt").write_text("installed\n", encoding="utf-8")
+    git("add", "history.txt")
+    git("commit", "-m", "installed")
+    installed_sha = git("rev-parse", "HEAD", capture_output=True).stdout.strip()
+
+    (repository / "history.txt").write_text(
+        "installed\ncandidate\n",
+        encoding="utf-8",
+    )
+    git("add", "history.txt")
+    git("commit", "-m", "candidate")
+    candidate_sha = git("rev-parse", "HEAD", capture_output=True).stdout.strip()
+    commands = []
+
+    class SetupReached(RuntimeError):
+        pass
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        if argv[0] == "git":
+            return subprocess.run(argv, **kwargs)
+        if argv[:2] == ["make", "setup"]:
+            raise SetupReached
+        raise AssertionError(f"Unexpected command before setup: {argv!r}")
+
+    monkeypatch.setattr("gamgui.core.updater.sys.platform", "darwin")
+    builder = LocalUpdateBuilder(
+        root=tmp_path / "updates",
+        repository_url=str(repository),
+        run=run,
+    )
+
+    with pytest.raises(SetupReached):
+        builder.prepare(
+            UpdateCandidate(candidate_sha, "url", ("update-ready",)),
+            profile=ONEROSTER_PROFILE,
+            installed_sha=installed_sha,
+        )
+
+    fetch = next(command for command in commands if "fetch" in command)
+    assert "--depth" not in fetch
+    assert any("merge-base" in command for command in commands)
+
+
 def test_local_verified_file_pins_installed_leaf_certificate(
     tmp_path,
     monkeypatch,
