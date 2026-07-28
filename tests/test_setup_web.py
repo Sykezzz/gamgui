@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from gamgui.core import setup as setup_mod
 from gamgui.core.activity import ActivityPathUnavailableError
+from gamgui.core.canary import GROUP_SCOPE
 from gamgui.core.gam.errors import GAMErrorKind, TokenPersistenceError
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
@@ -144,6 +145,8 @@ def test_import_shows_dwd_and_stores_creds(ctx):
     assert r.status_code == 200
     assert "CID.apps" in r.text                 # DWD client id surfaced
     assert "copyEl(" in r.text                   # client id has a copy button
+    assert GROUP_SCOPE in r.text                 # exact least-privilege group scope is copyable
+    assert "Directory, Classroom, and Drive scopes" in r.text
     assert vault.has_credentials("ex.com")
 
 

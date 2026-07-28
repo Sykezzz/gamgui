@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Protocol
 
 import httpx
 
-from .drive.client import ServiceAccountTokenProvider
+from .drive.client import ServiceAccountTokenProvider, TokenProvider
 from .paths import app_data_dir
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 CANARY_SUBJECT_ENV = "GAMGUI_CANARY_SUBJECT"
 CANARY_DOMAIN_ENV = "GAMGUI_CANARY_DOMAIN"
-GROUP_SCOPE = "https://www.googleapis.com/auth/admin.directory.group"
+GROUP_SCOPE = "https://www.googleapis.com/auth/admin.directory.group.readonly"
 CLASSROOM_SCOPE = "https://www.googleapis.com/auth/classroom.courses"
 CANARY_CHECK_NAMES = ("users", "groups", "classroom", "drive")
 
@@ -214,16 +214,27 @@ class DelegatedCanaryPageProbe:
     """Issue true one-item Directory and Classroom API page reads."""
 
     def __init__(self, vault, domain: str, http: Optional[httpx.AsyncClient] = None) -> None:
-        self.tokens = ServiceAccountTokenProvider(
+        self.group_token_provider = ServiceAccountTokenProvider(
             vault,
             domain,
-            scopes=(GROUP_SCOPE, CLASSROOM_SCOPE),
+            scopes=(GROUP_SCOPE,),
+        )
+        self.classroom_token_provider = ServiceAccountTokenProvider(
+            vault,
+            domain,
+            scopes=(CLASSROOM_SCOPE,),
         )
         self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(20.0))
         self._owns_http = http is None
 
-    async def _get(self, subject: str, url: str, params: dict) -> object:
-        token = await self.tokens.token_for(subject)
+    async def _get(
+        self,
+        token_provider: TokenProvider,
+        subject: str,
+        url: str,
+        params: dict,
+    ) -> object:
+        token = await token_provider.token_for(subject)
         response = await self.http.get(
             url,
             params=params,
@@ -237,6 +248,7 @@ class DelegatedCanaryPageProbe:
 
     async def one_group_page(self, subject: str) -> object:
         return await self._get(
+            self.group_token_provider,
             subject,
             "https://admin.googleapis.com/admin/directory/v1/groups",
             {
@@ -248,6 +260,7 @@ class DelegatedCanaryPageProbe:
 
     async def one_course_page(self, subject: str) -> object:
         return await self._get(
+            self.classroom_token_provider,
             subject,
             "https://classroom.googleapis.com/v1/courses",
             {

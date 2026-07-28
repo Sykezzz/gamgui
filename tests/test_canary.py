@@ -8,6 +8,8 @@ import pytest
 
 from gamgui.core.canary import (
     CANARY_CHECK_NAMES,
+    CLASSROOM_SCOPE,
+    GROUP_SCOPE,
     CanaryConfigStore,
     CanaryResultStore,
     DelegatedCanaryPageProbe,
@@ -45,18 +47,62 @@ async def test_delegated_page_probe_hard_bounds_group_and_course_reads():
         return httpx.Response(200, json={})
 
     class Tokens:
+        def __init__(self, token):
+            self.token = token
+
         async def token_for(self, _subject):
-            return "token"
+            return self.token
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     probe = DelegatedCanaryPageProbe(object(), "example.edu", http=http)
-    probe.tokens = Tokens()
+    assert probe.group_token_provider is not probe.classroom_token_provider
+    assert probe.group_token_provider.scopes == (GROUP_SCOPE,)
+    assert probe.classroom_token_provider.scopes == (CLASSROOM_SCOPE,)
+    assert (GROUP_SCOPE, CLASSROOM_SCOPE) == (
+        "https://www.googleapis.com/auth/admin.directory.group.readonly",
+        "https://www.googleapis.com/auth/classroom.courses",
+    )
+    probe.group_token_provider = Tokens("group-token")
+    probe.classroom_token_provider = Tokens("classroom-token")
     await probe.one_group_page("admin@example.edu")
     await probe.one_course_page("admin@example.edu")
     await http.aclose()
 
     assert requests[0].url.params["maxResults"] == "1"
     assert requests[1].url.params["pageSize"] == "1"
+    assert requests[0].headers["Authorization"] == "Bearer group-token"
+    assert requests[1].headers["Authorization"] == "Bearer classroom-token"
+
+
+@pytest.mark.asyncio
+async def test_group_authorization_failure_does_not_poison_classroom_token():
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    class MissingGroupAuthorization:
+        async def token_for(self, _subject):
+            raise PermissionError("group scope is not authorized")
+
+    class ClassroomTokens:
+        async def token_for(self, _subject):
+            return "classroom-token"
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    probe = DelegatedCanaryPageProbe(object(), "example.edu", http=http)
+    probe.group_token_provider = MissingGroupAuthorization()
+    probe.classroom_token_provider = ClassroomTokens()
+
+    with pytest.raises(PermissionError):
+        await probe.one_group_page("admin@example.edu")
+    await probe.one_course_page("admin@example.edu")
+    await http.aclose()
+
+    assert len(requests) == 1
+    assert requests[0].url.params["pageSize"] == "1"
+    assert requests[0].headers["Authorization"] == "Bearer classroom-token"
 
 
 @pytest.mark.asyncio
@@ -138,6 +184,7 @@ async def test_canary_discards_exception_text(tmp_path):
 
     assert not result["ok"]
     assert not next(check for check in result["checks"] if check["name"] == "groups")["ok"]
+    assert next(check for check in result["checks"] if check["name"] == "classroom")["ok"]
     persisted = results.path.read_text(encoding="utf-8")
     assert "admin@example.edu" not in persisted
     assert "private-id" not in persisted

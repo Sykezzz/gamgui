@@ -262,20 +262,21 @@ This is the handoff order for a new administrator. Do not skip the approval chec
    Use the commands rendered by the app so the bundled binary path and private `GAMCFGDIR` are
    correct. GamGUI imports the resulting credentials into Keychain.
 4. **Authorize Domain-Wide Delegation.** Preserve the scopes already created by GAM. Add exactly
-   these district feature scopes—do not replace the existing list with only these five:
+   these district feature scopes—do not replace the existing list with only these six:
 
    ```text
    https://www.googleapis.com/auth/admin.directory.user.readonly
    https://www.googleapis.com/auth/classroom.courses
    https://www.googleapis.com/auth/classroom.rosters
    https://www.googleapis.com/auth/classroom.profile.emails
+   https://www.googleapis.com/auth/admin.directory.group.readonly
    https://www.googleapis.com/auth/drive
    ```
 
    The setup screen renders the same comma-separated value and the service-account client ID.
    Changing these scopes or any Admin Console policy requires the recorded sign-off from step 2.
 5. **Verify setup.** Click **Verify access**. GamGUI first verifies GAM's existing service-account
-   authorization, then checks those five feature scopes. A passing verification activates the
+   authorization, then checks those six feature scopes. A passing verification activates the
    connector and stores the approved canary subject locally for updater use.
 6. **Approve and run the live acceptance pass.** A live canary requires explicit sign-off even
    though it is read-only:

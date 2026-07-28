@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from gamgui.core import setup as setup_mod
-from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
+from gamgui.core.canary import GROUP_SCOPE
+from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import FILENAMES, InMemoryBackend, SecretsVault
 from gamgui.core.setup import (
@@ -435,20 +436,80 @@ def _scope_passes(scopes: tuple[str, ...]) -> str:
     return "\n".join(f"{scope} PASS" for scope in scopes)
 
 
+def test_district_setup_scope_contract_adds_readonly_groups_without_expanding_oneroster(
+    vault,
+    runner,
+):
+    assert ONEROSTER_DWD_SCOPES == (
+        "https://www.googleapis.com/auth/admin.directory.user.readonly",
+        "https://www.googleapis.com/auth/classroom.courses",
+        "https://www.googleapis.com/auth/classroom.rosters",
+        "https://www.googleapis.com/auth/classroom.profile.emails",
+    )
+    assert GROUP_SCOPE == (
+        "https://www.googleapis.com/auth/admin.directory.group.readonly"
+    )
+    assert DISTRICT_FEATURE_DWD_SCOPES == (
+        *ONEROSTER_DWD_SCOPES,
+        GROUP_SCOPE,
+        "https://www.googleapis.com/auth/drive",
+    )
+    assert "https://www.googleapis.com/auth/admin.directory.group" not in (
+        DISTRICT_FEATURE_DWD_SCOPES
+    )
+    assert (
+        SetupService(vault, runner)
+        .dwd_details("example.com")["feature_scopes"]
+        .split(",")
+        == list(DISTRICT_FEATURE_DWD_SCOPES)
+    )
+
+
 async def test_verify_requires_explicit_pass_for_all_district_feature_scopes(
     vault,
     domain,
 ):
+    admin = "admin@example.com"
     runner = _SequentialRunner(
         _base_verification_pass(),
         _scope_passes(DISTRICT_FEATURE_DWD_SCOPES),
     )
 
-    result = await SetupService(vault, runner).verify(domain, "admin@example.com")
+    result = await SetupService(vault, runner).verify(domain, admin)
 
     assert result.ok is True
     assert result.missing_feature_scopes == []
-    assert len(runner.calls) == 2
+    assert runner.calls == [
+        (domain, GAMCommands.check_svcacct(admin)),
+        (
+            domain,
+            GAMCommands.check_svcacct(admin, DISTRICT_FEATURE_DWD_SCOPES),
+        ),
+    ]
+
+
+async def test_verify_reports_missing_readonly_group_scope_as_directory_access(
+    vault,
+    domain,
+):
+    runner = _SequentialRunner(
+        _base_verification_pass(),
+        _scope_passes(
+            tuple(
+                scope
+                for scope in DISTRICT_FEATURE_DWD_SCOPES
+                if scope != GROUP_SCOPE
+            )
+        ),
+    )
+
+    result = await SetupService(vault, runner).verify(domain, "admin@example.com")
+
+    assert not result.ok
+    assert result.missing_feature_scopes == [GROUP_SCOPE]
+    assert result.summary == (
+        "Directory, Classroom, or Drive delegation is missing required access."
+    )
 
 
 async def test_verify_rejects_an_omitted_district_feature_scope(vault, domain):

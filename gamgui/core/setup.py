@@ -354,6 +354,7 @@ ONEROSTER_DWD_SCOPES = (
 )
 DISTRICT_FEATURE_DWD_SCOPES = (
     *ONEROSTER_DWD_SCOPES,
+    "https://www.googleapis.com/auth/admin.directory.group.readonly",
     "https://www.googleapis.com/auth/drive",
 )
 
@@ -735,7 +736,7 @@ class SetupService:
             summary=(
                 "All required scopes authorized."
                 if not feature_failed
-                else "Drive or Classroom delegation is missing required access."
+                else "Directory, Classroom, or Drive delegation is missing required access."
             ),
             lines=combined_lines,
             raw=combined_raw,
