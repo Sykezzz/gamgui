@@ -303,7 +303,7 @@ def rebuild_course_plans(
                 "DELETE FROM issues WHERE code = 'OR-TERM-AMBIGUOUS'"
             )
             conn.execute(
-                "DELETE FROM issues WHERE code IN ({})".format(
+                "DELETE FROM issues WHERE entity_kind = 'class' AND code IN ({})".format(
                     ", ".join("?" for _ in _CLASS_DERIVED_ISSUE_CODES)
                 ),
                 tuple(_CLASS_DERIVED_ISSUE_CODES),

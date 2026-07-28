@@ -169,6 +169,17 @@ def test_unsupported_enrollment_role_quarantines_exact_class(tmp_path: Path) -> 
     assert snapshot.ready_for_apply
     assert course["ready"] is False
     assert "OR-ENROLLMENT-ROLE" in course["quarantine_codes"]
+    initial_issues = service.preview(
+        snapshot.id, "issues", query="OR-ENROLLMENT-ROLE"
+    ).items
+    assert any(item["entity_kind"] == "enrollment" for item in initial_issues)
+
+    service.select_session(snapshot.id, "year-1")
+    rebuilt_issues = service.preview(
+        snapshot.id, "issues", query="OR-ENROLLMENT-ROLE"
+    ).items
+    assert any(item["entity_kind"] == "enrollment" for item in rebuilt_issues)
+    assert not any(item["entity_kind"] == "class" for item in rebuilt_issues)
 
 
 def test_enrollment_with_missing_class_blocks_exact_state_apply(
