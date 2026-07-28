@@ -12,11 +12,15 @@ from fastapi.testclient import TestClient
 
 from gamgui.core import setup as setup_mod
 from gamgui.core.activity import ActivityPathUnavailableError
+from gamgui.core.gam.errors import GAMErrorKind, TokenPersistenceError
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 from gamgui.core.setup import DISTRICT_FEATURE_DWD_SCOPES, SetupService, _root_is_sane
 from gamgui.web.routes import setup as setup_routes
-from gamgui.web.routes.setup import SETUP_COMPONENT_GATE_MESSAGE
+from gamgui.web.routes.setup import (
+    SETUP_COMPONENT_GATE_MESSAGE,
+    SETUP_TOKEN_PERSISTENCE_ACTION,
+)
 from gamgui.web.server import AppState, create_app
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -870,6 +874,42 @@ def test_verify_refuses_reconnect_before_remote_check_when_admin_job_is_active(
     assert response.status_code == 200
     assert "active administrative operation" in response.text
     assert state.connector is None
+
+
+def test_verify_token_persistence_failure_is_visible_and_does_not_activate(
+    ctx, monkeypatch
+):
+    client, base, _, state = ctx
+
+    async def token_save_failed(*_args, **_kwargs):
+        raise TokenPersistenceError(
+            command_succeeded=True,
+            gam_error_kind=GAMErrorKind.AUTH_EXPIRED,
+        )
+
+    def unexpected_activation(*_args, **_kwargs):
+        pytest.fail("a token persistence failure must not activate the connector")
+
+    monkeypatch.setattr(SetupService, "verify", token_save_failed)
+    monkeypatch.setattr(state, "activate_connector", unexpected_activation)
+
+    response = client.post(
+        "/setup/verify",
+        data={
+            "domain": "private.example",
+            "admin": "admin@private.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "GAM-TOKEN-PERSISTENCE" in response.text
+    assert "refreshed authorization could not be saved" in response.text
+    assert SETUP_TOKEN_PERSISTENCE_ACTION in response.text
+    assert "private.example" not in response.text
+    assert "PasswordSetError" not in response.text
+    assert "OSStatus" not in response.text
+    assert state.connector is None
+    assert not (base / "canary-config.json").exists()
 
 
 def test_fresh_shows_commands(ctx):

@@ -7,7 +7,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from keyring.errors import PasswordSetError
 
+from gamgui.core.gam.errors import TokenPersistenceError
 from gamgui.core.secrets.ephemeral import (
     _LIVE,
     _LIVE_PID_TRUST_SECONDS,
@@ -76,6 +78,210 @@ def test_oauth2_token_write_back(vault, domain, tmp_path):
     with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
         (cfgdir / FILENAMES["oauth2"]).write_text("refreshed-value", encoding="utf-8")
     assert vault.get(domain, "oauth2") == "refreshed-value"
+
+
+def test_token_write_back_failure_is_typed_private_and_wipes(
+    vault,
+    domain,
+    tmp_path,
+    monkeypatch,
+):
+    refreshed_token = "refreshed-sensitive-token"
+    backend_detail = f"Keychain failure for {domain}: OSStatus -25293 ({refreshed_token})"
+
+    def fail_write_back(_domain: str, _name: str, _value: str) -> None:
+        raise PasswordSetError(backend_detail)
+
+    monkeypatch.setattr(vault, "set", fail_write_back)
+
+    with pytest.raises(TokenPersistenceError) as caught:
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+            (cfgdir / FILENAMES["oauth2"]).write_text(
+                refreshed_token,
+                encoding="utf-8",
+            )
+
+    error = caught.value
+    assert error.error_code == "GAM-TOKEN-PERSISTENCE"
+    assert error.command_succeeded is True
+    assert error.gam_error_kind is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "refreshed authorization could not be saved" in str(error)
+    for private_text in (domain, refreshed_token, backend_detail, "OSStatus", "-25293"):
+        assert private_text not in str(error)
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_token_read_failure_is_typed_private_and_wipes(
+    vault,
+    domain,
+    tmp_path,
+    monkeypatch,
+):
+    original_read_text = Path.read_text
+
+    def fail_token_read(path: Path, *args, **kwargs) -> str:
+        if path.name == FILENAMES["oauth2"]:
+            raise PermissionError(f"private token read failure for {domain}")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_token_read)
+
+    with pytest.raises(TokenPersistenceError) as caught:
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+
+    error = caught.value
+    assert error.error_code == "GAM-TOKEN-PERSISTENCE"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert domain not in str(error)
+    assert "PermissionError" not in str(error)
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_token_read_failure_never_masks_body_error(
+    vault,
+    domain,
+    tmp_path,
+    monkeypatch,
+):
+    original_read_text = Path.read_text
+
+    def fail_token_read(path: Path, *args, **kwargs) -> str:
+        if path.name == FILENAMES["oauth2"]:
+            raise PermissionError("private token read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_token_read)
+
+    with pytest.raises(RuntimeError, match="body failure") as caught:
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+            raise RuntimeError("body failure")
+
+    assert type(caught.value) is RuntimeError
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["missing", "empty", "invalid-utf8"],
+)
+def test_unusable_token_file_fails_closed_and_wipes(
+    vault,
+    domain,
+    tmp_path,
+    replacement,
+):
+    original = vault.get(domain, "oauth2")
+
+    with pytest.raises(TokenPersistenceError) as caught:
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+            token_file = cfgdir / FILENAMES["oauth2"]
+            if replacement == "missing":
+                token_file.unlink()
+            elif replacement == "empty":
+                token_file.write_text("", encoding="utf-8")
+            else:
+                token_file.write_bytes(b"\xff")
+
+    assert caught.value.error_code == "GAM-TOKEN-PERSISTENCE"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert vault.get(domain, "oauth2") == original
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_optional_context_without_original_token_exits_cleanly(tmp_path):
+    vault = SecretsVault(backend=InMemoryBackend())
+
+    with EphemeralConfig(
+        vault,
+        "optional.example",
+        require=False,
+        base_dir=tmp_path,
+    ) as cfgdir:
+        saved = cfgdir
+        assert not (cfgdir / FILENAMES["oauth2"]).exists()
+
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_optional_context_persists_a_new_token(tmp_path):
+    vault = SecretsVault(backend=InMemoryBackend())
+
+    with EphemeralConfig(
+        vault,
+        "optional.example",
+        require=False,
+        base_dir=tmp_path,
+    ) as cfgdir:
+        saved = cfgdir
+        (cfgdir / FILENAMES["oauth2"]).write_text(
+            "new-authorization",
+            encoding="utf-8",
+        )
+
+    assert vault.get("optional.example", "oauth2") == "new-authorization"
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_token_write_back_failure_never_masks_body_error(
+    vault,
+    domain,
+    tmp_path,
+    monkeypatch,
+):
+    def fail_write_back(_domain: str, _name: str, _value: str) -> None:
+        raise PasswordSetError("private backend failure: OSStatus -25293")
+
+    monkeypatch.setattr(vault, "set", fail_write_back)
+
+    with pytest.raises(RuntimeError, match="body failure") as caught:
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+            (cfgdir / FILENAMES["oauth2"]).write_text(
+                "refreshed-sensitive-token",
+                encoding="utf-8",
+            )
+            raise RuntimeError("body failure")
+
+    assert type(caught.value) is RuntimeError
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
+def test_token_write_back_programming_error_surfaces_and_wipes(
+    vault,
+    domain,
+    tmp_path,
+    monkeypatch,
+):
+    def fail_write_back(_domain: str, _name: str, _value: str) -> None:
+        raise TypeError("programming defect")
+
+    monkeypatch.setattr(vault, "set", fail_write_back)
+
+    with pytest.raises(TypeError, match="programming defect"):
+        with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
+            saved = cfgdir
+            (cfgdir / FILENAMES["oauth2"]).write_text(
+                "refreshed-sensitive-token",
+                encoding="utf-8",
+            )
+
+    assert not saved.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
 
 
 def test_sweep_stale_configs(tmp_path):

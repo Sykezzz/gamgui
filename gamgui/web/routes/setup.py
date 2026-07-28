@@ -17,6 +17,7 @@ from ...core.activity import ActivityBusyError, ActivityPathUnavailableError
 from ...core.canary import CanaryConfigStore
 from ...core.components import ComponentError
 from ...core.connectors.gam_connector import GAMConnector
+from ...core.gam.errors import TokenPersistenceError
 from ...core.setup import SetupService
 from ..activity import (
     ADMIN_ACTIVITY_BUSY_MESSAGE,
@@ -37,6 +38,12 @@ SETUP_ACTIVITY_PATH_MESSAGE = (
     "GamGUI could not determine the current home directory, so the private "
     "setup lock and credentials path could not be expanded safely. Restore "
     "this account's home-folder configuration, reopen setup, and try again."
+)
+
+SETUP_TOKEN_PERSISTENCE_ACTION = (
+    "Keep the existing credentials; do not delete or re-import Keychain items. "
+    "Quit and reopen GamGUI, then run Verify access once. If this code returns, "
+    "report it with the time of the attempt."
 )
 
 
@@ -223,7 +230,22 @@ async def verify(
             {"message": ADMIN_ACTIVITY_BUSY_MESSAGE},
         )
     svc = _service(request)
-    result = await svc.verify(domain, admin)
+    try:
+        result = await svc.verify(domain, admin)
+    except TokenPersistenceError as exc:
+        # A completed GAM call is not safe to treat as final when its refreshed
+        # authorization could not be persisted. Render a stable, privacy-safe
+        # recovery code instead of leaking the Keychain/backend exception as an
+        # HTMX 500. Connector activation and canary configuration remain untouched.
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_error.html",
+            {
+                "message": str(exc),
+                "error_code": exc.error_code,
+                "action": SETUP_TOKEN_PERSISTENCE_ACTION,
+            },
+        )
     if result.ok:
         try:
             st.activate_connector(GAMConnector(runner=st.runner, domain=domain))

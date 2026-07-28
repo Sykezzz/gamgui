@@ -21,7 +21,7 @@ from ..activity import ActivityRegistry
 from ..activity import activity_registry as global_activity_registry
 from ..secrets.ephemeral import EphemeralConfig
 from ..secrets.vault import SecretsVault
-from .errors import GAMError, GAMErrorKind
+from .errors import GAMError, GAMErrorKind, TokenPersistenceError
 
 # Env var that overrides binary discovery (used by tests with a mock gam, and power users).
 GAM_BINARY_ENV = "GAMGUI_GAM_BINARY"
@@ -289,11 +289,31 @@ class GAMRunner:
         timeout = timeout or self.timeout
 
         async def _do() -> str:
-            with EphemeralConfig(self.vault, domain, base_dir=self.base_dir) as cfgdir:
-                res = await self._exec(argv, cfgdir, timeout)
-            if res.returncode != 0:
-                raise GAMError.from_run(res.returncode, res.stderr, argv)
-            return strip_cfgdir_noise(res.stdout, cfgdir)
+            result: Optional[RunResult] = None
+            token_persistence_failed = False
+            config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
+            try:
+                with config as cfgdir:
+                    result = await self._exec(argv, cfgdir, timeout)
+            except TokenPersistenceError:
+                if not config.token_persistence_error_raised:
+                    raise
+                token_persistence_failed = True
+            if result is None:
+                raise RuntimeError("GAM did not return a command result.")
+            if token_persistence_failed:
+                gam_error_kind = (
+                    None
+                    if result.returncode == 0
+                    else GAMError.from_run(result.returncode, result.stderr, argv).kind
+                )
+                raise TokenPersistenceError(
+                    command_succeeded=result.returncode == 0,
+                    gam_error_kind=gam_error_kind,
+                ) from None
+            if result.returncode != 0:
+                raise GAMError.from_run(result.returncode, result.stderr, argv)
+            return strip_cfgdir_noise(result.stdout, cfgdir)
 
         if serialize:
             async with self._write_lock:
@@ -319,32 +339,62 @@ class GAMRunner:
 
         @asynccontextmanager
         async def _do() -> AsyncIterator[SpooledRunResult]:
-            with EphemeralConfig(self.vault, domain, base_dir=self.base_dir) as cfgdir:
-                fd, raw_path = tempfile.mkstemp(prefix="gam-output-", suffix=".tmp", dir=str(cfgdir))
-                os.close(fd)
-                spool_path = Path(raw_path)
-                os.chmod(spool_path, 0o600)
-                failed = False
-                try:
-                    result = await self._exec_to_file(
-                        command, cfgdir, command_timeout, spool_path
+            result: Optional[RunResult] = None
+            token_persistence_failed = False
+            config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
+            try:
+                with config as cfgdir:
+                    fd, raw_path = tempfile.mkstemp(
+                        prefix="gam-output-", suffix=".tmp", dir=str(cfgdir)
                     )
-                    if result.returncode != 0:
-                        raise GAMError.from_run(result.returncode, result.stderr, command)
-                    await asyncio.to_thread(_strip_cfgdir_noise_file, spool_path, cfgdir)
-                    yield SpooledRunResult(
-                        path=spool_path,
-                        stdout_bytes=spool_path.stat().st_size,
-                    )
-                except BaseException:
-                    failed = True
-                    raise
-                finally:
-                    cleaned = await await_secure_remove_private_file(spool_path)
-                    if not cleaned and not failed:
-                        raise RuntimeError(
-                            "Private GAM output could not be removed securely."
+                    os.close(fd)
+                    spool_path = Path(raw_path)
+                    os.chmod(spool_path, 0o600)
+                    failed = False
+                    try:
+                        result = await self._exec_to_file(
+                            command, cfgdir, command_timeout, spool_path
                         )
+                        # Preserve the command failure if private-file cleanup also fails. The
+                        # enclosing EphemeralConfig still wipes the whole private directory.
+                        failed = result.returncode != 0
+                        if result.returncode == 0:
+                            await asyncio.to_thread(
+                                _strip_cfgdir_noise_file, spool_path, cfgdir
+                            )
+                            yield SpooledRunResult(
+                                path=spool_path,
+                                stdout_bytes=spool_path.stat().st_size,
+                            )
+                    except BaseException:
+                        failed = True
+                        raise
+                    finally:
+                        cleaned = await await_secure_remove_private_file(spool_path)
+                        if not cleaned and not failed:
+                            raise RuntimeError(
+                                "Private GAM output could not be removed securely."
+                            )
+            except TokenPersistenceError:
+                if not config.token_persistence_error_raised:
+                    raise
+                token_persistence_failed = True
+            if result is None:
+                raise RuntimeError("GAM did not return a command result.")
+            if token_persistence_failed:
+                gam_error_kind = (
+                    None
+                    if result.returncode == 0
+                    else GAMError.from_run(
+                        result.returncode, result.stderr, command
+                    ).kind
+                )
+                raise TokenPersistenceError(
+                    command_succeeded=result.returncode == 0,
+                    gam_error_kind=gam_error_kind,
+                ) from None
+            if result.returncode != 0:
+                raise GAMError.from_run(result.returncode, result.stderr, command)
 
         if serialize:
             async with self._write_lock:

@@ -13,6 +13,7 @@ the real Keychain. The default backend uses ``keyring``, which maps to the macOS
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sys
@@ -65,17 +66,29 @@ class InMemoryBackend:
 class _DarwinSecurityAPI:
     """Small, injectable Security.framework adapter for ACL-preserving password writes."""
 
-    def __init__(self) -> None:
-        from ctypes import c_void_p
+    def __init__(self, macos_api=None, core_foundation=None) -> None:
+        if macos_api is None:
+            from keyring.backends.macOS import api as macos_api
 
-        from keyring.backends.macOS import api
+        if core_foundation is None:
+            core_foundation = macos_api._found
 
-        self._api = api
-        self.item_not_found = api.error.item_not_found
+        self._api = macos_api
+        self.item_not_found = macos_api.error.item_not_found
         self.duplicate_item = -25299  # errSecDuplicateItem
-        self._update = api._sec.SecItemUpdate
-        self._update.restype = api.OS_status
-        self._update.argtypes = (c_void_p, c_void_p)
+        self._update = macos_api._sec.SecItemUpdate
+        self._update.restype = macos_api.OS_status
+        self._update.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        self._create_data = core_foundation.CFDataCreate
+        self._create_data.restype = ctypes.c_void_p
+        self._create_data.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_long,
+        )
+        self._release = core_foundation.CFRelease
+        self._release.restype = None
+        self._release.argtypes = (ctypes.c_void_p,)
 
     def _identity(self, service: str, username: str) -> dict:
         return {
@@ -84,17 +97,48 @@ class _DarwinSecurityAPI:
             "kSecAttrAccount": username or "",
         }
 
+    def _query_with_password(self, password: str, **attributes) -> object:
+        encoded = password.encode("utf-8")
+        buffer = ctypes.create_string_buffer(encoded)
+        data = self._create_data(
+            None,
+            ctypes.cast(buffer, ctypes.c_void_p),
+            len(encoded),
+        )
+        if not data:
+            raise MemoryError("Unable to allocate Keychain password data")
+        data_pointer = ctypes.c_void_p(data)
+        try:
+            # keyring's query uses CFType callbacks, so the dictionary retains the data.
+            return self._api.create_query(
+                **attributes,
+                kSecValueData=data_pointer,
+            )
+        finally:
+            self._release(data_pointer)
+
     def update_generic_password(self, service: str, username: str, password: str) -> int:
         query = self._api.create_query(**self._identity(service, username))
-        attributes = self._api.create_query(kSecValueData=password)
-        return int(self._update(query, attributes))
+        attributes = None
+        try:
+            attributes = self._query_with_password(password)
+            return int(self._update(query, attributes))
+        finally:
+            if attributes:
+                self._release(attributes)
+            if query:
+                self._release(query)
 
     def add_generic_password(self, service: str, username: str, password: str) -> int:
-        query = self._api.create_query(
+        query = self._query_with_password(
+            password,
             **self._identity(service, username),
-            kSecValueData=password,
         )
-        return int(self._api.SecItemAdd(query, None))
+        try:
+            return int(self._api.SecItemAdd(query, None))
+        finally:
+            if query:
+                self._release(query)
 
     def raise_for_status(self, status: int) -> None:
         try:
