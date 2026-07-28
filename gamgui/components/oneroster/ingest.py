@@ -50,6 +50,9 @@ OPTIONAL_FILES = (
     "results.csv",
 )
 ALLOWED_FILES = frozenset(name.casefold() for name in REQUIRED_FILES + OPTIONAL_FILES)
+IGNORED_MACOS_ROOT_FILES = frozenset((".ds_store",))
+MACOS_METADATA_DIRECTORY = "__macosx/"
+MACOS_SIDECAR_PREFIX = "__macosx/._"
 DEFAULT_MAX_CSV_LINE_CHARS = 4 * 1024 * 1024
 DEFAULT_MAX_CSV_FIELD_CHARS = 1024 * 1024
 DEFAULT_MAX_RECORDS_PER_FILE = 2_000_000
@@ -369,6 +372,37 @@ def _preflight_members(
         name = info.filename
         folded = name.casefold()
         unix_mode = (info.external_attr >> 16) & 0xFFFF
+        total += max(0, int(info.file_size))
+        if info.file_size > limits.max_member_bytes:
+            issues.append(
+                _issue(
+                    "OR-ZIP-MEMBER-SIZE",
+                    f"ZIP member {name} exceeds the expanded-size limit.",
+                )
+            )
+        ratio = info.file_size / max(1, info.compress_size)
+        if ratio > limits.max_compression_ratio:
+            issues.append(
+                _issue(
+                    "OR-ZIP-RATIO",
+                    f"ZIP member {name} exceeds the compression-ratio limit.",
+                )
+            )
+        unsafe_kind = False
+        if stat.S_IFMT(unix_mode) == stat.S_IFLNK:
+            issues.append(_issue("OR-ZIP-SYMLINK", "ZIP symbolic links are not allowed."))
+            unsafe_kind = True
+        if info.flag_bits & 0x1:
+            issues.append(_issue("OR-ZIP-ENCRYPTED", "Encrypted ZIP members are not supported."))
+            unsafe_kind = True
+        if unsafe_kind:
+            continue
+        if _is_ignorable_macos_metadata(info):
+            # Finder-created archives can contain AppleDouble sidecars beneath
+            # __MACOSX/ plus a root .DS_Store. These members are never opened or
+            # extracted. Exact-name matching keeps every other nested member behind
+            # the normal path boundary.
+            continue
         if info.is_dir() or name.endswith(("/", "\\")):
             issues.append(_issue("OR-ZIP-NESTED", "ZIP directories are not allowed."))
             continue
@@ -386,12 +420,6 @@ def _preflight_members(
                 )
             )
             continue
-        if stat.S_IFMT(unix_mode) == stat.S_IFLNK:
-            issues.append(_issue("OR-ZIP-SYMLINK", "ZIP symbolic links are not allowed."))
-            continue
-        if info.flag_bits & 0x1:
-            issues.append(_issue("OR-ZIP-ENCRYPTED", "Encrypted ZIP members are not supported."))
-            continue
         if folded not in ALLOWED_FILES:
             issues.append(
                 _issue(
@@ -408,22 +436,6 @@ def _preflight_members(
                 )
             )
             continue
-        if info.file_size > limits.max_member_bytes:
-            issues.append(
-                _issue(
-                    "OR-ZIP-MEMBER-SIZE",
-                    f"ZIP member {name} exceeds the expanded-size limit.",
-                )
-            )
-        total += max(0, int(info.file_size))
-        ratio = info.file_size / max(1, info.compress_size)
-        if ratio > limits.max_compression_ratio:
-            issues.append(
-                _issue(
-                    "OR-ZIP-RATIO",
-                    f"ZIP member {name} exceeds the compression-ratio limit.",
-                )
-            )
         members[folded] = info
     if total > limits.max_expanded_bytes:
         issues.append(
@@ -441,6 +453,21 @@ def _preflight_members(
                 )
             )
     return members
+
+
+def _is_ignorable_macos_metadata(info: zipfile.ZipInfo) -> bool:
+    folded = info.filename.casefold()
+    if folded in IGNORED_MACOS_ROOT_FILES:
+        return True
+    if folded == MACOS_METADATA_DIRECTORY:
+        return info.is_dir()
+    if not folded.startswith(MACOS_SIDECAR_PREFIX):
+        return False
+    sidecar_target = folded[len(MACOS_SIDECAR_PREFIX) :]
+    return (
+        sidecar_target in ALLOWED_FILES
+        or sidecar_target in IGNORED_MACOS_ROOT_FILES
+    )
 
 
 def _read_manifest(
