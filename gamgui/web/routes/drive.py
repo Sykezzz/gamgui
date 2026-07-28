@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import webbrowser
+from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, Response
 
+from ...core.canary import CanaryConfigStore
 from ...core.drive import DriveAPIError, DriveSafetyError
 from ...core.drive.models import OperationTarget
 from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
@@ -23,6 +25,23 @@ _NOT_CONNECTED = "Drive administration is unavailable. Reconnect the Workspace d
 
 def _service(request: Request):
     return getattr(request.app.state.gamgui, "drive_service", None)
+
+
+def _admin_subject(request: Request) -> str:
+    state = request.app.state.gamgui
+    configured = str(getattr(state, "admin_subject", "") or "").strip().casefold()
+    if configured:
+        return configured
+    if not hasattr(state, "runner"):
+        return ""
+    runner = getattr(state, "runner", None)
+    base_dir = getattr(runner, "base_dir", None)
+    path = Path(base_dir) / "canary-config.json" if base_dir is not None else None
+    config = CanaryConfigStore(path).load()
+    active_domain = str(getattr(state, "audit_domain", "") or "").strip().casefold()
+    if config is None or (active_domain and config.domain != active_domain):
+        return ""
+    return config.subject
 
 
 def _friendly(exc: Exception) -> str:
@@ -149,6 +168,7 @@ async def _detail_context(request: Request, email: str, file_id: str, notice: st
         "file": file,
         "notice": notice,
         "error": "",
+        "admin_email": _admin_subject(request),
     }
 
 
@@ -348,11 +368,15 @@ async def preview_frame(request: Request, email: str, file_id: str) -> HTMLRespo
         file = await service.get_file(email.strip(), file_id.strip())
         # Validate before rendering an iframe so unsafe types never become inline candidates.
         if not file.is_google_doc and file.mime_type not in {
+            "application/json",
             "application/pdf",
             "image/png",
             "image/jpeg",
             "image/webp",
+            "text/csv",
+            "text/markdown",
             "text/plain",
+            "text/tab-separated-values",
         }:
             raise DriveSafetyError(
                 "This file type is not safe to preview inside GamGUI."
@@ -369,7 +393,9 @@ async def preview_frame(request: Request, email: str, file_id: str) -> HTMLRespo
 
 
 @router.get("/preview/content")
-async def preview_content(request: Request, email: str, file_id: str) -> Response:
+async def preview_content(
+    request: Request, email: str, file_id: str, download: bool = False
+) -> Response:
     service = _service(request)
     if service is None:
         return Response(_NOT_CONNECTED, status_code=503, media_type="text/plain")
@@ -385,8 +411,12 @@ async def preview_content(request: Request, email: str, file_id: str) -> Respons
     headers = {
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'inline; filename="{preview.filename}"',
-        "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self' data:",
+        "Content-Disposition": (
+            f'attachment; filename="{preview.filename}"'
+            if download
+            else f'inline; filename="{preview.filename}"'
+        ),
+        "Content-Security-Policy": "default-src 'none'; img-src 'self' data: blob:",
     }
     return Response(preview.body, media_type=preview.media_type, headers=headers)
 
@@ -419,6 +449,98 @@ async def open_in_drive(
         request,
         "_action_result.html",
         {"ok": True, "message": "Opened in Google Drive."},
+    )
+
+
+@router.post("/admin-access/open", response_class=HTMLResponse)
+async def open_with_admin_access(
+    request: Request,
+    email: Annotated[str, Form()],
+    file_id: Annotated[str, Form()],
+) -> HTMLResponse:
+    service = _service(request)
+    admin_email = _admin_subject(request)
+    if service is None:
+        return _error(request, _NOT_CONNECTED)
+    if not admin_email:
+        return _error(
+            request,
+            "No verified administrator account is configured. Re-run Workspace setup.",
+        )
+    lease = try_acquire_admin_activity(
+        request.app.state.gamgui, "drive-temporary-admin-access"
+    )
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    result = None
+    try:
+        result = await service.grant_temporary_admin_access(
+            email.strip(), file_id.strip(), admin_email
+        )
+        parsed = urlparse(result.web_view_link)
+        if parsed.scheme != "https" or not (
+            parsed.hostname == "google.com"
+            or str(parsed.hostname or "").endswith(".google.com")
+        ):
+            raise DriveSafetyError("Google did not return a safe edit link for this file.")
+        opened = await asyncio.to_thread(webbrowser.open, result.web_view_link, 2)
+        if not opened:
+            raise DriveSafetyError("The system browser could not be opened.")
+    except Exception as exc:
+        if result is not None and result.created:
+            try:
+                await service.revoke_temporary_admin_access(
+                    email.strip(),
+                    file_id.strip(),
+                    admin_email,
+                    result.permission_id,
+                )
+            except Exception:
+                pass
+        return _error(request, _friendly(exc))
+    finally:
+        lease.release()
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_drive_admin_access.html",
+        {
+            "result": result,
+            "email": email.strip(),
+            "file_id": file_id.strip(),
+        },
+    )
+
+
+@router.post("/admin-access/remove", response_class=HTMLResponse)
+async def remove_admin_access(
+    request: Request,
+    email: Annotated[str, Form()],
+    file_id: Annotated[str, Form()],
+    permission_id: Annotated[str, Form()],
+) -> HTMLResponse:
+    service = _service(request)
+    admin_email = _admin_subject(request)
+    if service is None:
+        return _error(request, _NOT_CONNECTED)
+    if not admin_email:
+        return _error(request, "The configured administrator account is unavailable.")
+    lease = try_acquire_admin_activity(
+        request.app.state.gamgui, "drive-temporary-admin-access-remove"
+    )
+    if lease is None:
+        return _error(request, ADMIN_ACTIVITY_BUSY_MESSAGE)
+    try:
+        await service.revoke_temporary_admin_access(
+            email.strip(), file_id.strip(), admin_email, permission_id.strip()
+        )
+    except Exception as exc:
+        return _error(request, _friendly(exc))
+    finally:
+        lease.release()
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_action_result.html",
+        {"ok": True, "message": f"Removed temporary access for {admin_email}."},
     )
 
 
@@ -457,6 +579,7 @@ async def ownership_apply(
     file_id: Annotated[str, Form()],
     destination: Annotated[str, Form()],
     confirmation: Annotated[str, Form()],
+    restrict_access: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
     service = _service(request)
     if service is None:
@@ -472,12 +595,19 @@ async def ownership_apply(
             file_id.strip(),
             destination.strip(),
             confirmation=confirmation,
+            restrict_access=restrict_access == "on",
         )
     except Exception as exc:
         return _error(request, _friendly(exc))
     finally:
         lease.release()
     message = result.detail
+    if result.restricted and not result.residual_access:
+        message += (
+            f" Restricted to the new owner; removed {result.removed_permissions} "
+            "other direct permission"
+            f"{'' if result.removed_permissions == 1 else 's'}."
+        )
     if result.residual_access:
         message += f" Warning: {result.residual_access}"
     return TEMPLATES.TemplateResponse(

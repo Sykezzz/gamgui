@@ -15,8 +15,15 @@
       <form hx-post="/drive/open" hx-target="#drive-action" hx-swap="innerHTML">
         <input type="hidden" name="email" value="{{ email }}" />
         <input type="hidden" name="file_id" value="{{ file.id }}" />
-        <button type="submit" class="rounded-lg bg-brand-blueink px-3 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2">Open/Edit in Drive</button>
+        <button type="submit" class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink hover:bg-brand-blue/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Open as signed-in browser user</button>
       </form>
+      {% if admin_email and admin_email | lower != email | lower %}
+      <form hx-post="/drive/admin-access/open" hx-target="#drive-action" hx-swap="innerHTML">
+        <input type="hidden" name="email" value="{{ email }}" />
+        <input type="hidden" name="file_id" value="{{ file.id }}" />
+        <button type="submit" class="rounded-lg bg-brand-blueink px-3 py-2 text-sm font-medium text-brand-white hover:bg-brand-black focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2">Grant admin access &amp; open</button>
+      </form>
+      {% endif %}
       {% endif %}
     </div>
   </div>
@@ -25,6 +32,12 @@
   <p class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{{ notice }}</p>
   {% endif %}
   <div id="drive-action" aria-live="polite"></div>
+  {% if file.web_view_link %}
+  <p class="text-xs text-brand-blueink">
+    Google’s editor uses the account signed into your browser, not GamGUI’s delegated
+    owner identity. Use temporary admin access when that browser account is not already shared.
+  </p>
+  {% endif %}
   <div id="drive-preview"></div>
 
   <dl class="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
@@ -64,7 +77,7 @@
   {% if file.owned_by_me and not file.is_shared_drive %}
   <div class="border-t border-red-200 pt-4">
     <h4 class="eyebrow text-red-700">Ownership</h4>
-    <p class="mt-1 text-sm text-brand-blueink">Transfer ownership only to a live internal user. The previous owner may retain writer access; GamGUI attempts to remove it and reports any residual access.</p>
+    <p class="mt-1 text-sm text-brand-blueink">Transfer ownership only to a live internal user. GamGUI removes the previous owner’s retained writer access and can optionally remove every other direct permission.</p>
     <form class="mt-3 flex flex-wrap gap-2" hx-post="/drive/ownership/preview" hx-target="#drive-ownership" hx-swap="innerHTML">
       <input type="hidden" name="email" value="{{ email }}" />
       <input type="hidden" name="file_id" value="{{ file.id }}" />

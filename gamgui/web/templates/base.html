@@ -26,12 +26,13 @@
   </div>
   <div id="busy" aria-live="polite"><span class="spinner"></span><span>Working…</span></div>
   <div class="min-h-full">
-    <header class="border-b border-brand-gray/40 bg-brand-white/80 backdrop-blur">
-      <div class="mx-auto {{ self.container_class() }} px-6 py-4 flex flex-wrap items-start gap-4">
-        <a href="/" class="wordmark font-serif text-lg text-brand-black">GamGUI</a>
-        <span class="h-4 w-px bg-brand-gray/60"></span>
-        <span class="eyebrow text-brand-blueink">Console</span>
-        <nav class="basis-full text-sm flex flex-wrap items-center gap-x-4 gap-y-2 text-brand-blueink/80 sm:basis-auto sm:ml-auto sm:justify-end"
+    <header class="border-b border-brand-gray/40 bg-brand-white/90 backdrop-blur">
+      <div class="mx-auto {{ self.container_class() }} flex min-w-0 items-center gap-3 px-4 py-2 sm:px-6">
+        <a href="/" class="wordmark shrink-0 font-serif text-base text-brand-black">GamGUI</a>
+        <span class="hidden h-4 w-px shrink-0 bg-brand-gray/60 sm:block"></span>
+        <span class="eyebrow hidden shrink-0 text-brand-blueink sm:inline">Console</span>
+        <nav class="ml-auto flex min-w-0 flex-1 items-center gap-4 overflow-x-auto whitespace-nowrap pb-1 text-sm text-brand-blueink/80 sm:justify-end sm:pb-0"
+             aria-label="Primary navigation"
              hx-boost="true" hx-target="#app-main" hx-select="#app-main"
              hx-swap="outerHTML show:top" hx-push-url="true">
           <a class="hover:text-brand-black transition-colors" href="/">Home</a>
@@ -55,10 +56,10 @@
         {{ update_notice }}
       </div>
     {% endif %}
-    <main id="app-main" tabindex="-1" class="mx-auto {% block container_class %}max-w-5xl{% endblock %} px-6 py-10">
+    <main id="app-main" tabindex="-1" class="mx-auto {% block container_class %}max-w-5xl{% endblock %} px-4 py-6 sm:px-6">
       {% block content %}{% endblock %}
     </main>
-    <footer class="mx-auto {{ self.container_class() }} px-6 py-8 text-xs text-brand-gray">
+    <footer class="mx-auto {{ self.container_class() }} px-4 py-5 text-xs text-brand-blueink sm:px-6">
       GamGUI — a local admin console for Google Workspace
     </footer>
   </div>

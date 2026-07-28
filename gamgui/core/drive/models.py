@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIMES = {
     "application/vnd.google-apps.document",
+    "application/vnd.google-apps.drawing",
     "application/vnd.google-apps.spreadsheet",
     "application/vnd.google-apps.presentation",
 }
@@ -211,3 +212,14 @@ class TransferResult:
     destination: str
     detail: str = ""
     residual_access: str = ""
+    restricted: bool = False
+    removed_permissions: int = 0
+
+
+@dataclass(frozen=True)
+class TemporaryAccessResult:
+    admin_email: str
+    permission_id: str
+    web_view_link: str
+    created: bool
+    detail: str = ""

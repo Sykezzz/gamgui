@@ -9,6 +9,15 @@
     <label class="block text-sm font-medium text-red-900">Type {{ destination }} to confirm
       <input class="mt-1 w-full rounded-lg border border-red-300 bg-brand-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-600" type="email" name="confirmation" autocomplete="off" required />
     </label>
+    <label class="flex items-start gap-2 rounded-lg border border-red-300 bg-brand-white p-3 text-sm text-red-950">
+      <input class="mt-0.5 rounded border-red-400 text-red-700 focus:ring-red-600" type="checkbox" name="restrict_access" />
+      <span>
+        <strong>Restrict to the new owner after transfer.</strong>
+        Remove every removable direct user, group, domain, and link permission.
+        Inherited or policy-controlled access cannot be removed at the file level and
+        will be reported as residual access.
+      </span>
+    </label>
     <button type="submit" class="rounded-lg bg-red-700 px-3 py-2 text-sm font-medium text-white hover:bg-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-700 focus-visible:ring-offset-2">Transfer ownership</button>
   </form>
 </div>
