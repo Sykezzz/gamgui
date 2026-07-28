@@ -60,6 +60,22 @@ DEFAULT_MAX_MANIFEST_ROWS = 256
 DEFAULT_MAX_ISSUES = 10_000
 csv.field_size_limit(DEFAULT_MAX_CSV_FIELD_CHARS)
 
+_CLASS_DERIVED_ISSUE_CODES = frozenset(
+    {
+        "OR-REFERENCE-TERM",
+        "OR-REFERENCE-COURSE",
+        "OR-REFERENCE-SCHOOL-YEAR",
+        "OR-ALIAS-MISSING",
+        "OR-ALIAS-COLLISION",
+        "OR-ENROLLMENT-ROLE",
+        "OR-OWNER-MISSING",
+        "OR-OWNER-AMBIGUOUS",
+        "OR-USER-MISSING",
+        "OR-COURSE-NAME-INCOMPLETE",
+        "OR-GAM-VALUE-INVALID",
+    }
+)
+
 REQUIRED_HEADERS: Mapping[str, frozenset[str]] = {
     "manifest.csv": frozenset(("propertyName", "value")),
     "academicSessions.csv": frozenset(
@@ -286,8 +302,16 @@ def rebuild_course_plans(
             conn.execute(
                 "DELETE FROM issues WHERE code = 'OR-TERM-AMBIGUOUS'"
             )
-            existing = tuple(_issues_from_db(conn))
-            issues = _IssueCollector(DEFAULT_MAX_ISSUES, existing)
+            conn.execute(
+                "DELETE FROM issues WHERE code IN ({})".format(
+                    ", ".join("?" for _ in _CLASS_DERIVED_ISSUE_CODES)
+                ),
+                tuple(_CLASS_DERIVED_ISSUE_CODES),
+            )
+            issues = _IssueCollector(
+                DEFAULT_MAX_ISSUES,
+                tuple(_issues_from_db(conn)),
+            )
             _build_course_plans(conn, domain, selected_session_id, issues)
             _write_issues(conn, issues)
             rebuild_preview_index(conn, domain)
@@ -1090,26 +1114,6 @@ def _validate_references(
 ) -> None:
     for row in conn.execute(
         """
-        SELECT c.sourced_id, c.course_id, c.row_number
-        FROM classes c LEFT JOIN courses x
-          ON x.domain = c.domain AND x.sourced_id = c.course_id
-         AND x.status != 'tobedeleted'
-        WHERE c.domain = ? AND c.status != 'tobedeleted' AND x.sourced_id IS NULL
-        """,
-        (domain,),
-    ):
-        issues.append(
-            _issue(
-                "OR-REFERENCE-COURSE",
-                "Class references a course that is missing from this snapshot.",
-                "class",
-                row["sourced_id"],
-                row["row_number"],
-                blocking=False,
-            )
-        )
-    for row in conn.execute(
-        """
         SELECT e.sourced_id, e.class_id, e.user_id, e.row_number,
                c.sourced_id AS found_class, u.sourced_id AS found_user
         FROM enrollments e
@@ -1153,59 +1157,6 @@ def _validate_references(
                 blocking=False,
             )
         )
-    for row in conn.execute(
-        """
-        SELECT c.sourced_id, c.school_year_id, c.row_number
-        FROM courses c LEFT JOIN academic_sessions a
-          ON a.domain = c.domain AND a.sourced_id = c.school_year_id
-         AND a.status != 'tobedeleted'
-        WHERE c.domain = ? AND c.status != 'tobedeleted'
-          AND trim(c.school_year_id) != '' AND a.sourced_id IS NULL
-        """,
-        (domain,),
-    ):
-        issues.append(
-            _issue(
-                "OR-REFERENCE-SCHOOL-YEAR",
-                "Course references a school year that is missing from this snapshot.",
-                "course",
-                row["sourced_id"],
-                row["row_number"],
-                blocking=False,
-            )
-        )
-    known_sessions = {
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT sourced_id FROM academic_sessions
-            WHERE domain = ? AND status != 'tobedeleted'
-            """,
-            (domain,),
-        )
-    }
-    for row in conn.execute(
-        """
-        SELECT sourced_id, term_ids, row_number FROM classes
-        WHERE domain = ? AND status != 'tobedeleted'
-        """,
-        (domain,),
-    ):
-        terms = _split_ids(row["term_ids"])
-        missing = [item for item in terms if item not in known_sessions]
-        if not terms or missing:
-            issues.append(
-                _issue(
-                    "OR-REFERENCE-TERM",
-                    "Class has no valid academic-session reference.",
-                    "class",
-                    row["sourced_id"],
-                    row["row_number"],
-                    blocking=False,
-                )
-            )
-
-
 def _choose_current_session(
     conn: sqlite3.Connection,
     domain: str,
@@ -1443,19 +1394,20 @@ def _build_course_plans(
                 student_count,
             ),
         )
-        for code in codes:
-            if code in {"OR-TERM-AMBIGUOUS"}:
-                continue
-            issues.append(
-                _issue(
-                    code,
-                    _quarantine_message(code),
-                    "class",
-                    class_id,
-                    int(row["row_number"]),
-                    blocking=code == "OR-GAM-VALUE-INVALID",
+        if selected:
+            for code in codes:
+                if code in {"OR-TERM-AMBIGUOUS"}:
+                    continue
+                issues.append(
+                    _issue(
+                        code,
+                        _quarantine_message(code),
+                        "class",
+                        class_id,
+                        int(row["row_number"]),
+                        blocking=code == "OR-GAM-VALUE-INVALID",
+                    )
                 )
-            )
 
 
 def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
