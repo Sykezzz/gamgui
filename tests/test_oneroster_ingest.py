@@ -169,6 +169,17 @@ def test_unsupported_enrollment_role_quarantines_exact_class(tmp_path: Path) -> 
     assert snapshot.ready_for_apply
     assert course["ready"] is False
     assert "OR-ENROLLMENT-ROLE" in course["quarantine_codes"]
+    initial_issues = service.preview(
+        snapshot.id, "issues", query="OR-ENROLLMENT-ROLE"
+    ).items
+    assert any(item["entity_kind"] == "enrollment" for item in initial_issues)
+
+    service.select_session(snapshot.id, "year-1")
+    rebuilt_issues = service.preview(
+        snapshot.id, "issues", query="OR-ENROLLMENT-ROLE"
+    ).items
+    assert any(item["entity_kind"] == "enrollment" for item in rebuilt_issues)
+    assert not any(item["entity_kind"] == "class" for item in rebuilt_issues)
 
 
 def test_enrollment_with_missing_class_blocks_exact_state_apply(
@@ -254,6 +265,74 @@ def test_ambiguous_term_is_preview_only_until_selected(tmp_path: Path) -> None:
     assert selected.state is SnapshotState.READY
     assert selected.selected_session_id == "term-1"
     assert selected.counts.ready_courses == 1
+
+
+def test_session_reselection_does_not_amplify_existing_inactive_term_issues(
+    tmp_path: Path,
+) -> None:
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,",
+        "term-1,tobedeleted,",
+        1,
+    )
+    historical_classes = [
+        f"historical-{number},active,Historical {number},P{number},,course-1,term-1,school-1,9"
+        for number in range(10_000)
+    ]
+    files["classes.csv"] += "\n".join(historical_classes) + "\n"
+    service = OneRosterService("example.org", tmp_path / "inactive-terms")
+
+    snapshot = service.upload(zip_bytes(files))
+    initial_codes = {
+        item["code"] for item in service.preview(snapshot.id, "issues", limit=50).items
+    }
+    assert "OR-ISSUE-LIMIT" not in initial_codes
+    assert snapshot.issue_count == 1
+
+    rebuilt = service.select_session(snapshot.id, "year-1")
+    rebuilt_codes = {
+        item["code"] for item in service.preview(snapshot.id, "issues", limit=50).items
+    }
+    assert "OR-ISSUE-LIMIT" not in rebuilt_codes
+    assert rebuilt.issue_count == 0
+
+
+def test_session_selection_recomputes_selected_class_issues(tmp_path: Path) -> None:
+    files = valid_files(term_ids="term-1,term-2")
+    files["academicSessions.csv"] += (
+        "term-2,active,Second Term,term,2000-01-01,2100-12-31,year-1,2026-27\n"
+    )
+    files["classes.csv"] += (
+        "term-2-ownerless,active,Historical,PT2,,course-1,term-2,school-1,9\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "session-derived-issues")
+
+    snapshot = service.upload(zip_bytes(files))
+    initial_codes = {
+        item["code"] for item in service.preview(snapshot.id, "issues", limit=50).items
+    }
+    assert "OR-TERM-AMBIGUOUS" in initial_codes
+    assert "OR-OWNER-MISSING" not in initial_codes
+
+    first = service.select_session(snapshot.id, "term-1")
+    first_codes = {
+        item["code"] for item in service.preview(first.id, "issues", limit=50).items
+    }
+    assert "OR-OWNER-MISSING" not in first_codes
+
+    second = service.select_session(snapshot.id, "term-2")
+    second_codes = {
+        item["code"] for item in service.preview(second.id, "issues", limit=50).items
+    }
+    assert "OR-OWNER-MISSING" in second_codes
+
+    restored = service.select_session(snapshot.id, "term-1")
+    restored_codes = {
+        item["code"]
+        for item in service.preview(restored.id, "issues", limit=50).items
+    }
+    assert "OR-OWNER-MISSING" not in restored_codes
 
 
 def test_bounded_cursor_search_and_domain_isolation(tmp_path: Path) -> None:

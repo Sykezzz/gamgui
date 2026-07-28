@@ -15,6 +15,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from gamgui.components.oneroster.service import OneRosterService
+from gamgui.core.activity import ActivityRegistry
 from gamgui.web.routes import oneroster as oneroster_routes
 from gamgui.web.routes.oneroster import (
     _BoundedUploadStream,
@@ -22,6 +24,7 @@ from gamgui.web.routes.oneroster import (
     _planning_record,
     router,
 )
+from tests.test_oneroster_helpers import valid_files, zip_bytes
 
 
 TEMPLATES = Path(__file__).parents[1] / "gamgui" / "web" / "templates"
@@ -430,6 +433,8 @@ def test_dashboard_reads_only_local_import_configuration():
 
 def test_upload_rejects_non_zip_before_service_and_accepts_zip_stream():
     client, service = _client()
+    registry = ActivityRegistry()
+    client.app.state.gamgui.activity_registry = registry
     rejected = client.post(
         "/classroom/imports/upload",
         files={"package": ("roster.csv", b"users", "text/csv")},
@@ -445,6 +450,69 @@ def test_upload_rejects_non_zip_before_service_and_accepts_zip_stream():
     assert "district.zip" in accepted.text
     assert "Import ID" in accepted.text
     assert ("upload", "district.zip") in service.calls
+    assert not registry.is_active()
+
+
+def test_historical_session_reselection_allows_next_upload_without_active_job(
+    tmp_path: Path,
+):
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,",
+        "term-1,tobedeleted,",
+        1,
+    )
+    files["classes.csv"] += "\n".join(
+        f"historical-{number},active,Historical {number},P{number},,course-1,term-1,school-1,9"
+        for number in range(3_000)
+    ) + "\n"
+    service = OneRosterService("example.org", tmp_path / "oneroster")
+    registry = ActivityRegistry()
+    state = SimpleNamespace(
+        component_manager=FakeComponentManager(),
+        oneroster_service=service,
+        audit_domain="example.org",
+        connector=object(),
+        oneroster_manifest_tasks={},
+        oneroster_manifest_errors={},
+        activity_registry=registry,
+    )
+    app = FastAPI()
+    app.state.gamgui = state
+    app.include_router(router)
+    client = TestClient(app)
+
+    first = client.post(
+        "/classroom/imports/upload",
+        files={"package": ("historical.zip", zip_bytes(files), "application/zip")},
+    )
+    assert first.status_code == 200
+    assert "CMP-ACTIVE-JOB" not in first.text
+    first_snapshot = service.history()[0]
+    assert not registry.is_active()
+    assert not service.store.has_active_jobs()
+
+    selected = client.post(
+        f"/classroom/imports/import/{first_snapshot.id}/session",
+        data={"session_id": "year-1"},
+    )
+    assert selected.status_code == 200
+    assert "CMP-ACTIVE-JOB" not in selected.text
+    issues = service.preview(first_snapshot.id, "issues", limit=50)
+    assert all(item["code"] != "OR-ISSUE-LIMIT" for item in issues.items)
+    assert not registry.is_active()
+    assert not service.store.has_active_jobs()
+
+    second = client.post(
+        "/classroom/imports/upload",
+        files={
+            "package": ("current.zip", zip_bytes(valid_files()), "application/zip")
+        },
+    )
+    assert second.status_code == 200
+    assert "CMP-ACTIVE-JOB" not in second.text
+    assert not registry.is_active()
+    assert not service.store.has_active_jobs()
 
 
 def test_bounded_upload_stream_rejects_bytes_past_server_cap():
