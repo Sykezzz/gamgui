@@ -48,6 +48,132 @@ def test_duplicate_case_member_and_nested_member_are_rejected(tmp_path: Path) ->
     assert "OR-ZIP-TRAVERSAL" in codes
 
 
+def test_finder_macos_metadata_is_ignored_without_relaxing_csv_paths(
+    tmp_path: Path,
+) -> None:
+    output = io.BytesIO()
+    files = valid_files()
+    files["demographics.csv"] = "sourcedId,status,birthDate,sex\n"
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+            archive.writestr(f"__MACOSX/._{name}", "AppleDouble metadata")
+
+    service = OneRosterService("example.org", tmp_path / "component")
+    snapshot = service.upload(output.getvalue())
+    issues = service.preview(snapshot.id, "issues")
+
+    assert snapshot.state is SnapshotState.READY
+    assert snapshot.ready_for_apply
+    assert issues.items == ()
+
+
+def test_macos_metadata_directories_and_ds_store_are_ignored(
+    tmp_path: Path,
+) -> None:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in valid_files().items():
+            archive.writestr(name, data)
+        archive.writestr("__MACOSX/", "")
+        archive.writestr(".DS_Store", "Finder metadata")
+
+    service = OneRosterService("example.org", tmp_path / "component")
+    snapshot = service.upload(output.getvalue())
+
+    assert snapshot.state is SnapshotState.READY
+    assert snapshot.ready_for_apply
+    assert service.preview(snapshot.id, "issues").items == ()
+
+
+@pytest.mark.parametrize(
+    ("member_name", "expected_code"),
+    (
+        ("__MACOSX/not-appledouble.bin", "OR-ZIP-TRAVERSAL"),
+        ("__MACOSX/nested/", "OR-ZIP-NESTED"),
+        ("__MACOSX/../../outside.csv", "OR-ZIP-TRAVERSAL"),
+        ("__MACOSX-copy/._users.csv", "OR-ZIP-TRAVERSAL"),
+    ),
+)
+def test_non_finder_macos_paths_remain_blocked(
+    tmp_path: Path,
+    member_name: str,
+    expected_code: str,
+) -> None:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in valid_files().items():
+            archive.writestr(name, data)
+        archive.writestr(member_name, "not trusted metadata")
+
+    service = OneRosterService("example.org", tmp_path / "component")
+    snapshot = service.upload(output.getvalue())
+    codes = {item["code"] for item in service.preview(snapshot.id, "issues").items}
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert expected_code in codes
+
+
+def test_macos_sidecars_still_obey_symlink_and_encryption_checks() -> None:
+    symlink = zipfile.ZipInfo("__MACOSX/._users.csv")
+    symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+    encrypted = zipfile.ZipInfo("__MACOSX/._classes.csv")
+    encrypted.flag_bits |= 0x1
+    issues = []
+
+    _preflight_members(
+        _InfoArchive([symlink, encrypted]),  # type: ignore[arg-type]
+        SafetyLimits(),
+        issues,
+    )
+
+    codes = {issue.code for issue in issues}
+    assert "OR-ZIP-SYMLINK" in codes
+    assert "OR-ZIP-ENCRYPTED" in codes
+
+
+def test_macos_sidecars_count_toward_size_ratio_and_expansion_limits(
+    tmp_path: Path,
+) -> None:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in valid_files().items():
+            archive.writestr(name, data)
+        archive.writestr("__MACOSX/._users.csv", b"0" * 2048)
+
+    service = OneRosterService(
+        "example.org",
+        tmp_path / "component",
+        safety_limits=SafetyLimits(
+            max_member_bytes=1024,
+            max_expanded_bytes=16 * 1024,
+            max_compression_ratio=2,
+        ),
+    )
+    snapshot = service.upload(output.getvalue())
+    codes = {item["code"] for item in service.preview(snapshot.id, "issues").items}
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert "OR-ZIP-MEMBER-SIZE" in codes
+    assert "OR-ZIP-RATIO" in codes
+
+    expanded = zipfile.ZipInfo("__MACOSX/._users.csv")
+    expanded.file_size = 2048
+    expanded.compress_size = 2048
+    expansion_issues = []
+    _preflight_members(
+        _InfoArchive([expanded]),  # type: ignore[arg-type]
+        SafetyLimits(
+            max_member_bytes=4096,
+            max_expanded_bytes=1024,
+        ),
+        expansion_issues,
+    )
+    assert "OR-ZIP-EXPANDED-SIZE" in {
+        issue.code for issue in expansion_issues
+    }
+
+
 def test_symlink_and_encrypted_flags_are_preflight_blockers() -> None:
     symlink = zipfile.ZipInfo("users.csv")
     symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
