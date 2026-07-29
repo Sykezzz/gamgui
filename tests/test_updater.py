@@ -1236,6 +1236,7 @@ def test_prepare_database_schemas_initializes_every_core_store_on_copy(
         "calendar_index.db",
         "classroom_courses.db",
         "classroom_roster_operations.db",
+        "classroom_teacher_entitlements.db",
         "drive_operations.db",
     }
     assert all(path.is_file() for path in paths)

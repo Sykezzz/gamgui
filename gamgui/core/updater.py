@@ -2714,6 +2714,7 @@ def prepare_database_schemas(data_root: Path) -> list[Path]:
     from .calendar_index import CalendarIndex
     from .classroom.index import CourseIndex
     from .classroom.manifests import RosterManifestStore
+    from .classroom_access import EntitlementStore
     from .directory_index import DirectoryIndex
     from .drive.operations import DriveOperationStore
 
@@ -2724,13 +2725,15 @@ def prepare_database_schemas(data_root: Path) -> list[Path]:
         root / "calendar_index.db",
         root / "classroom_courses.db",
         root / "classroom_roster_operations.db",
+        root / "classroom_teacher_entitlements.db",
         root / "drive_operations.db",
     ]
     DirectoryIndex(paths[0], "__migration_check__")
     CalendarIndex(paths[1])
     CourseIndex(paths[2])
     RosterManifestStore(paths[3])
-    DriveOperationStore(paths[4])
+    EntitlementStore(paths[4])
+    DriveOperationStore(paths[5])
     try:
         from .components import load_embedded_profile
 

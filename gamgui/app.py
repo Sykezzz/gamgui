@@ -114,6 +114,9 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--current-app", default="")
     parser.add_argument("--activation-lock-fd", type=int, default=-1)
     parser.add_argument("--activation-transaction", default="")
+    parser.add_argument("--headless-task", default="")
+    parser.add_argument("--policy-id", default="")
+    parser.add_argument("--scheduled", action="store_true")
     # macOS may append process-serial arguments; they are intentionally ignored.
     args, _unknown = parser.parse_known_args(argv)
     return args
@@ -701,6 +704,14 @@ def _run_canary(json_output: bool = False) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _arguments(argv)
+    if args.headless_task:
+        if args.headless_task != "classroom-teachers" or not args.policy_id:
+            return 2
+        from .agent import run_classroom_teachers
+
+        return asyncio.run(
+            run_classroom_teachers(args.policy_id, scheduled=args.scheduled)
+        )
     if args.apply_update_helper:
         return _run_helper(args)
     if args.self_test:

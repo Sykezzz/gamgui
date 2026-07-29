@@ -1,0 +1,286 @@
+{% extends "base.html" %}
+{% block title %}Classroom teacher access — GamGUI Console{% endblock %}
+{% block content %}
+{% if not connected %}
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
+    <p class="eyebrow text-brand-blue">Not connected</p>
+    <h1 class="mt-2 font-serif text-2xl text-brand-black">Connect a domain first</h1>
+    <p class="mt-2 text-sm text-brand-blueink">Teacher access policies require a verified Workspace connection.</p>
+    <a href="/setup" class="mt-4 inline-flex items-center rounded-lg bg-brand-blue px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40">Run setup</a>
+  </section>
+{% else %}
+<div class="space-y-5">
+  <header>
+    <p class="eyebrow text-brand-blue">Classroom entitlement</p>
+    <h1 class="font-serif text-2xl tracking-tight text-brand-black">Classroom teacher access</h1>
+    <p class="mt-1 max-w-3xl text-sm text-brand-blueink">
+      Keep the domain’s special Classroom Teachers group aligned to one approved staff source.
+      This grants teacher verification; it does not create accounts or classes.
+    </p>
+  </header>
+
+  {% if error %}
+    <div role="alert" class="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">{{ error }}</div>
+  {% endif %}
+  {% if notice %}
+    <div role="status" class="rounded-xl border border-brand-blue/30 bg-brand-mist px-4 py-3 text-sm text-brand-blueink">{{ notice }}</div>
+  {% endif %}
+
+  {% if policy %}
+  <section aria-labelledby="policy-status-heading" class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <p class="eyebrow text-brand-blue">Policy status</p>
+        <h2 id="policy-status-heading" class="mt-1 font-serif text-xl text-brand-black">{{ policy.status|title }}</h2>
+        <p class="mt-1 text-sm text-brand-blueink">
+          {% if policy.source_mode == source_group %}
+            Source group: <span class="font-mono text-xs">{{ policy.source_group }}</span>
+          {% else %}
+            CSV source: {{ "watched export" if policy.csv_mode == csv_watch else "approved upload" }}
+          {% endif %}
+        </p>
+      </div>
+      <dl class="grid grid-cols-2 gap-x-5 gap-y-1 text-sm tabular-nums">
+        <dt class="text-brand-blueink">Last run</dt>
+        <dd class="text-right text-brand-blueink">{{ last_run }}</dd>
+        <dt class="text-brand-blueink">Result</dt>
+        <dd class="text-right text-brand-blueink">{{ policy.last_run_status or "Not yet" }}</dd>
+        <dt class="text-brand-blueink">Next run</dt>
+        <dd class="text-right text-brand-blueink">{{ next_run }}</dd>
+      </dl>
+    </div>
+    {% if policy.last_run_message %}
+      <p class="mt-3 rounded-lg border border-brand-gray/30 bg-paper px-3 py-2 text-sm text-brand-blueink">{{ policy.last_run_message }}</p>
+    {% endif %}
+    <div class="mt-4 flex flex-wrap gap-2">
+      <form method="post" action="/classroom/access/run">
+        <input type="hidden" name="policy_id" value="{{ policy.id }}" />
+        <button type="submit" class="rounded-lg bg-brand-blue px-3.5 py-2 text-sm font-medium text-brand-white hover:bg-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40 disabled:cursor-not-allowed disabled:opacity-50"
+                {% if policy.status != "active" %}disabled aria-describedby="run-disabled-reason"{% endif %}>Run now</button>
+      </form>
+      <form method="post" action="/classroom/access/disable">
+        <input type="hidden" name="policy_id" value="{{ policy.id }}" />
+        <button type="submit" class="rounded-lg border border-brand-gray/60 bg-brand-white px-3.5 py-2 text-sm font-medium text-brand-blueink hover:border-brand-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/30">Disable policy</button>
+      </form>
+      {% if policy.status != "active" %}
+        <p id="run-disabled-reason" class="self-center text-xs text-brand-blueink">Approve the current preview before running.</p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <form method="post" action="/classroom/access/save" enctype="multipart/form-data"
+        class="space-y-5 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
+    <div>
+      <p class="eyebrow text-brand-blue">Setup</p>
+      <h2 class="mt-1 font-serif text-xl text-brand-black">Configure the authoritative source</h2>
+      <p class="mt-1 text-sm text-brand-blueink">Saving always creates a fresh live preview. No membership changes occur until approval.</p>
+    </div>
+
+    <fieldset class="space-y-3">
+      <legend class="text-sm font-semibold text-brand-blueink">1. Confirm the target</legend>
+      <label for="target-group" class="block text-sm text-brand-blueink">Classroom Teachers group email</label>
+      <input id="target-group" name="target_group" type="email" list="workspace-groups" required
+             value="{{ policy.target_group if policy else '' }}"
+             placeholder="classroom_teachers@{{ domain }}"
+             class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <label class="flex items-start gap-2 text-sm text-brand-blueink">
+        <input type="checkbox" name="target_confirmed" value="yes" required
+               class="mt-1 rounded border-brand-gray text-brand-blue focus:ring-brand-blue/30" />
+        <span>I confirm this is the domain’s existing special Classroom Teachers group. GamGUI will never create, rename, or delete it.</span>
+      </label>
+    </fieldset>
+
+    <fieldset class="space-y-3">
+      <legend class="text-sm font-semibold text-brand-blueink">2. Choose one source</legend>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
+          <span class="flex items-center gap-2 font-medium">
+            <input type="radio" name="source_mode" value="{{ source_group }}"
+                   {% if not policy or policy.source_mode == source_group %}checked{% endif %}
+                   onchange="updateSourcePanels()" />
+            Synchronized Google group
+          </span>
+          <span class="mt-1 block text-xs text-brand-blueink">Nest one AD/GCDS-synchronized staff group into Classroom Teachers.</span>
+        </label>
+        <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
+          <span class="flex items-center gap-2 font-medium">
+            <input type="radio" name="source_mode" value="{{ source_csv }}"
+                   {% if policy and policy.source_mode == source_csv %}checked{% endif %}
+                   onchange="updateSourcePanels()" />
+            CSV fallback
+          </span>
+          <span class="mt-1 block text-xs text-brand-blueink">Reconcile active internal users from an approved snapshot or watched export.</span>
+        </label>
+      </div>
+
+      <div id="group-source-panel">
+        <label for="source-group" class="block text-sm text-brand-blueink">Synchronized staff group email</label>
+        <input id="source-group" name="source_group" type="email" list="workspace-groups"
+               value="{{ policy.source_group if policy else '' }}"
+               placeholder="teachers-and-admins@{{ domain }}"
+               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      </div>
+
+      <div id="csv-source-panel" class="space-y-3" hidden>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
+            <span class="flex items-center gap-2 font-medium">
+              <input type="radio" name="csv_mode" value="{{ csv_upload }}"
+                     {% if not policy or policy.csv_mode == csv_upload %}checked{% endif %}
+                     onchange="updateCsvPanels()" />
+              Approved upload
+            </span>
+            <span class="mt-1 block text-xs text-brand-blueink">A replacement upload always requires preview and approval.</span>
+          </label>
+          <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
+            <span class="flex items-center gap-2 font-medium">
+              <input type="radio" name="csv_mode" value="{{ csv_watch }}"
+                     {% if policy and policy.csv_mode == csv_watch %}checked{% endif %}
+                     onchange="updateCsvPanels()" />
+              Watched export
+            </span>
+            <span class="mt-1 block text-xs text-brand-blueink">Read a stable absolute file path during each scheduled run.</span>
+          </label>
+        </div>
+        <div id="csv-upload-panel">
+          <label for="csv-file" class="block text-sm text-brand-blueink">CSV with an <code class="font-mono text-xs">email</code> column</label>
+          <input id="csv-file" name="csv_file" type="file" accept=".csv,text/csv,text/plain"
+                 class="mt-1 block w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-brand-blueink file:mr-3 file:rounded-md file:border-0 file:bg-brand-mist file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-brand-blueink" />
+          {% if policy and policy.csv_emails %}
+            <p class="mt-1 text-xs text-brand-blueink tabular-nums">{{ policy.csv_emails|length }} normalized users are currently stored.</p>
+          {% endif %}
+        </div>
+        <div id="csv-watch-panel" hidden>
+          <label for="watched-path" class="block text-sm text-brand-blueink">Absolute UTF-8 CSV path on this Mac</label>
+          <input id="watched-path" name="watched_path" type="text"
+                 value="{{ policy.watch_path if policy else '' }}"
+                 placeholder="/Users/admin/Exports/classroom-teachers.csv"
+                 class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="grid gap-4 sm:grid-cols-2">
+      <legend class="col-span-full text-sm font-semibold text-brand-blueink">3. Preserve explicit exceptions</legend>
+      <label for="exception-users" class="block text-sm text-brand-blueink">
+        Exception users
+        <textarea id="exception-users" name="exception_users" rows="4" placeholder="principal@{{ domain }}"
+                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">{{ policy.exception_users|join("\n") if policy else "" }}</textarea>
+      </label>
+      <label for="exception-groups" class="block text-sm text-brand-blueink">
+        Exception groups
+        <textarea id="exception-groups" name="exception_groups" rows="4" placeholder="classroom-exceptions@{{ domain }}"
+                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">{{ policy.exception_groups|join("\n") if policy else "" }}</textarea>
+      </label>
+      <p class="col-span-full text-xs text-brand-blueink">One internal email per line. Anything else directly in Classroom Teachers is removed after approval.</p>
+    </fieldset>
+
+    <fieldset class="space-y-3">
+      <legend class="text-sm font-semibold text-brand-blueink">4. Daily background schedule</legend>
+      <label class="flex items-start gap-2 text-sm text-brand-blueink">
+        <input type="checkbox" name="schedule_enabled" value="yes"
+               {% if not policy or policy.schedule_enabled %}checked{% endif %}
+               {% if not schedule_available %}disabled{% endif %}
+               class="mt-1 rounded border-brand-gray text-brand-blue focus:ring-brand-blue/30" />
+        <span>Run while this macOS user is signed in, even when the GamGUI window is closed.</span>
+      </label>
+      {% if not schedule_available %}
+        <p class="text-xs text-amber-800">Background registration can only be installed by the macOS release. Manual preview and Run now remain available here.</p>
+      {% endif %}
+      <div class="flex flex-wrap items-end gap-3">
+        <label for="schedule-hour" class="text-sm text-brand-blueink">Hour
+          <input id="schedule-hour" name="schedule_hour" type="number" min="0" max="23"
+                 value="{{ policy.schedule_hour if policy else 2 }}"
+                 class="mt-1 block w-24 rounded-lg border border-brand-gray/60 px-3 py-2 text-sm tabular-nums focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        </label>
+        <label for="schedule-minute" class="text-sm text-brand-blueink">Minute
+          <input id="schedule-minute" name="schedule_minute" type="number" min="0" max="59"
+                 value="{{ policy.schedule_minute if policy else 0 }}"
+                 class="mt-1 block w-24 rounded-lg border border-brand-gray/60 px-3 py-2 text-sm tabular-nums focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        </label>
+        <span class="pb-2 text-xs text-brand-blueink">Local 24-hour time; default 02:00.</span>
+      </div>
+    </fieldset>
+
+    <datalist id="workspace-groups">
+      {% for group in groups %}
+        <option value="{{ group.email }}">{{ group.name }}</option>
+      {% endfor %}
+    </datalist>
+
+    <button type="submit" class="rounded-lg bg-brand-blue px-4 py-2.5 text-sm font-semibold text-brand-white hover:bg-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40">Save and preview exact membership</button>
+  </form>
+
+  {% if plan %}
+  <section aria-labelledby="plan-heading" class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <p class="eyebrow text-brand-blue">Live preview</p>
+        <h2 id="plan-heading" class="mt-1 font-serif text-xl text-brand-black">{{ plan.status|title }}</h2>
+        {% if plan.hold_reason %}<p class="mt-1 text-sm text-amber-800">{{ plan.hold_reason }}</p>{% endif %}
+        {% if plan.error %}<p class="mt-1 text-sm text-amber-800">{{ plan.error }}</p>{% endif %}
+      </div>
+      <dl class="grid grid-cols-3 gap-3 text-center tabular-nums">
+        <div><dt class="text-xs text-brand-blueink">Add</dt><dd class="font-serif text-xl text-brand-black">{{ plan.adds|length }}</dd></div>
+        <div><dt class="text-xs text-brand-blueink">Remove</dt><dd class="font-serif text-xl text-brand-black">{{ plan.removes|length }}</dd></div>
+        <div><dt class="text-xs text-brand-blueink">Keep</dt><dd class="font-serif text-xl text-brand-black">{{ plan.unchanged|length }}</dd></div>
+      </dl>
+    </div>
+
+    {% if plan.adds or plan.removes %}
+      <div class="mt-4 grid gap-4 sm:grid-cols-2">
+        <div>
+          <h3 class="text-sm font-semibold text-brand-blueink">Add</h3>
+          <ul class="mt-2 max-h-48 overflow-y-auto rounded-lg border border-brand-gray/30 bg-paper p-3 font-mono text-xs text-brand-blueink">
+            {% for email in plan.adds[:100] %}<li class="py-0.5">{{ email }}</li>{% endfor %}
+            {% if plan.adds|length > 100 %}<li class="pt-2 font-sans text-brand-blueink">Plus {{ plan.adds|length - 100 }} more in the persisted manifest.</li>{% endif %}
+          </ul>
+        </div>
+        <div>
+          <h3 class="text-sm font-semibold text-brand-blueink">Remove</h3>
+          <ul class="mt-2 max-h-48 overflow-y-auto rounded-lg border border-brand-gray/30 bg-paper p-3 font-mono text-xs text-brand-blueink">
+            {% for email in plan.removes[:100] %}<li class="py-0.5">{{ email }}</li>{% endfor %}
+            {% if plan.removes|length > 100 %}<li class="pt-2 font-sans text-brand-blueink">Plus {{ plan.removes|length - 100 }} more in the persisted manifest.</li>{% endif %}
+          </ul>
+        </div>
+      </div>
+    {% else %}
+      <p class="mt-4 rounded-lg border border-brand-gray/30 bg-paper px-3 py-2 text-sm text-brand-blueink">No direct membership changes are required.</p>
+    {% endif %}
+
+    {% if plan.status in ("held", "planned", "interrupted") and policy %}
+      <form method="post" action="/classroom/access/approve" class="mt-4">
+        <input type="hidden" name="policy_id" value="{{ policy.id }}" />
+        <input type="hidden" name="plan_id" value="{{ plan.id }}" />
+        <button type="submit" class="rounded-lg bg-brand-blue px-4 py-2.5 text-sm font-semibold text-brand-white hover:bg-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40">
+          {{ "Resume approved plan" if plan.status == "interrupted" else "Approve this exact plan" }}
+        </button>
+      </form>
+    {% endif %}
+  </section>
+  {% endif %}
+</div>
+
+<script>
+  function updateSourcePanels() {
+    var source = document.querySelector('input[name="source_mode"]:checked');
+    var groupPanel = document.getElementById("group-source-panel");
+    var csvPanel = document.getElementById("csv-source-panel");
+    var csvSelected = source && source.value === "{{ source_csv }}";
+    if (groupPanel) groupPanel.hidden = csvSelected;
+    if (csvPanel) csvPanel.hidden = !csvSelected;
+    if (csvSelected) updateCsvPanels();
+  }
+  function updateCsvPanels() {
+    var mode = document.querySelector('input[name="csv_mode"]:checked');
+    var uploadPanel = document.getElementById("csv-upload-panel");
+    var watchPanel = document.getElementById("csv-watch-panel");
+    var watchSelected = mode && mode.value === "{{ csv_watch }}";
+    if (uploadPanel) uploadPanel.hidden = watchSelected;
+    if (watchPanel) watchPanel.hidden = !watchSelected;
+  }
+  updateSourcePanels();
+</script>
+{% endif %}
+{% endblock %}
