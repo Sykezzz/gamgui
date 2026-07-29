@@ -288,7 +288,7 @@ def test_private_fork_discovery_rejects_stale_validated_ref():
     assert GitHubUpdateSource(run=run).discover() is None
 
 
-def test_coordinator_prepares_and_records_canary(tmp_path):
+def test_automatic_update_prepares_without_workspace_canary(tmp_path):
     store = UpdateStateStore(tmp_path / "state.json")
 
     class Source:
@@ -300,13 +300,15 @@ def test_coordinator_prepares_and_records_canary(tmp_path):
             assert candidate.sha == SHA
             return _app_bundle(tmp_path / "GamGUI.app", "candidate")
 
-        def run_canary(self, pending):
-            assert pending.name == "GamGUI.app"
+        def run_canary(self, _pending):
+            raise AssertionError("automatic update checks must not read Workspace credentials")
 
     pending = UpdateCoordinator(store, Source(), Builder()).check_and_prepare()
     state = store.load()
     assert pending == tmp_path / "GamGUI.app"
-    assert state.candidate_sha == SHA and state.canary_result == "passed" and not state.last_error
+    assert state.candidate_sha == SHA
+    assert state.canary_result == ""
+    assert not state.last_error
 
 
 def test_coordinator_fails_closed_when_job_active(tmp_path):
@@ -341,20 +343,18 @@ def test_official_install_never_silently_builds_a_local_update(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("active_states", "canary_called"),
+    "active_states",
     [
-        ([False, False, True], False),
-        ([False, False, False, True], True),
+        [False, True],
+        [False, False, True],
     ],
 )
-def test_coordinator_rechecks_active_jobs_before_canary_and_publish(
+def test_coordinator_rechecks_active_jobs_before_prepare_and_publish(
     tmp_path,
     active_states,
-    canary_called,
 ):
     store = UpdateStateStore(tmp_path / "state.json")
     states = iter(active_states)
-    calls = []
 
     class Source:
         def discover(self, *_args):
@@ -364,9 +364,6 @@ def test_coordinator_rechecks_active_jobs_before_canary_and_publish(
         def prepare(self, _candidate):
             return _app_bundle(tmp_path / "GamGUI.app", "candidate")
 
-        def run_canary(self, _pending):
-            calls.append("canary")
-
     coordinator = UpdateCoordinator(
         store,
         Source(),
@@ -375,7 +372,6 @@ def test_coordinator_rechecks_active_jobs_before_canary_and_publish(
     )
     assert coordinator.check_and_prepare() is None
     state = store.load()
-    assert bool(calls) is canary_called
     assert not state.candidate_sha and not state.pending_app
     assert "became active" in state.last_error
 
@@ -1056,25 +1052,13 @@ def test_state_failure_during_rollback_still_relaunches_previous_app(tmp_path):
     assert launches[-1][1]["GAMGUI_SKIP_UPDATE_ONCE"] == "1"
 
 
-@pytest.mark.parametrize(
-    "state",
-    [
-        UpdateState(
-            candidate_sha=SHA,
-            canary_result="passed",
-            required_check_evidence=[],
-        ),
-        UpdateState(
-            candidate_sha=SHA,
-            canary_result="failed",
-            required_check_evidence=["update-ready"],
-        ),
-    ],
-)
-def test_installer_rejects_staged_state_without_both_activation_evidences(
+def test_installer_rejects_staged_state_without_required_update_evidence(
     tmp_path,
-    state,
 ):
+    state = UpdateState(
+        candidate_sha=SHA,
+        required_check_evidence=[],
+    )
     root = tmp_path / "data" / "updates"
     data_root = tmp_path / "data"
     current = _app_bundle(tmp_path / "Applications" / "GamGUI.app", "old")
@@ -1094,7 +1078,7 @@ def test_installer_rejects_staged_state_without_both_activation_evidences(
     assert (current / "Contents" / "MacOS" / "GamGUI").read_text() == "old"
     blocked = store.load()
     assert f"sha:{SHA}" in blocked.profile_blocklists[CORE_PROFILE]
-    assert "required CI or canary evidence" in blocked.last_error
+    assert "required update evidence" in blocked.last_error
 
 
 def test_installer_restores_old_app_when_atomic_exchange_fails(monkeypatch, tmp_path):

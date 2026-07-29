@@ -27,11 +27,12 @@ canary, pilot, or mutation.** The approval must identify the Workspace tenant, t
 subject (when applicable), the exact scopes or operation, the target set, and the approved window.
 A read-only canary is still a live Google-side action and is included in this gate.
 
-For an installed app, sign-off may explicitly authorize the recurring four-probe read-only canary
-used for validated updates. Without that standing approval, do not complete the canary
-configuration or run the local updater. An approval for setup or canary reads does not authorize
-Classroom roster changes, Drive ownership/sharing changes, or any other mutation; obtain a separate
-mutation or bounded-pilot approval.
+For an installed app, sign-off may explicitly authorize the four-probe read-only canary for manual
+acceptance or a user-initiated verified-file update. The automatic startup updater does not run that
+canary or read Workspace credentials. Without that standing approval, do not complete the canary
+configuration or initiate a verified-file update. An approval for setup or canary reads does not
+authorize Classroom roster changes, Drive ownership/sharing changes, or any other mutation; obtain a
+separate mutation or bounded-pilot approval.
 
 ## Status
 
@@ -64,8 +65,8 @@ Actively developed and used against live Google Workspace tenants. Working today
 - **Reports and audit** — 2SV gaps, inactive or suspended accounts, admins, missing recovery,
   storage/mail usage, directory completeness, and an incrementally indexed local audit trail.
 - **Local updater** — on an installed macOS app, prepares only an exact `district-main` commit that
-  has the `update-ready` check, runs bundle/self-tests plus the approved bounded canary, and rolls
-  back the app and local databases if activation health fails.
+  has the `update-ready` check, verifies the sealed signed bundle and its self-test without reading
+  Workspace credentials, and rolls back the app and local databases if activation health fails.
 
 You build and run it yourself; it is not yet notarized for distribution to other Macs.
 
@@ -277,7 +278,8 @@ This is the handoff order for a new administrator. Do not skip the approval chec
    Changing these scopes or any Admin Console policy requires the recorded sign-off from step 2.
 5. **Verify setup.** Click **Verify access**. GamGUI first verifies GAM's existing service-account
    authorization, then checks those six feature scopes. A passing verification activates the
-   connector and stores the approved canary subject locally for updater use.
+   connector and stores the approved canary subject locally for manual acceptance or a
+   user-initiated verified-file update.
 6. **Approve and run the live acceptance pass.** A live canary requires explicit sign-off even
    though it is read-only:
 
@@ -430,9 +432,9 @@ development server does not self-update.
    selected profile. It never falls back from `classroom-oneroster` to `core` because one profile
    failed validation. It requires the local `GamGUI Local` signing identity, verifies the signature,
    and runs the bundled self-test.
-4. It runs the four bounded, read-only canary probes in a disposable app-data directory. Only
-   timing/status evidence is copied to the live updater state. This step contacts Google and
-   requires prior administrator approval for the configured canary subject.
+4. Exact-SHA CI, the sealed artifact identity, local signing verification, and the bundled offline
+   self-test establish automatic-update readiness. The automatic startup path does not run the live
+   Workspace canary or read Keychain credentials.
 5. A passing build is staged while the current app keeps running. On the next launch, a helper
    snapshots the current app and all local SQLite databases, tests schema preparation on a copy,
    swaps the bundle, and requires a startup health marker within 45 seconds.
@@ -440,10 +442,12 @@ development server does not self-update.
    the prior app and database snapshot, relaunches the old app, and blocklists that SHA. Successful
    activation keeps at most two rollback backups, and backups older than 30 days are pruned.
 
-Network, toolchain, signing, or canary preparation failures leave the installed version untouched
+Network, toolchain, signing, or self-test preparation failures leave the installed version untouched
 and are retryable; they do not blocklist the SHA. The app shows only a generic local notice, not
-paths, commands, or tenant data. The updater never changes OAuth/DWD scopes, Admin Console policy,
-or tenant data, and it never treats a missing/failed canary as approval to proceed.
+paths, commands, or tenant data. A user-initiated verified-file update separately runs the four
+bounded, read-only canary probes in a disposable app-data directory and requires prior administrator
+approval for the configured canary subject. The updater never changes OAuth/DWD scopes, Admin Console
+policy, or tenant data, and it never treats a missing/failed required canary as approval to proceed.
 
 ### Tests & CI
 

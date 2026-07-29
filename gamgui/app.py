@@ -312,7 +312,7 @@ def _handoff_pending_update() -> bool:
         if not recovering and not activation_evidence_valid(state):
             coordinator.block(
                 state.candidate_sha,
-                "The staged update lacked required CI or canary evidence; "
+                "The staged update lacked required update evidence; "
                 "the current version was kept.",
             )
             return False

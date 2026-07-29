@@ -205,11 +205,12 @@ def test_pending_update_hands_off_exact_staged_state(monkeypatch, tmp_path):
     monkeypatch.setenv("GAMGUI_APP_DATA_DIR", str(data_root))
     monkeypatch.setattr("gamgui.app.sys.platform", "darwin")
     monkeypatch.setattr("gamgui.app.installed_app_path", lambda: current)
+    monkeypatch.setattr("gamgui.app._activation_must_defer", lambda: False)
     UpdateStateStore().save(
         UpdateState(
             candidate_sha="a" * 40,
             pending_app=str(pending),
-            canary_result="passed",
+            canary_result="",
             required_check_evidence=["update-ready"],
             activation_kind=ACTIVATION_APP_UPDATE,
             candidate_artifact=ComponentArtifactId(
@@ -515,5 +516,5 @@ def test_pending_update_without_activation_evidence_is_blocked(monkeypatch, tmp_
     assert not _handoff_pending_update()
     state = UpdateStateStore().load()
     assert sha in state.blocked_shas
-    assert "CI or canary evidence" in state.last_error
+    assert "required update evidence" in state.last_error
     assert launched == []

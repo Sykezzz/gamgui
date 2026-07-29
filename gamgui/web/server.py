@@ -72,6 +72,7 @@ from ..core.drive import (
 from ..core.secrets.ephemeral import sweep_stale_configs
 from ..core.secrets.vault import InMemoryBackend, SecretsVault
 from ..core.updater import (
+    ACTIVATION_APP_UPDATE,
     ACTIVATION_PROBE_ENV,
     ACTIVATION_TRANSACTION_ENV,
     UpdateStateStore,
@@ -272,7 +273,14 @@ class AppState:
             or embedded.artifact.source_sha != expected_sha
             or state.candidate_sha != expected_sha
             or not marker_matches
-            or state.canary_result != "passed"
+            or (
+                state.activation_kind == ACTIVATION_APP_UPDATE
+                and not activation_evidence_valid(state)
+            )
+            or (
+                not state.activation_kind
+                and state.canary_result != "passed"
+            )
             or "update-ready" not in state.required_check_evidence
             or candidate_is_blocked(state)
         ):
