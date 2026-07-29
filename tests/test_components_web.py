@@ -181,6 +181,27 @@ def test_first_run_skip_is_not_rendered_again():
     assert ("skip",) in manager.calls
 
 
+def test_staged_update_requires_restart_instead_of_first_run_skip():
+    manager = FakeComponentManager()
+    manager.data.update(
+        state="update_available",
+        installed=True,
+        enabled=True,
+        first_run_pending=False,
+        restart_required=True,
+    )
+
+    response = _client(manager).get("/components/status", params={"context": "setup"})
+
+    assert response.status_code == 200
+    assert (
+        "Quit GamGUI normally, then reopen it to apply the verified update"
+        in response.text
+    )
+    assert "Continue setup" not in response.text
+    assert not any(call[0] == "skip" for call in manager.calls)
+
+
 def test_component_change_refuses_active_admin_job_server_side():
     manager = FakeComponentManager()
     response = _client(manager, active=True).post(

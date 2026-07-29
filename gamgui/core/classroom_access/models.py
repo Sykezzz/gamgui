@@ -36,6 +36,7 @@ class EntitlementPolicy:
     target_group: str
     source_mode: str
     source_group: str = ""
+    source_groups: Tuple[str, ...] = ()
     csv_mode: str = CSVMode.UPLOAD.value
     csv_emails: Tuple[str, ...] = ()
     watch_path: str = ""
@@ -56,17 +57,38 @@ class EntitlementPolicy:
     updated_at: float = 0.0
 
     @property
+    def effective_source_groups(self) -> Tuple[str, ...]:
+        """Return the canonical plural source while preserving legacy policies."""
+
+        values = self.source_groups
+        if not values and self.source_group:
+            values = (self.source_group,)
+        return tuple(
+            sorted(
+                {
+                    normalize_email(str(value))
+                    for value in values
+                    if normalize_email(str(value))
+                }
+            )
+        )
+
+    @property
     def configuration_hash(self) -> str:
         csv_identity: Iterable[str]
         if self.source_mode == SourceMode.CSV.value and self.csv_mode == CSVMode.UPLOAD.value:
             csv_identity = self.csv_emails
         else:
             csv_identity = ()
+        source_groups = self.effective_source_groups
         payload = {
             "domain": self.domain,
             "target_group": self.target_group,
             "source_mode": self.source_mode,
-            "source_group": self.source_group,
+            # Preserve the original singleton payload so existing approvals and
+            # restart-safe manifests do not become stale merely because the
+            # persisted policy gained a plural representation.
+            "source_group": source_groups[0] if len(source_groups) == 1 else "",
             "csv_mode": self.csv_mode,
             "csv_emails": list(csv_identity),
             "watch_path": self.watch_path,
@@ -77,6 +99,8 @@ class EntitlementPolicy:
             "schedule_hour": self.schedule_hour,
             "schedule_minute": self.schedule_minute,
         }
+        if len(source_groups) > 1:
+            payload["source_groups"] = list(source_groups)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

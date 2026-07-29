@@ -2,6 +2,10 @@
 {% block title %}Components — GamGUI Console{% endblock %}
 {% block content %}
 <div class="space-y-8">
+  {% if deep_link %}
+    {% set classroom_section = "imports" %}
+    {% include "_classroom_subnav.html" %}
+  {% endif %}
   <header>
     {% if deep_link %}
     <p class="eyebrow text-brand-blue">Classroom / OneRoster</p>

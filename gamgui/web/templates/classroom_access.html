@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Classroom teacher access — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
 {% block content %}
+{% set classroom_section = "access" %}
+{% include "_classroom_subnav.html" %}
 {% if not connected %}
   <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
     <p class="eyebrow text-brand-blue">Not connected</p>
@@ -14,7 +17,7 @@
     <p class="eyebrow text-brand-blue">Classroom entitlement</p>
     <h1 class="font-serif text-2xl tracking-tight text-brand-black">Classroom teacher access</h1>
     <p class="mt-1 max-w-3xl text-sm text-brand-blueink">
-      Keep the domain’s special Classroom Teachers group aligned to one approved staff source.
+      Keep the domain’s special Classroom Teachers group aligned to approved staff sources.
       This grants teacher verification; it does not create accounts or classes.
     </p>
   </header>
@@ -34,7 +37,9 @@
         <h2 id="policy-status-heading" class="mt-1 font-serif text-xl text-brand-black">{{ policy.status|title }}</h2>
         <p class="mt-1 text-sm text-brand-blueink">
           {% if policy.source_mode == source_group %}
-            Source group: <span class="font-mono text-xs">{{ policy.source_group }}</span>
+            Source groups:
+            <span class="tabular-nums">{{ policy.effective_source_groups|length }}</span>
+            <span class="mt-1 block font-mono text-xs">{{ policy.effective_source_groups|join(", ") }}</span>
           {% else %}
             CSV source: {{ "watched export" if policy.csv_mode == csv_watch else "approved upload" }}
           {% endif %}
@@ -92,16 +97,16 @@
     </fieldset>
 
     <fieldset class="space-y-3">
-      <legend class="text-sm font-semibold text-brand-blueink">2. Choose one source</legend>
+      <legend class="text-sm font-semibold text-brand-blueink">2. Choose one source type</legend>
       <div class="grid gap-3 sm:grid-cols-2">
         <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
           <span class="flex items-center gap-2 font-medium">
             <input type="radio" name="source_mode" value="{{ source_group }}"
                    {% if not policy or policy.source_mode == source_group %}checked{% endif %}
                    onchange="updateSourcePanels()" />
-            Synchronized Google group
+            Synchronized Google groups
           </span>
-          <span class="mt-1 block text-xs text-brand-blueink">Nest one AD/GCDS-synchronized staff group into Classroom Teachers.</span>
+          <span class="mt-1 block text-xs text-brand-blueink">Nest each AD/GCDS-synchronized staff group into Classroom Teachers. Their effective membership is combined by Google.</span>
         </label>
         <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
           <span class="flex items-center gap-2 font-medium">
@@ -115,11 +120,11 @@
       </div>
 
       <div id="group-source-panel">
-        <label for="source-group" class="block text-sm text-brand-blueink">Synchronized staff group email</label>
-        <input id="source-group" name="source_group" type="email" list="workspace-groups"
-               value="{{ policy.source_group if policy else '' }}"
-               placeholder="teachers-and-admins@{{ domain }}"
-               class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        <label for="source-groups" class="block text-sm text-brand-blueink">Synchronized staff group emails</label>
+        <textarea id="source-groups" name="source_groups" rows="4"
+                  placeholder="teachers@{{ domain }}&#10;administrators@{{ domain }}"
+                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">{{ policy.effective_source_groups|join("\n") if policy else "" }}</textarea>
+        <p class="mt-1 text-xs text-brand-blueink">One internal Google group per line. The exact direct target roster will contain these groups plus approved exceptions.</p>
       </div>
 
       <div id="csv-source-panel" class="space-y-3" hidden>
