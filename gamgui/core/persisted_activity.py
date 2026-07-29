@@ -2,7 +2,7 @@
 
 The application updater must not activate a different bundle while a previous
 process may still be mutating Workspace state.  This module inspects only the
-three allowlisted operation databases that already exist.  It never creates an
+allowlisted operation databases that already exist.  It never creates an
 absent store, never exposes tenant or target identifiers, and only recovers a
 row when the process helper proves that its lease owner is dead (or its PID was
 definitely reused).
@@ -22,6 +22,7 @@ from typing import Callable, Optional
 from .processes import process_lease_is_dead
 
 CLASSROOM_ROSTER_ACTIVITY = "classroom-roster"
+CLASSROOM_TEACHER_ENTITLEMENT_ACTIVITY = "classroom-teacher-entitlement"
 DRIVE_OWNERSHIP_ACTIVITY = "drive-ownership"
 ONEROSTER_IMPORT_ACTIVITY = "oneroster-import"
 
@@ -77,6 +78,25 @@ _STORES = (
         frozenset(
             {
                 "planned",
+                "running",
+                "completed",
+                "partial",
+                "failed",
+                "stale",
+                "interrupted",
+            }
+        ),
+    ),
+    _StoreSpec(
+        ("classroom_teacher_entitlements.db",),
+        "entitlement_plans",
+        CLASSROOM_TEACHER_ENTITLEMENT_ACTIVITY,
+        frozenset({"id", "status", "error", "updated_at"}),
+        frozenset(
+            {
+                "held",
+                "planned",
+                "approved",
                 "running",
                 "completed",
                 "partial",
@@ -302,14 +322,22 @@ def _recover_row(
     owner = str(row["run_owner"])
     pid = int(row["run_pid"])
     identity = str(row["run_identity"])
-    if spec.kind == CLASSROOM_ROSTER_ACTIVITY:
+    if spec.kind in {
+        CLASSROOM_ROSTER_ACTIVITY,
+        CLASSROOM_TEACHER_ENTITLEMENT_ACTIVITY,
+    }:
+        table = (
+            "roster_manifests"
+            if spec.kind == CLASSROOM_ROSTER_ACTIVITY
+            else "entitlement_plans"
+        )
         result = connection.execute(
-            """
-            UPDATE roster_manifests
+            f"""
+            UPDATE "{table}"
             SET status = 'interrupted',
                 error = CASE
                     WHEN error = ''
-                    THEN 'The app stopped before this roster operation finished.'
+                    THEN 'The app stopped before this administrative operation finished.'
                     ELSE error
                 END,
                 updated_at = ?, run_owner = '', run_pid = 0, run_identity = ''

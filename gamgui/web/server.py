@@ -39,6 +39,12 @@ from ..core.classroom.manifests import (
     default_roster_manifest_path,
 )
 from ..core.classroom.service import ClassroomService
+from ..core.classroom_access import (
+    EntitlementService,
+    EntitlementStore,
+    LaunchAgentManager,
+    default_entitlement_store_path,
+)
 from ..core.connectors.gam_connector import GAMConnector
 from ..core.components import (
     CORE_PROFILE,
@@ -119,6 +125,9 @@ class AppState:
     classroom_refresh_error: str = ""
     classroom_manifest_tasks: dict = field(default_factory=dict, repr=False)
     classroom_manifest_errors: dict = field(default_factory=dict, repr=False)
+    entitlement_store: Optional[EntitlementStore] = None
+    entitlement_service: Optional[EntitlementService] = None
+    entitlement_scheduler: Optional[LaunchAgentManager] = None
     drive_service: Optional[DriveService] = None
     component_manager: Optional[ComponentManager] = None
     oneroster_service: object = None
@@ -618,6 +627,17 @@ class AppState:
                 new_classroom_index,
                 new_classroom_manifests,
             )
+            new_entitlement_store = self.entitlement_store or EntitlementStore(
+                base_dir / "classroom_teacher_entitlements.db"
+                if base_dir is not None
+                else default_entitlement_store_path()
+            )
+            new_entitlement_service = EntitlementService(
+                connector, domain, new_entitlement_store
+            )
+            new_entitlement_scheduler = (
+                self.entitlement_scheduler or LaunchAgentManager()
+            )
             operations = DriveOperationStore(
                 base_dir / "drive_operations.db" if base_dir is not None else None
             )
@@ -649,6 +669,9 @@ class AppState:
             self.classroom_index,
             self.classroom_manifests,
             self.classroom_service,
+            self.entitlement_store,
+            self.entitlement_service,
+            self.entitlement_scheduler,
             self.drive_service,
         ) = (
             connector,
@@ -657,6 +680,9 @@ class AppState:
             new_classroom_index,
             new_classroom_manifests,
             new_classroom_service,
+            new_entitlement_store,
+            new_entitlement_service,
+            new_entitlement_scheduler,
             new_drive_service,
         )
         self.user_cache = UserCache()
@@ -718,6 +744,7 @@ class AppState:
                 return True
         stores = (
             self.classroom_manifests,
+            self.entitlement_store,
             getattr(self.drive_service, "operations", None),
             getattr(self.oneroster_service, "store", None),
         )
@@ -757,6 +784,22 @@ class AppState:
                 self.classroom_index,
                 self.classroom_manifests,
             )
+        if self.entitlement_store is None:
+            self.entitlement_store = EntitlementStore(
+                base_dir / "classroom_teacher_entitlements.db"
+                if base_dir is not None
+                else default_entitlement_store_path()
+            )
+        if (
+            self.entitlement_service is None
+            or self.entitlement_service.connector is not connector
+            or self.entitlement_service.domain != domain
+        ):
+            self.entitlement_service = EntitlementService(
+                connector, domain, self.entitlement_store
+            )
+        if self.entitlement_scheduler is None:
+            self.entitlement_scheduler = LaunchAgentManager()
         if self.drive_service is None or self.drive_service.domain != domain:
             operations = DriveOperationStore(
                 base_dir / "drive_operations.db" if base_dir is not None else None
@@ -1158,6 +1201,11 @@ def create_app(state: AppState) -> FastAPI:
         path="/classroom/imports/upload",
         maximum_bytes=(250 * 1024 * 1024) + (1024 * 1024),
     )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        path="/classroom/access/save",
+        maximum_bytes=11 * 1024 * 1024,
+    )
     app.add_middleware(PrivacyTimingMiddleware)
     app.add_middleware(ActivationProbeGateMiddleware, state=state)
     app.add_middleware(TokenGateMiddleware, token=state.token)
@@ -1218,6 +1266,7 @@ def create_app(state: AppState) -> FastAPI:
     from .routes.builder import router as builder_router
     from .routes.calendars import router as calendars_router
     from .routes.classroom import router as classroom_router
+    from .routes.classroom_access import router as classroom_access_router
     from .routes.components import (
         core_deep_link_router,
         router as components_router,
@@ -1238,6 +1287,7 @@ def create_app(state: AppState) -> FastAPI:
     app.include_router(signatures_router)
     app.include_router(calendars_router)
     app.include_router(classroom_router)
+    app.include_router(classroom_access_router)
     app.include_router(components_router)
     if state.embedded_profile() == ONEROSTER_PROFILE:
         try:

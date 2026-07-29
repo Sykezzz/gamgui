@@ -9,6 +9,7 @@ import pytest
 from gamgui.core import persisted_activity as persisted_activity_module
 from gamgui.core.persisted_activity import (
     CLASSROOM_ROSTER_ACTIVITY,
+    CLASSROOM_TEACHER_ENTITLEMENT_ACTIVITY,
     DRIVE_OWNERSHIP_ACTIVITY,
     ONEROSTER_IMPORT_ACTIVITY,
     inspect_persisted_operations,
@@ -77,6 +78,35 @@ def test_preflight_does_not_create_absent_operation_databases(tmp_path: Path) ->
     assert result.may_activate
     assert not result.kinds
     assert not root.exists()
+
+
+def test_preflight_recovers_dead_entitlement_executor(tmp_path: Path) -> None:
+    store = tmp_path / "classroom_teacher_entitlements.db"
+    _write_database(
+        store,
+        """
+        CREATE TABLE entitlement_plans (
+            id TEXT PRIMARY KEY, status TEXT NOT NULL, error TEXT NOT NULL,
+            updated_at REAL NOT NULL, run_owner TEXT NOT NULL,
+            run_pid INTEGER NOT NULL, run_identity TEXT NOT NULL
+        );
+        INSERT INTO entitlement_plans
+        VALUES ('private-policy-plan', 'running', '', 1, 'owner-e', 999, 'start-e');
+        """,
+    )
+
+    result = inspect_persisted_operations(
+        tmp_path,
+        lease_is_dead=lambda pid, identity: (pid, identity) == (999, "start-e"),
+    )
+
+    assert result.recovered_kinds == (CLASSROOM_TEACHER_ENTITLEMENT_ACTIVITY,)
+    with sqlite3.connect(store) as connection:
+        status, error = connection.execute(
+            "SELECT status, error FROM entitlement_plans"
+        ).fetchone()
+    assert status == "interrupted"
+    assert "administrative operation" in error
 
 
 def test_preflight_recovers_only_definitely_dead_leases_and_defers_once(
