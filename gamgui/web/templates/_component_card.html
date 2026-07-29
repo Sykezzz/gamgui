@@ -86,6 +86,8 @@
         <input type="hidden" name="context" value="setup" />
         <button type="submit" class="inline-flex rounded-lg border border-brand-gray/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Keep disabled</button>
       </form>
+      {% elif component.restart_required and not component.first_run_pending %}
+      <p class="text-sm text-brand-blueink">Quit GamGUI normally, then reopen it to apply the verified update. Your existing OneRoster configuration and retained data will be preserved.</p>
       {% else %}
       <form hx-post="/components/oneroster/skip" hx-target="#component-card-oneroster" hx-swap="outerHTML">
         <input type="hidden" name="context" value="setup" />
