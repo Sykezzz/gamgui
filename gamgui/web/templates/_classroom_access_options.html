@@ -1,0 +1,22 @@
+{% if error %}
+<p class="px-3 py-2 text-sm text-amber-800">{{ error }}</p>
+{% elif items %}
+  {% for value, label in items %}
+  <button type="button"
+          class="access-picker-option block w-full cursor-pointer px-3 py-2 text-left hover:bg-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-blue/40"
+          role="option"
+          data-value="{{ value }}">
+    <span class="block truncate font-mono text-sm text-brand-black">{{ value }}</span>
+    {% if label and label != value %}
+      <span class="block truncate text-xs text-brand-blueink">{{ label }}</span>
+    {% endif %}
+  </button>
+  {% endfor %}
+  {% if more %}
+  <p class="px-3 py-2 text-xs text-brand-blueink">
+    Showing the first {{ items|length }} of {{ total }}. Keep typing to narrow the list.
+  </p>
+  {% endif %}
+{% else %}
+<p class="px-3 py-2 text-sm text-brand-blueink">No matches.</p>
+{% endif %}

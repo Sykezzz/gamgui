@@ -7,6 +7,7 @@ from .models import (
     PolicyStatus,
     SourceMode,
     parse_email_lines,
+    parse_org_unit_lines,
 )
 from .scheduler import LaunchAgentManager
 from .service import EntitlementService, EntitlementValidationError
@@ -24,4 +25,5 @@ __all__ = [
     "SourceMode",
     "default_entitlement_store_path",
     "parse_email_lines",
+    "parse_org_unit_lines",
 ]

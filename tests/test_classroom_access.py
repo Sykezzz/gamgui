@@ -54,12 +54,16 @@ class _Connector:
             ],
         }
         self.users = {
-            email: GAMUser(email, suspended=suspended)
-            for email, suspended in (
-                ("teacher@example.org", False),
-                ("admin@example.org", False),
-                ("old@example.org", False),
-                ("suspended@example.org", True),
+            email: GAMUser(
+                email,
+                suspended=suspended,
+                org_unit_path=org_unit_path,
+            )
+            for email, suspended, org_unit_path in (
+                ("teacher@example.org", False, "/Staff/Teachers"),
+                ("admin@example.org", False, "/Staff/Administrators"),
+                ("old@example.org", False, "/Former Staff"),
+                ("suspended@example.org", True, "/Staff/Teachers"),
             )
         }
         self.calls = []
@@ -194,6 +198,7 @@ def test_store_migrates_legacy_single_source_policy(tmp_path):
             row[1] for row in conn.execute("PRAGMA table_info(entitlement_policies)")
         }
     assert "source_groups_json" in columns
+    assert "source_org_units_json" in columns
 
 
 def test_source_groups_are_normalized_persisted_and_order_independent(tmp_path):
@@ -241,6 +246,33 @@ def test_singleton_plural_source_preserves_legacy_configuration_hash():
     )
 
     assert plural.configuration_hash == legacy.configuration_hash
+
+
+def test_source_org_units_are_normalized_persisted_and_order_independent(tmp_path):
+    store = _store(tmp_path)
+    policy = store.save_policy(
+        EntitlementPolicy(
+            id="",
+            domain="example.org",
+            target_group="classroom_teachers@example.org",
+            source_mode=SourceMode.GOOGLE_GROUP.value,
+            source_org_units=(
+                "Staff/Teachers/",
+                "/Staff/Administrators",
+                "/Staff/Teachers",
+            ),
+        )
+    )
+
+    assert policy.source_org_units == (
+        "/Staff/Administrators",
+        "/Staff/Teachers",
+    )
+    assert EntitlementStore(store.path).get_policy(policy.id) == policy
+    assert replace(
+        policy,
+        source_org_units=tuple(reversed(policy.source_org_units)),
+    ).configuration_hash == policy.configuration_hash
 
 
 @pytest.mark.asyncio
@@ -292,6 +324,61 @@ async def test_group_source_plans_exact_direct_membership_and_requires_approval(
     )
     assert plan.removes == ("old@example.org",)
     assert "Review and approve" in plan.hold_reason
+
+
+@pytest.mark.asyncio
+async def test_ou_source_includes_active_users_in_selected_ou_and_children(tmp_path):
+    connector = _Connector()
+    store = _store(tmp_path)
+    policy = store.save_policy(
+        EntitlementPolicy(
+            id="",
+            domain="example.org",
+            target_group="classroom_teachers@example.org",
+            source_mode=SourceMode.GOOGLE_GROUP.value,
+            source_org_units=("/Staff",),
+        )
+    )
+
+    plan = await EntitlementService(connector, "example.org", store).plan(
+        policy, approval_required=True
+    )
+
+    assert plan.source_emails == (
+        "admin@example.org",
+        "teacher@example.org",
+    )
+    assert plan.adds == (
+        "admin@example.org",
+        "teacher@example.org",
+    )
+    assert plan.removes == ("old@example.org",)
+    assert "suspended@example.org" not in plan.desired
+
+
+@pytest.mark.asyncio
+async def test_approved_ou_plan_rejects_membership_drift(tmp_path):
+    connector = _Connector()
+    store = _store(tmp_path)
+    policy = store.save_policy(
+        EntitlementPolicy(
+            id="",
+            domain="example.org",
+            target_group="classroom_teachers@example.org",
+            source_mode=SourceMode.GOOGLE_GROUP.value,
+            source_org_units=("/Staff/Teachers",),
+        )
+    )
+    service = EntitlementService(connector, "example.org", store)
+    plan = await service.plan(policy, approval_required=True)
+    assert store.approve_plan(plan.id)
+    connector.users["teacher@example.org"].org_unit_path = "/Students"
+
+    with pytest.raises(ValueError, match="live membership changed after preview"):
+        await service.apply(plan.id)
+
+    assert connector.calls == []
+    assert store.get_plan(plan.id).status == "stale"
 
 
 @pytest.mark.asyncio

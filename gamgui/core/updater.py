@@ -365,7 +365,7 @@ class UpdateState:
 
 
 def activation_evidence_valid(state: UpdateState) -> bool:
-    """Return whether a staged bundle has both exact-SHA CI and canary evidence."""
+    """Return whether a staged bundle has the required update evidence."""
 
     if state.activation_kind == ACTIVATION_COMPONENT_SWAP:
         return (
@@ -390,7 +390,6 @@ def activation_evidence_valid(state: UpdateState) -> bool:
         )
     return (
         state.activation_kind == ACTIVATION_APP_UPDATE
-        and state.canary_result == "passed"
         and READY_CHECK in state.required_check_evidence
         and state.candidate_artifact is not None
         and state.candidate_artifact.profile == state.desired_profile
@@ -1164,7 +1163,7 @@ class LocalUpdateBuilder:
 
 
 class UpdateCoordinator:
-    """Coordinate discovery, staging, canary, blocklisting, and backup retention."""
+    """Coordinate update discovery, offline staging, blocklisting, and backup retention."""
 
     def __init__(
         self,
@@ -1194,7 +1193,7 @@ class UpdateCoordinator:
                 return existing
             self.block(
                 state.candidate_sha,
-                "The staged update lacked required CI or canary evidence.",
+                "The staged update lacked required update evidence.",
             )
             return None
         candidate: Optional[UpdateCandidate] = None
@@ -1239,13 +1238,14 @@ class UpdateCoordinator:
                     "The built application did not match the validated candidate SHA.",
                 )
             if self.active_jobs():
-                raise RuntimeError("An administrative operation became active; the update canary was deferred.")
-            self.builder.run_canary(pending)
-            if self.active_jobs():
                 raise RuntimeError("An administrative operation became active; update activation was deferred.")
             state.candidate_sha = candidate.sha
             state.pending_app = str(pending)
-            state.canary_result = "passed"
+            # Exact-SHA CI, sealed artifact identity, and the staged bundle's
+            # offline self-test establish automatic-update readiness. A live
+            # Workspace canary would prompt for Keychain access during startup,
+            # so it remains only on the user-initiated verified-file path.
+            state.canary_result = ""
             state.required_check_evidence = list(candidate.successful_checks)
             state.desired_profile = profile
             state.desired_components = list(component_ids_for_profile(profile))
@@ -1266,7 +1266,7 @@ class UpdateCoordinator:
             return None
         except Exception as exc:
             # Preparation failures can be environmental or transient (network, toolchain,
-            # certificate, or read-only canary). Only a failed activation/rollback blocklists a
+            # certificate, or offline self-test). Only a failed activation/rollback blocklists a
             # SHA; otherwise the same validated commit may be retried after the environment is
             # repaired.
             state.last_error = str(exc)
@@ -2370,7 +2370,7 @@ class LocalUpdateInstaller:
         if sha in _blocked_shas_for_profile(state, profile):
             raise ValueError("The candidate SHA is blocked.")
         if not activation_evidence_valid(state):
-            raise ValueError("The candidate lacks required CI or canary evidence.")
+            raise ValueError("The candidate lacks required update evidence.")
         _require_within(pending_app, self.root)
         if not pending_app.is_dir() or not (pending_app / "Contents" / "MacOS" / "GamGUI").is_file():
             raise ValueError("The staged application bundle is incomplete.")

@@ -31,6 +31,7 @@ from .core.paths import APP_DATA_ENV, app_data_dir
 from .core.persisted_activity import inspect_persisted_operations
 from .core.secrets.ephemeral import sweep_stale_configs, wipe_live_configs
 from .core.updater import (
+    ACTIVATION_APP_UPDATE,
     ACTIVATION_RECOVERY_ENV,
     ACTIVATION_PROBE_ENV,
     LocalUpdateInstaller,
@@ -52,6 +53,7 @@ from .web.server import AppState, create_app
 # cancelled, the `with EphemeralConfig(...)` block unwinds and the dir is wiped. Long enough for a
 # quick call to finish, short enough that quitting still feels instant.
 _GRACEFUL_SHUTDOWN_SECONDS = 3
+_UPDATE_CONFIRM_TIMEOUT_SECONDS = 5 * 60
 
 
 def _free_loopback_port() -> int:
@@ -214,6 +216,38 @@ def _allow_window_close(
     return False
 
 
+def _confirm_automatic_update(state) -> bool:
+    """Explain an automatic app activation before the launcher exits."""
+
+    if getattr(state, "activation_kind", "") != ACTIVATION_APP_UPDATE:
+        return True
+    artifact = getattr(state, "candidate_artifact", None)
+    version = str(getattr(artifact, "version", "") or "").strip()
+    script = """
+on run argv
+    set candidateVersion to item 1 of argv
+    set versionText to ""
+    if candidateVersion is not "" then set versionText to " " & candidateVersion
+    display dialog "GamGUI" & versionText & " is ready to install." & return & return & "GamGUI will close, verify the update in the background, and reopen automatically. Your Workspace data will not be changed during this check." with title "GamGUI update ready" buttons {"Not now", "Install and restart"} default button "Install and restart" cancel button "Not now" with icon note
+    return button returned of result
+end run
+""".strip()
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/osascript", "-e", script, "--", version],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_UPDATE_CONFIRM_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (
+        completed.returncode == 0
+        and completed.stdout.strip() == "Install and restart"
+    )
+
+
 def _handoff_pending_update() -> bool:
     if sys.platform != "darwin":
         return False
@@ -312,7 +346,7 @@ def _handoff_pending_update() -> bool:
         if not recovering and not activation_evidence_valid(state):
             coordinator.block(
                 state.candidate_sha,
-                "The staged update lacked required CI or canary evidence; "
+                "The staged update lacked required update evidence; "
                 "the current version was kept.",
             )
             return False
@@ -323,6 +357,18 @@ def _handoff_pending_update() -> bool:
                 message=(
                     "The update was deferred because persisted administrative "
                     "operation state is active or could not be verified."
+                ),
+            )
+            return False
+        if not recovering and not _confirm_automatic_update(state):
+            return False
+        if not recovering and _activation_must_defer():
+            _record_activation_deferred(
+                store,
+                code="CMP-ACTIVE-JOB",
+                message=(
+                    "The update was deferred because an administrative "
+                    "operation became active before restart."
                 ),
             )
             return False
@@ -769,7 +815,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # links (Audit viewer, Builder results) silently do nothing in the native window.
     webview.settings["ALLOW_DOWNLOADS"] = True
 
-    window = webview.create_window("GamGUI", url, width=1100, height=760, min_size=(900, 600))
+    window = webview.create_window(
+        "GamGUI",
+        url,
+        width=1100,
+        height=760,
+        min_size=(900, 600),
+        hidden=activation_probe_start,
+        focus=not activation_probe_start,
+    )
 
     def _notify_close_refusal(message: str) -> None:
         escaped = json.dumps(str(message))
@@ -794,6 +848,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     window.events.loaded += _mark_activation_loaded
 
     def _fit_to_screen() -> None:
+        if activation_probe_start:
+            return
         # Once the GUI loop knows the display, grow the window to fit it (so the full-width screens
         # have room) and center it. Best-effort — falls back silently to the default 1100×760.
         try:

@@ -72,6 +72,7 @@ from ..core.drive import (
 from ..core.secrets.ephemeral import sweep_stale_configs
 from ..core.secrets.vault import InMemoryBackend, SecretsVault
 from ..core.updater import (
+    ACTIVATION_APP_UPDATE,
     ACTIVATION_PROBE_ENV,
     ACTIVATION_TRANSACTION_ENV,
     UpdateStateStore,
@@ -272,7 +273,14 @@ class AppState:
             or embedded.artifact.source_sha != expected_sha
             or state.candidate_sha != expected_sha
             or not marker_matches
-            or state.canary_result != "passed"
+            or (
+                state.activation_kind == ACTIVATION_APP_UPDATE
+                and not activation_evidence_valid(state)
+            )
+            or (
+                not state.activation_kind
+                and state.canary_result != "passed"
+            )
             or "update-ready" not in state.required_check_evidence
             or candidate_is_blocked(state)
         ):
@@ -923,6 +931,24 @@ class AppState:
             limit=limit,
             offset=offset,
             cursor=cursor,
+        )
+
+    async def directory_org_units(
+        self,
+        query: str = "",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Page[str]:
+        index = self.ensure_directory_index()
+        if index is None:
+            return Page([], None, 0, None, False)
+        await self._ensure_directory_snapshot("users", False)
+        return await asyncio.to_thread(
+            index.search_org_units,
+            query,
+            limit=limit,
+            offset=offset,
         )
 
     async def patch_directory_user(self, user: GAMUser) -> None:

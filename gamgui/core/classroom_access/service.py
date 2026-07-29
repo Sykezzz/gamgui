@@ -16,6 +16,7 @@ from .models import (
     SourceMode,
     connector_identity_for,
     normalize_email_tuple,
+    normalize_org_unit_path,
     parse_email_lines,
     stable_hash,
 )
@@ -68,27 +69,37 @@ class EntitlementService:
         source_groups = policy.effective_source_groups
         if policy.target_group in source_groups:
             return self._held(policy, "The source group cannot also be the target group.")
+        source_org_units = policy.effective_source_org_units
 
         source_emails: tuple[str, ...] = ()
         desired_users: tuple[str, ...] = ()
         desired_groups = list(policy.exception_groups)
         hold_reason = ""
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            if not source_groups:
-                return self._held(policy, "Choose at least one synchronized staff source group.")
+            if not source_groups and not source_org_units:
+                return self._held(
+                    policy,
+                    "Choose at least one synchronized staff group or organizational unit.",
+                )
             missing_sources = [
                 group for group in source_groups if group not in group_map
             ]
             if missing_sources:
                 return self._held(policy, "The synchronized staff source group was not found.")
             try:
-                source_hash, source_has_members = await self._google_source_state(
-                    policy
-                )
+                (
+                    source_hash,
+                    source_has_members,
+                    source_emails,
+                ) = await self._directory_source_state(policy)
             except EntitlementValidationError as exc:
                 return self._held(policy, str(exc))
             if not source_has_members:
-                hold_reason = "The synchronized staff source groups are empty."
+                hold_reason = (
+                    "The synchronized staff source groups are empty."
+                    if source_groups and not source_org_units
+                    else "The selected staff groups and organizational units are empty."
+                )
             desired_groups.extend(source_groups)
         elif policy.source_mode == SourceMode.CSV.value:
             try:
@@ -121,8 +132,12 @@ class EntitlementService:
             )
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
             try:
-                desired_users = await self._require_active_users(
+                exception_users = await self._require_active_users(
                     policy.exception_users
+                )
+                desired_users = normalize_email_tuple(
+                    (*source_emails, *exception_users),
+                    domain=self.domain,
                 )
             except EntitlementValidationError as exc:
                 return self._held(policy, str(exc))
@@ -468,8 +483,11 @@ class EntitlementService:
         }
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
             required_groups.update(policy.effective_source_groups)
-            source_emails: tuple[str, ...] = ()
-            source_hash, _source_has_members = await self._google_source_state(policy)
+            (
+                source_hash,
+                _source_has_members,
+                source_emails,
+            ) = await self._directory_source_state(policy)
         else:
             source_emails = await self._csv_source(policy)
             source_hash = stable_hash("csv", source_emails)
@@ -537,7 +555,11 @@ class EntitlementService:
     async def _live_basis(self, policy: EntitlementPolicy, expected_source_hash: str) -> str:
         source: Sequence[str] = ()
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            source_hash, _source_has_members = await self._google_source_state(policy)
+            (
+                source_hash,
+                _source_has_members,
+                source,
+            ) = await self._directory_source_state(policy)
         else:
             source = await self._csv_source(policy)
             source_hash = stable_hash("csv", source)
@@ -565,7 +587,13 @@ class EntitlementService:
         self, policy: EntitlementPolicy, source_emails: Sequence[str]
     ) -> tuple[str, ...]:
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            users = await self._require_active_users(policy.exception_users)
+            exception_users = await self._require_active_users(
+                policy.exception_users
+            )
+            users = normalize_email_tuple(
+                (*source_emails, *exception_users),
+                domain=self.domain,
+            )
             groups = (*policy.exception_groups, *policy.effective_source_groups)
         else:
             users = await self._require_active_users(
@@ -590,7 +618,10 @@ class EntitlementService:
                 ) from exc
             identities = tuple(
                 sorted(
-                    f"{str(getattr(member, 'member_type', 'USER')).upper()}:{normalize_email(getattr(member, 'email', ''))}"
+                    (
+                        f"{str(getattr(member, 'member_type', 'USER')).upper()}:"
+                        f"{normalize_email(getattr(member, 'email', ''))}"
+                    )
                     for member in source_members
                     if normalize_email(getattr(member, "email", ""))
                 )
@@ -602,6 +633,75 @@ class EntitlementService:
             group, *identities = snapshots[0]
             return stable_hash("google_group", group, identities), has_members
         return stable_hash("google_groups", *snapshots), has_members
+
+    async def _directory_source_state(
+        self, policy: EntitlementPolicy
+    ) -> tuple[str, bool, tuple[str, ...]]:
+        """Hash the exact live union of nested groups and OU-resolved users."""
+
+        group_hash, groups_have_members = await self._google_source_state(policy)
+        org_units = policy.effective_source_org_units
+        if not org_units:
+            # Preserve the existing source hash for policies that only use
+            # synchronized groups so approved manifests do not become stale.
+            return group_hash, groups_have_members, ()
+        users = await self._org_unit_source_users(org_units)
+        return (
+            stable_hash(
+                "directory_sources",
+                group_hash,
+                ("org_units", *org_units),
+                ("org_users", *users),
+            ),
+            groups_have_members or bool(users),
+            users,
+        )
+
+    async def _org_unit_source_users(
+        self, org_units: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Resolve active internal users in selected OUs, including descendants."""
+
+        try:
+            bulk = getattr(self.connector, "list_oneroster_directory", None)
+            if callable(bulk):
+                directory = await bulk()
+                values = directory.values()
+            else:
+                list_users = getattr(self.connector, "list_users", None)
+                if not callable(list_users):
+                    raise RuntimeError("Workspace user listing is unavailable.")
+                values = await list_users(
+                    fields=("primaryEmail", "suspended", "orgUnitPath")
+                )
+        except Exception as exc:
+            raise EntitlementValidationError(
+                "The Workspace organizational-unit membership could not be read."
+            ) from exc
+
+        selected = tuple(
+            path.casefold()
+            for path in (normalize_org_unit_path(value) for value in org_units)
+            if path
+        )
+        users = set()
+        for user in values:
+            if getattr(user, "suspended", False):
+                continue
+            email = normalize_email(getattr(user, "primary_email", ""))
+            if not email or not email.endswith(f"@{self.domain}"):
+                continue
+            path = normalize_org_unit_path(
+                getattr(user, "org_unit_path", "/") or "/"
+            ).casefold()
+            if any(
+                source == "/"
+                or path == source
+                or path.startswith(f"{source}/")
+                for source in selected
+            ):
+                users.add(email)
+        return tuple(sorted(users))
 
     async def _csv_source(self, policy: EntitlementPolicy) -> tuple[str, ...]:
         if policy.csv_mode == CSVMode.UPLOAD.value:
@@ -713,6 +813,11 @@ class EntitlementService:
             if email and not normalize_email(email).endswith(f"@{self.domain}"):
                 raise EntitlementValidationError(
                     f"{normalize_email(email)} is outside the connected Workspace domain."
+                )
+        for org_unit in policy.effective_source_org_units:
+            if normalize_org_unit_path(org_unit) != org_unit:
+                raise EntitlementValidationError(
+                    "An organizational-unit source path is invalid."
                 )
 
     def _require_claim(self, plan_id: str) -> None:

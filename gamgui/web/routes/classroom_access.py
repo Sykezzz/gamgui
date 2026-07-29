@@ -19,6 +19,7 @@ from ...core.classroom_access import (
     PolicyStatus,
     SourceMode,
     parse_email_lines,
+    parse_org_unit_lines,
 )
 from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
@@ -26,6 +27,7 @@ from ..server import TEMPLATES
 router = APIRouter(prefix="/classroom/access")
 _PAGE = "classroom_access.html"
 _CSV_UPLOAD_MAX = 10 * 1024 * 1024
+_PICK_LIMIT = 25
 
 
 async def _context(
@@ -38,18 +40,12 @@ async def _context(
 ) -> dict:
     state = request.app.state.gamgui
     connected = state.connector is not None and bool(state.audit_domain)
-    groups = ()
     if connected:
         state.ensure_workspace_services()
         if policy is None and state.entitlement_store is not None:
             policy = await asyncio.to_thread(
                 state.entitlement_store.policy_for_domain, state.audit_domain
             )
-        try:
-            page = await state.directory_groups(limit=50)
-            groups = tuple(page.items)
-        except Exception:
-            groups = ()
     if policy is not None and plan is None and policy.pending_plan_id:
         plan = await asyncio.to_thread(
             state.entitlement_store.get_plan, policy.pending_plan_id
@@ -77,7 +73,6 @@ async def _context(
         "domain": state.audit_domain,
         "policy": policy,
         "plan": plan,
-        "groups": groups,
         "error": error,
         "notice": notice,
         "last_run": last_run,
@@ -104,6 +99,61 @@ async def access_page(request: Request) -> HTMLResponse:
     return await _render(request)
 
 
+@router.get("/options", response_class=HTMLResponse)
+async def access_options(
+    request: Request,
+    kind: str = "groups",
+    q: str = "",
+) -> HTMLResponse:
+    """Return a bounded live directory page for keyboard-operable pickers."""
+
+    state = request.app.state.gamgui
+    if not q:
+        q = next(
+            (
+                value
+                for key, value in request.query_params.items()
+                if key not in {"kind", "q"}
+            ),
+            "",
+        )
+    if state.connector is None or not state.audit_domain:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_classroom_access_options.html",
+            {"items": (), "error": "Connect a Workspace domain first."},
+        )
+    try:
+        if kind == "org_units":
+            page = await state.directory_org_units(query=q, limit=_PICK_LIMIT)
+            items = tuple((path, path) for path in page.items)
+        elif kind == "groups":
+            page = await state.directory_groups(query=q, limit=_PICK_LIMIT)
+            items = tuple(
+                (group.email, group.name or group.email) for group in page.items
+            )
+        else:
+            raise ValueError("Unknown directory picker.")
+    except (OSError, RuntimeError, ValueError):
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_classroom_access_options.html",
+            {
+                "items": (),
+                "error": "Directory search is temporarily unavailable.",
+            },
+        )
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_classroom_access_options.html",
+        {
+            "items": items,
+            "more": page.total > len(page.items),
+            "total": page.total,
+        },
+    )
+
+
 @router.post("/save", response_class=HTMLResponse)
 async def save_and_preview(
     request: Request,
@@ -111,6 +161,7 @@ async def save_and_preview(
     source_mode: Annotated[str, Form()],
     source_groups: Annotated[str, Form()] = "",
     source_group: Annotated[str, Form()] = "",
+    source_org_units: Annotated[str, Form()] = "",
     csv_mode: Annotated[str, Form()] = CSVMode.UPLOAD.value,
     watched_path: Annotated[str, Form()] = "",
     exception_users: Annotated[str, Form()] = "",
@@ -143,11 +194,19 @@ async def save_and_preview(
             if source_mode == SourceMode.GOOGLE_GROUP.value
             else ()
         )
+        synchronized_org_units = (
+            parse_org_unit_lines(source_org_units)
+            if source_mode == SourceMode.GOOGLE_GROUP.value
+            else ()
+        )
         if (
             source_mode == SourceMode.GOOGLE_GROUP.value
             and not synchronized_groups
+            and not synchronized_org_units
         ):
-            raise ValueError("Enter at least one synchronized staff source group.")
+            raise ValueError(
+                "Choose at least one synchronized staff group or organizational unit."
+            )
         if csv_mode not in {mode.value for mode in CSVMode}:
             raise ValueError("Choose an uploaded snapshot or watched CSV path.")
         if not 0 <= int(schedule_hour) <= 23 or not 0 <= int(schedule_minute) <= 59:
@@ -184,6 +243,11 @@ async def save_and_preview(
             ),
             source_groups=(
                 synchronized_groups
+                if source_mode == SourceMode.GOOGLE_GROUP.value
+                else ()
+            ),
+            source_org_units=(
+                synchronized_org_units
                 if source_mode == SourceMode.GOOGLE_GROUP.value
                 else ()
             ),

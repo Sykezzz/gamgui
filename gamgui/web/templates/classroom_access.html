@@ -37,9 +37,15 @@
         <h2 id="policy-status-heading" class="mt-1 font-serif text-xl text-brand-black">{{ policy.status|title }}</h2>
         <p class="mt-1 text-sm text-brand-blueink">
           {% if policy.source_mode == source_group %}
-            Source groups:
-            <span class="tabular-nums">{{ policy.effective_source_groups|length }}</span>
-            <span class="mt-1 block font-mono text-xs">{{ policy.effective_source_groups|join(", ") }}</span>
+            Directory sources:
+            <span class="tabular-nums">{{ policy.effective_source_groups|length }} group{{ "" if policy.effective_source_groups|length == 1 else "s" }}</span>,
+            <span class="tabular-nums">{{ policy.effective_source_org_units|length }} OU{{ "" if policy.effective_source_org_units|length == 1 else "s" }}</span>
+            {% if policy.effective_source_groups %}
+              <span class="mt-1 block font-mono text-xs">{{ policy.effective_source_groups|join(", ") }}</span>
+            {% endif %}
+            {% if policy.effective_source_org_units %}
+              <span class="mt-1 block font-mono text-xs">{{ policy.effective_source_org_units|join(", ") }}</span>
+            {% endif %}
           {% else %}
             CSV source: {{ "watched export" if policy.csv_mode == csv_watch else "approved upload" }}
           {% endif %}
@@ -85,10 +91,22 @@
     <fieldset class="space-y-3">
       <legend class="text-sm font-semibold text-brand-blueink">1. Confirm the target</legend>
       <label for="target-group" class="block text-sm text-brand-blueink">Classroom Teachers group email</label>
-      <input id="target-group" name="target_group" type="email" list="workspace-groups" required
-             value="{{ policy.target_group if policy else '' }}"
-             placeholder="classroom_teachers@{{ domain }}"
-             class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <div class="access-picker relative" data-picker-mode="single">
+        <input id="target-group" name="target_group" type="email" required autocomplete="off"
+               value="{{ policy.target_group if policy else '' }}"
+               placeholder="Search the Workspace group directory"
+               role="combobox" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="target-group-options"
+               hx-get="/classroom/access/options?kind=groups"
+               hx-trigger="input changed delay:250ms, focus"
+               hx-target="#target-group-options" hx-swap="innerHTML" hx-sync="this:replace"
+               class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+        <div id="target-group-options"
+             class="access-picker-menu absolute left-0 right-0 z-30 mt-1 max-h-64 overflow-y-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"
+             role="listbox" aria-label="Matching Workspace groups"
+             data-picker-target="target-group" data-picker-mode="single" hidden></div>
+      </div>
+      <p class="text-xs text-brand-blueink">Type a name or email, then choose the live Workspace result.</p>
       <label class="flex items-start gap-2 text-sm text-brand-blueink">
         <input type="checkbox" name="target_confirmed" value="yes" required
                class="mt-1 rounded border-brand-gray text-brand-blue focus:ring-brand-blue/30" />
@@ -104,9 +122,9 @@
             <input type="radio" name="source_mode" value="{{ source_group }}"
                    {% if not policy or policy.source_mode == source_group %}checked{% endif %}
                    onchange="updateSourcePanels()" />
-            Synchronized Google groups
+            Workspace directory sources
           </span>
-          <span class="mt-1 block text-xs text-brand-blueink">Nest each AD/GCDS-synchronized staff group into Classroom Teachers. Their effective membership is combined by Google.</span>
+          <span class="mt-1 block text-xs text-brand-blueink">Combine AD/GCDS-synchronized Google groups with active users from selected organizational units.</span>
         </label>
         <label class="rounded-xl border border-brand-gray/40 p-3 text-sm text-brand-blueink">
           <span class="flex items-center gap-2 font-medium">
@@ -119,12 +137,48 @@
         </label>
       </div>
 
-      <div id="group-source-panel">
-        <label for="source-groups" class="block text-sm text-brand-blueink">Synchronized staff group emails</label>
-        <textarea id="source-groups" name="source_groups" rows="4"
-                  placeholder="teachers@{{ domain }}&#10;administrators@{{ domain }}"
-                  class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30">{{ policy.effective_source_groups|join("\n") if policy else "" }}</textarea>
-        <p class="mt-1 text-xs text-brand-blueink">One internal Google group per line. The exact direct target roster will contain these groups plus approved exceptions.</p>
+      <div id="group-source-panel" class="space-y-4">
+        <div>
+          <label for="source-group-search" class="block text-sm font-medium text-brand-blueink">Synchronized Google groups</label>
+          <div class="access-picker relative mt-1" data-picker-mode="multiple">
+            <input id="source-group-search" name="source_group_query" type="search" autocomplete="off"
+                   placeholder="Search groups by name or email"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="source-group-options"
+                   hx-get="/classroom/access/options?kind=groups"
+                   hx-trigger="input changed delay:250ms, focus"
+                   hx-target="#source-group-options" hx-swap="innerHTML" hx-sync="this:replace"
+                   class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+            <div id="source-group-options"
+                 class="access-picker-menu absolute left-0 right-0 z-30 mt-1 max-h-64 overflow-y-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"
+                 role="listbox" aria-label="Matching synchronized groups"
+                 data-picker-target="source-groups" data-picker-mode="multiple" hidden></div>
+          </div>
+          <textarea id="source-groups" name="source_groups" hidden>{{ policy.effective_source_groups|join("\n") if policy else "" }}</textarea>
+          <div id="source-groups-selected" class="mt-2 flex flex-wrap gap-2" aria-live="polite"></div>
+          <p class="mt-1 text-xs text-brand-blueink">Selected groups are nested directly into Classroom Teachers, so Google resolves their effective membership.</p>
+        </div>
+
+        <div>
+          <label for="source-ou-search" class="block text-sm font-medium text-brand-blueink">Organizational units</label>
+          <div class="access-picker relative mt-1" data-picker-mode="multiple">
+            <input id="source-ou-search" name="source_org_unit_query" type="search" autocomplete="off"
+                   placeholder="Search organizational-unit paths"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="source-ou-options"
+                   hx-get="/classroom/access/options?kind=org_units"
+                   hx-trigger="input changed delay:250ms, focus"
+                   hx-target="#source-ou-options" hx-swap="innerHTML" hx-sync="this:replace"
+                   class="w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+            <div id="source-ou-options"
+                 class="access-picker-menu absolute left-0 right-0 z-30 mt-1 max-h-64 overflow-y-auto rounded-lg border border-brand-gray/40 bg-brand-white shadow-lg"
+                 role="listbox" aria-label="Matching organizational units"
+                 data-picker-target="source-org-units" data-picker-mode="multiple" hidden></div>
+          </div>
+          <textarea id="source-org-units" name="source_org_units" hidden>{{ policy.effective_source_org_units|join("\n") if policy else "" }}</textarea>
+          <div id="source-org-units-selected" class="mt-2 flex flex-wrap gap-2" aria-live="polite"></div>
+          <p class="mt-1 text-xs text-brand-blueink">Active internal users in each selected OU and its child OUs are included. The preview shows the exact direct-user changes before approval.</p>
+        </div>
       </div>
 
       <div id="csv-source-panel" class="space-y-3" hidden>
@@ -208,12 +262,6 @@
       </div>
     </fieldset>
 
-    <datalist id="workspace-groups">
-      {% for group in groups %}
-        <option value="{{ group.email }}">{{ group.name }}</option>
-      {% endfor %}
-    </datalist>
-
     <button type="submit" class="rounded-lg bg-brand-blue px-4 py-2.5 text-sm font-semibold text-brand-white hover:bg-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40">Save and preview exact membership</button>
   </form>
 
@@ -285,6 +333,119 @@
     if (uploadPanel) uploadPanel.hidden = watchSelected;
     if (watchPanel) watchPanel.hidden = !watchSelected;
   }
+  function accessPickerValues(store) {
+    var seen = {};
+    return (store.value || "").split(/\r?\n/).map(function (value) {
+      return value.trim();
+    }).filter(function (value) {
+      var key = value.toLowerCase();
+      if (!value || seen[key]) return false;
+      seen[key] = true;
+      return true;
+    });
+  }
+  function renderAccessSelections(storeId) {
+    var store = document.getElementById(storeId);
+    var selected = document.getElementById(storeId + "-selected");
+    if (!store || !selected) return;
+    selected.replaceChildren();
+    var values = accessPickerValues(store);
+    if (!values.length) {
+      var empty = document.createElement("span");
+      empty.className = "text-xs text-brand-blueink";
+      empty.textContent = storeId === "source-groups"
+        ? "No groups selected."
+        : "No organizational units selected.";
+      selected.appendChild(empty);
+      return;
+    }
+    values.forEach(function (value) {
+      var chip = document.createElement("span");
+      chip.className = "inline-flex max-w-full items-center gap-1 rounded-full border border-brand-blue/30 bg-brand-mist px-2.5 py-1 font-mono text-xs text-brand-blueink";
+      var text = document.createElement("span");
+      text.className = "truncate";
+      text.textContent = value;
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "rounded-full px-1 font-sans text-sm leading-none hover:bg-brand-blue/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue/40";
+      remove.setAttribute("aria-label", "Remove " + value);
+      remove.dataset.pickerRemove = value;
+      remove.dataset.pickerStore = storeId;
+      remove.textContent = "\u00d7";
+      chip.append(text, remove);
+      selected.appendChild(chip);
+    });
+  }
+  function closeAccessPicker(menu) {
+    if (!menu) return;
+    menu.hidden = true;
+    var input = document.querySelector('[aria-controls="' + menu.id + '"]');
+    if (input) input.setAttribute("aria-expanded", "false");
+  }
+  if (!window.gamguiAccessPickerBound) {
+    window.gamguiAccessPickerBound = true;
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+      var menu = event.detail && event.detail.target;
+      if (!menu || !menu.classList || !menu.classList.contains("access-picker-menu")) return;
+      menu.hidden = false;
+      var input = document.querySelector('[aria-controls="' + menu.id + '"]');
+      if (input) input.setAttribute("aria-expanded", "true");
+    });
+    document.addEventListener("click", function (event) {
+      var remove = event.target.closest && event.target.closest("[data-picker-remove]");
+      if (remove) {
+        var store = document.getElementById(remove.dataset.pickerStore);
+        if (!store) return;
+        var removing = (remove.dataset.pickerRemove || "").toLowerCase();
+        store.value = accessPickerValues(store).filter(function (value) {
+          return value.toLowerCase() !== removing;
+        }).join("\n");
+        renderAccessSelections(store.id);
+        return;
+      }
+      var option = event.target.closest && event.target.closest(".access-picker-option");
+      if (option) {
+        var menu = option.closest(".access-picker-menu");
+        var target = menu && document.getElementById(menu.dataset.pickerTarget);
+        var value = option.dataset.value || "";
+        if (!target || !value) return;
+        if (menu.dataset.pickerMode === "single") {
+          target.value = value;
+          target.dispatchEvent(new Event("change", {bubbles: true}));
+          closeAccessPicker(menu);
+          target.focus();
+          return;
+        }
+        var values = accessPickerValues(target);
+        if (!values.some(function (item) { return item.toLowerCase() === value.toLowerCase(); })) {
+          values.push(value);
+          values.sort(function (left, right) { return left.localeCompare(right); });
+          target.value = values.join("\n");
+        }
+        renderAccessSelections(target.id);
+        var search = document.querySelector('[aria-controls="' + menu.id + '"]');
+        closeAccessPicker(menu);
+        if (search) {
+          search.value = "";
+          search.focus();
+        }
+        return;
+      }
+      document.querySelectorAll(".access-picker-menu").forEach(function (menu) {
+        if (!event.target.closest || !event.target.closest(".access-picker")) {
+          closeAccessPicker(menu);
+        }
+      });
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key !== "Escape") return;
+      var input = event.target.closest && event.target.closest('[role="combobox"]');
+      if (!input) return;
+      closeAccessPicker(document.getElementById(input.getAttribute("aria-controls")));
+    });
+  }
+  renderAccessSelections("source-groups");
+  renderAccessSelections("source-org-units");
   updateSourcePanels();
 </script>
 {% endif %}

@@ -11,6 +11,7 @@ import pytest
 from gamgui.app import (
     _active_admin_jobs,
     _arguments,
+    _confirm_automatic_update,
     _fit_size,
     _handoff_pending_update,
     _run_helper,
@@ -63,6 +64,41 @@ def test_caps_on_a_huge_external():
 def test_cli_modes_are_parsed_without_rejecting_macos_arguments():
     args = _arguments(["--self-test", "--json", "-psn_0_12345"])
     assert args.self_test and args.json_output and not args.canary
+
+
+def test_automatic_update_prompt_explains_restart_and_honors_choice(monkeypatch):
+    calls = []
+
+    def run(arguments, **options):
+        calls.append((arguments, options))
+        return SimpleNamespace(returncode=0, stdout="Install and restart\n")
+
+    monkeypatch.setattr("gamgui.app.subprocess.run", run)
+    state = SimpleNamespace(
+        activation_kind=ACTIVATION_APP_UPDATE,
+        candidate_artifact=SimpleNamespace(version="2.4.0"),
+    )
+
+    assert _confirm_automatic_update(state)
+    arguments, options = calls[0]
+    assert arguments[:2] == ["/usr/bin/osascript", "-e"]
+    assert arguments[-1] == "2.4.0"
+    assert "reopen automatically" in arguments[2]
+    assert options["timeout"] == 300
+
+
+def test_automatic_update_prompt_defers_when_user_declines(monkeypatch):
+    monkeypatch.setattr(
+        "gamgui.app.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    assert not _confirm_automatic_update(
+        SimpleNamespace(
+            activation_kind=ACTIVATION_APP_UPDATE,
+            candidate_artifact=None,
+        )
+    )
 
 
 def test_health_start_preserves_profile_projection_guard(monkeypatch, tmp_path):
@@ -141,10 +177,16 @@ def test_activation_health_is_written_only_after_window_page_loaded(
         window.events.loaded.handler()
         window.events.loaded.handler()
 
+    created = []
+
+    def create_window(*_args, **kwargs):
+        created.append(kwargs)
+        return window
+
     webview = SimpleNamespace(
         settings={},
         screens=[],
-        create_window=lambda *_args, **_kwargs: window,
+        create_window=create_window,
         start=start,
     )
     monkeypatch.setitem(sys.modules, "webview", webview)
@@ -163,6 +205,15 @@ def test_activation_health_is_written_only_after_window_page_loaded(
 
     assert main([]) == 0
     assert writes == [payload]
+    assert created == [
+        {
+            "width": 1100,
+            "height": 760,
+            "min_size": (900, 600),
+            "hidden": True,
+            "focus": False,
+        }
+    ]
 
 
 def test_active_job_detection_understands_terminal_and_running_states():
@@ -205,11 +256,13 @@ def test_pending_update_hands_off_exact_staged_state(monkeypatch, tmp_path):
     monkeypatch.setenv("GAMGUI_APP_DATA_DIR", str(data_root))
     monkeypatch.setattr("gamgui.app.sys.platform", "darwin")
     monkeypatch.setattr("gamgui.app.installed_app_path", lambda: current)
+    monkeypatch.setattr("gamgui.app._activation_must_defer", lambda: False)
+    monkeypatch.setattr("gamgui.app._confirm_automatic_update", lambda _state: True)
     UpdateStateStore().save(
         UpdateState(
             candidate_sha="a" * 40,
             pending_app=str(pending),
-            canary_result="passed",
+            canary_result="",
             required_check_evidence=["update-ready"],
             activation_kind=ACTIVATION_APP_UPDATE,
             candidate_artifact=ComponentArtifactId(
@@ -515,5 +568,5 @@ def test_pending_update_without_activation_evidence_is_blocked(monkeypatch, tmp_
     assert not _handoff_pending_update()
     state = UpdateStateStore().load()
     assert sha in state.blocked_shas
-    assert "CI or canary evidence" in state.last_error
+    assert "required update evidence" in state.last_error
     assert launched == []
