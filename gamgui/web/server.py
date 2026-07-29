@@ -933,6 +933,24 @@ class AppState:
             cursor=cursor,
         )
 
+    async def directory_org_units(
+        self,
+        query: str = "",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Page[str]:
+        index = self.ensure_directory_index()
+        if index is None:
+            return Page([], None, 0, None, False)
+        await self._ensure_directory_snapshot("users", False)
+        return await asyncio.to_thread(
+            index.search_org_units,
+            query,
+            limit=limit,
+            offset=offset,
+        )
+
     async def patch_directory_user(self, user: GAMUser) -> None:
         index = self.ensure_directory_index()
         if index is not None:

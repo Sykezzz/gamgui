@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Tuple
@@ -37,6 +38,7 @@ class EntitlementPolicy:
     source_mode: str
     source_group: str = ""
     source_groups: Tuple[str, ...] = ()
+    source_org_units: Tuple[str, ...] = ()
     csv_mode: str = CSVMode.UPLOAD.value
     csv_emails: Tuple[str, ...] = ()
     watch_path: str = ""
@@ -74,6 +76,17 @@ class EntitlementPolicy:
         )
 
     @property
+    def effective_source_org_units(self) -> Tuple[str, ...]:
+        """Return canonical, order-independent organizational-unit paths."""
+
+        by_identity = {}
+        for value in self.source_org_units:
+            path = normalize_org_unit_path(str(value))
+            if path:
+                by_identity[path.casefold()] = path
+        return tuple(sorted(by_identity.values(), key=str.casefold))
+
+    @property
     def configuration_hash(self) -> str:
         csv_identity: Iterable[str]
         if self.source_mode == SourceMode.CSV.value and self.csv_mode == CSVMode.UPLOAD.value:
@@ -101,6 +114,9 @@ class EntitlementPolicy:
         }
         if len(source_groups) > 1:
             payload["source_groups"] = list(source_groups)
+        source_org_units = self.effective_source_org_units
+        if source_org_units:
+            payload["source_org_units"] = list(source_org_units)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -135,6 +151,32 @@ def parse_email_lines(text: str) -> Tuple[str, ...]:
     """Parse the same narrow email-list/CSV contract as Classroom rosters."""
 
     return tuple(parse_desired_roster(text or ""))
+
+
+def normalize_org_unit_path(value: str) -> str:
+    """Normalize an Admin SDK org-unit path without accepting control data."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return ""
+    if any(ord(character) < 32 for character in text):
+        raise ValueError("Organizational unit paths cannot contain control characters.")
+    if not text.startswith("/"):
+        text = f"/{text}"
+    segments = [segment.strip() for segment in text.split("/") if segment.strip()]
+    path = "/" + "/".join(segments)
+    if len(path) > 256:
+        raise ValueError("Organizational unit paths cannot exceed 256 characters.")
+    return path
+
+
+def parse_org_unit_lines(text: str) -> Tuple[str, ...]:
+    values = {}
+    for raw in str(text or "").splitlines():
+        path = normalize_org_unit_path(raw)
+        if path:
+            values[path.casefold()] = path
+    return tuple(sorted(values.values(), key=str.casefold))
 
 
 def normalize_email_tuple(values: Iterable[str], *, domain: str = "") -> Tuple[str, ...]:

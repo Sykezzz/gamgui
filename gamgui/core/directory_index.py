@@ -650,6 +650,54 @@ class DirectoryIndex:
             self.is_refreshing("groups"),
         )
 
+    def search_org_units(
+        self,
+        query: str = "",
+        *,
+        limit: int = MAX_PAGE_SIZE,
+        offset: int = 0,
+    ) -> Page[str]:
+        """Return bounded distinct OU paths from the indexed user snapshot."""
+
+        limit = max(1, min(int(limit), MAX_PAGE_SIZE))
+        offset = max(0, int(offset))
+        term = unicodedata.normalize("NFKC", str(query or "")).strip().casefold()
+        if any(ord(character) < 32 for character in term):
+            return Page(
+                [], None, 0, self.snapshot_age("users"), self.is_refreshing("users")
+            )
+        predicate = (
+            "domain = ? AND org_unit_path <> ''"
+            + (" AND instr(lower(org_unit_path), ?) > 0" if term else "")
+        )
+        params: tuple[object, ...] = (self.domain, term) if term else (self.domain,)
+        with closing(self._conn()) as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM (SELECT DISTINCT org_unit_path "
+                    f"FROM users WHERE {predicate})",
+                    params,
+                ).fetchone()[0]
+            )
+            offset = self._clamp_offset(offset, limit, total)
+            rows = conn.execute(
+                f"SELECT DISTINCT org_unit_path FROM users WHERE {predicate} "
+                "ORDER BY org_unit_path COLLATE NOCASE LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        items = [
+            _summary_text(row["org_unit_path"], _MAX_ORG_UNIT_CHARS)
+            for row in rows
+        ]
+        next_cursor = _encode_cursor(offset + limit) if offset + len(items) < total else None
+        return Page(
+            items,
+            next_cursor,
+            total,
+            self.snapshot_age("users"),
+            self.is_refreshing("users"),
+        )
+
     @staticmethod
     def _clamp_offset(offset: int, limit: int, total: int) -> int:
         if total and offset >= total:

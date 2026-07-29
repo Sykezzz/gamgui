@@ -59,6 +59,7 @@ class EntitlementStore:
                     source_mode TEXT NOT NULL,
                     source_group TEXT NOT NULL,
                     source_groups_json TEXT NOT NULL DEFAULT '[]',
+                    source_org_units_json TEXT NOT NULL DEFAULT '[]',
                     csv_mode TEXT NOT NULL,
                     csv_emails_json TEXT NOT NULL,
                     watch_path TEXT NOT NULL,
@@ -104,6 +105,13 @@ class EntitlementStore:
                     """
                     ALTER TABLE entitlement_policies
                     ADD COLUMN source_groups_json TEXT NOT NULL DEFAULT '[]'
+                    """
+                )
+            if "source_org_units_json" not in policy_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE entitlement_policies
+                    ADD COLUMN source_org_units_json TEXT NOT NULL DEFAULT '[]'
                     """
                 )
             conn.execute(
@@ -197,6 +205,7 @@ class EntitlementStore:
             target_group=policy.target_group.strip().casefold(),
             source_group=source_groups[0] if source_groups else "",
             source_groups=source_groups,
+            source_org_units=policy.effective_source_org_units,
             created_at=created_at,
             updated_at=now,
         )
@@ -215,7 +224,7 @@ class EntitlementStore:
                 """
                 INSERT INTO entitlement_policies (
                     id, domain, target_group, source_mode, source_group,
-                    source_groups_json,
+                    source_groups_json, source_org_units_json,
                     csv_mode, csv_emails_json, watch_path,
                     exception_users_json, exception_groups_json,
                     connector_identity, status,
@@ -224,7 +233,7 @@ class EntitlementStore:
                     pending_plan_id, last_run_status, last_run_message,
                     last_run_at, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     domain=excluded.domain,
@@ -232,6 +241,7 @@ class EntitlementStore:
                     source_mode=excluded.source_mode,
                     source_group=excluded.source_group,
                     source_groups_json=excluded.source_groups_json,
+                    source_org_units_json=excluded.source_org_units_json,
                     csv_mode=excluded.csv_mode,
                     csv_emails_json=excluded.csv_emails_json,
                     watch_path=excluded.watch_path,
@@ -538,6 +548,9 @@ class EntitlementStore:
             source_mode=str(row["source_mode"]),
             source_group=str(row["source_group"]),
             source_groups=source_groups,
+            source_org_units=tuple(
+                json.loads(row["source_org_units_json"] or "[]")
+            ),
             csv_mode=str(row["csv_mode"]),
             csv_emails=tuple(json.loads(row["csv_emails_json"] or "[]")),
             watch_path=str(row["watch_path"]),
@@ -590,6 +603,7 @@ class EntitlementStore:
             policy.source_mode,
             policy.source_group,
             json.dumps(list(policy.effective_source_groups)),
+            json.dumps(list(policy.effective_source_org_units)),
             policy.csv_mode,
             json.dumps(list(policy.csv_emails)),
             policy.watch_path,

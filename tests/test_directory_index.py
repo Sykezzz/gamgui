@@ -103,6 +103,21 @@ def test_group_index_search_and_page_bound(tmp_path):
     assert index.status().groups == 80
 
 
+def test_org_unit_search_is_distinct_bounded_and_uses_user_snapshot(tmp_path):
+    index = DirectoryIndex(tmp_path / "directory.db", "example.com")
+    users = [_user(n) for n in range(20)]
+    users[0].org_unit_path = "/Staff/Teachers"
+    users[1].org_unit_path = "/Staff/Teachers"
+    index.replace_users(users)
+
+    page = index.search_org_units("staff", limit=2)
+
+    assert page.items == ["/Staff", "/Staff/Teachers"]
+    assert page.total == 2
+    assert page.next_cursor is None
+    assert page.snapshot_age_seconds is not None
+
+
 def test_empty_snapshot_is_distinct_from_never_refreshed(tmp_path):
     index = DirectoryIndex(tmp_path / "directory.db", "example.com")
     assert index.is_empty("groups")

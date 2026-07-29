@@ -166,6 +166,12 @@ restart-safe manifest. Apply re-reads the live roster and refuses a stale previe
 be reused; removals require typing the exact course ID. Owner transfer requires both the exact
 course ID and exact destination email. The course owner cannot be removed from the teacher roster.
 
+Classroom Teacher Access is a separate Classroom page for the domain's existing special Classroom
+Teachers group. Its live directory pickers can combine multiple AD/GCDS-synchronized Google groups
+with active users from one or more organizational units, including child OUs. CSV remains an
+explicit alternative source. Every source or exception change creates a fresh exact preview;
+source membership is re-read before apply, and scheduled runs hold on drift or safety thresholds.
+
 ### Drive
 
 Drive search is scoped to one delegated user and their owned, non-trashed My Drive files. GamGUI can
@@ -435,9 +441,11 @@ development server does not self-update.
 4. Exact-SHA CI, the sealed artifact identity, local signing verification, and the bundled offline
    self-test establish automatic-update readiness. The automatic startup path does not run the live
    Workspace canary or read Keychain credentials.
-5. A passing build is staged while the current app keeps running. On the next launch, a helper
-   snapshots the current app and all local SQLite databases, tests schema preparation on a copy,
-   swaps the bundle, and requires a startup health marker within 45 seconds.
+5. A passing build is staged while the current app keeps running. On the next launch, a native
+   dialog explains the restart and lets the administrator install now or defer. If accepted, a
+   helper snapshots the current app and all local SQLite databases, tests schema preparation on a
+   copy, swaps the bundle, and obtains a startup health marker from a hidden verification window
+   within 45 seconds before reopening the normal app.
 6. If the helper's migration-copy self-test, bundle swap, or startup health check fails, it restores
    the prior app and database snapshot, relaunches the old app, and blocklists that SHA. Successful
    activation keeps at most two rollback backups, and backups older than 30 days are pruned.
