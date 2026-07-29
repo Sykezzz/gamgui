@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,9 @@ class _Connector:
                 "classroom_teachers@example.org", "Classroom Teachers"
             ),
             "staff@example.org": GAMGroup("staff@example.org", "Staff"),
+            "administrators@example.org": GAMGroup(
+                "administrators@example.org", "Administrators"
+            ),
             "exceptions@example.org": GAMGroup("exceptions@example.org", "Exceptions"),
         }
         self.members = {
@@ -44,6 +48,9 @@ class _Connector:
             ],
             "staff@example.org": [
                 GroupMember("teacher@example.org", member_type="USER")
+            ],
+            "administrators@example.org": [
+                GroupMember("admin@example.org", member_type="USER")
             ],
         }
         self.users = {
@@ -91,7 +98,10 @@ def _group_policy(store: EntitlementStore) -> EntitlementPolicy:
             domain="example.org",
             target_group="classroom_teachers@example.org",
             source_mode=SourceMode.GOOGLE_GROUP.value,
-            source_group="staff@example.org",
+            source_groups=(
+                "staff@example.org",
+                "administrators@example.org",
+            ),
             exception_groups=("exceptions@example.org",),
         )
     )
@@ -130,6 +140,142 @@ def test_store_is_restart_safe_and_owner_only(tmp_path):
         assert store.path.stat().st_mode & 0o777 == 0o600
 
 
+def test_store_migrates_legacy_single_source_policy(tmp_path):
+    path = tmp_path / "legacy-entitlements.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE entitlement_policies (
+                id TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                target_group TEXT NOT NULL,
+                source_mode TEXT NOT NULL,
+                source_group TEXT NOT NULL,
+                csv_mode TEXT NOT NULL,
+                csv_emails_json TEXT NOT NULL,
+                watch_path TEXT NOT NULL,
+                exception_users_json TEXT NOT NULL,
+                exception_groups_json TEXT NOT NULL,
+                connector_identity TEXT NOT NULL,
+                status TEXT NOT NULL,
+                schedule_enabled INTEGER NOT NULL,
+                schedule_hour INTEGER NOT NULL,
+                schedule_minute INTEGER NOT NULL,
+                approved_config_hash TEXT NOT NULL,
+                approved_source_hash TEXT NOT NULL,
+                pending_plan_id TEXT NOT NULL,
+                last_run_status TEXT NOT NULL,
+                last_run_message TEXT NOT NULL,
+                last_run_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO entitlement_policies VALUES (
+                'legacy-policy', 'example.org',
+                'classroom_teachers@example.org', 'google_group',
+                'staff@example.org', 'upload', '[]', '', '[]', '[]', '',
+                'active', 1, 2, 0, '', '', '', '', '', 0, 1, 1
+            )
+            """
+        )
+
+    store = EntitlementStore(path)
+    migrated = store.get_policy("legacy-policy")
+
+    assert migrated is not None
+    assert migrated.source_group == "staff@example.org"
+    assert migrated.source_groups == ("staff@example.org",)
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(entitlement_policies)")
+        }
+    assert "source_groups_json" in columns
+
+
+def test_source_groups_are_normalized_persisted_and_order_independent(tmp_path):
+    store = _store(tmp_path)
+    policy = store.save_policy(
+        EntitlementPolicy(
+            id="",
+            domain="example.org",
+            target_group="classroom_teachers@example.org",
+            source_mode=SourceMode.GOOGLE_GROUP.value,
+            source_groups=(
+                "Staff@Example.org",
+                "administrators@example.org",
+                "staff@example.org",
+            ),
+        )
+    )
+    reordered = replace(
+        policy,
+        source_group="",
+        source_groups=tuple(reversed(policy.source_groups)),
+    )
+
+    assert policy.source_groups == (
+        "administrators@example.org",
+        "staff@example.org",
+    )
+    assert policy.source_group == "administrators@example.org"
+    assert EntitlementStore(store.path).get_policy(policy.id) == policy
+    assert reordered.configuration_hash == policy.configuration_hash
+
+
+def test_singleton_plural_source_preserves_legacy_configuration_hash():
+    legacy = EntitlementPolicy(
+        id="policy",
+        domain="example.org",
+        target_group="classroom_teachers@example.org",
+        source_mode=SourceMode.GOOGLE_GROUP.value,
+        source_group="staff@example.org",
+    )
+    plural = replace(
+        legacy,
+        source_group="",
+        source_groups=("staff@example.org",),
+    )
+
+    assert plural.configuration_hash == legacy.configuration_hash
+
+
+@pytest.mark.asyncio
+async def test_singleton_plural_source_preserves_legacy_source_hash(tmp_path):
+    connector = _Connector()
+    legacy_store = EntitlementStore(tmp_path / "legacy.db")
+    plural_store = EntitlementStore(tmp_path / "plural.db")
+    legacy = legacy_store.save_policy(
+        EntitlementPolicy(
+            id="",
+            domain="example.org",
+            target_group="classroom_teachers@example.org",
+            source_mode=SourceMode.GOOGLE_GROUP.value,
+            source_group="staff@example.org",
+        )
+    )
+    plural = plural_store.save_policy(
+        replace(
+            legacy,
+            id="",
+            source_group="",
+            source_groups=("staff@example.org",),
+        )
+    )
+
+    legacy_plan = await EntitlementService(
+        connector, "example.org", legacy_store
+    ).plan(legacy, approval_required=True)
+    plural_plan = await EntitlementService(
+        connector, "example.org", plural_store
+    ).plan(plural, approval_required=True)
+
+    assert plural_plan.source_hash == legacy_plan.source_hash
+
+
 @pytest.mark.asyncio
 async def test_group_source_plans_exact_direct_membership_and_requires_approval(tmp_path):
     connector = _Connector()
@@ -139,7 +285,11 @@ async def test_group_source_plans_exact_direct_membership_and_requires_approval(
         policy, approval_required=True
     )
     assert plan.status == "held"
-    assert plan.adds == ("exceptions@example.org", "staff@example.org")
+    assert plan.adds == (
+        "administrators@example.org",
+        "exceptions@example.org",
+        "staff@example.org",
+    )
     assert plan.removes == ("old@example.org",)
     assert "Review and approve" in plan.hold_reason
 
@@ -157,6 +307,7 @@ async def test_approved_plan_adds_before_removing_and_activates_policy(tmp_path)
 
     assert result.status == "completed"
     assert connector.calls == [
+        ("add", "administrators@example.org"),
         ("add", "exceptions@example.org"),
         ("add", "staff@example.org"),
         ("remove", "old@example.org"),
@@ -198,6 +349,7 @@ async def test_interrupted_approved_plan_resumes_only_remaining_changes(tmp_path
     assert result is not None
     assert result.status == "completed"
     assert connector.calls == [
+        ("add", "administrators@example.org"),
         ("add", "staff@example.org"),
         ("remove", "old@example.org"),
     ]
@@ -219,7 +371,7 @@ async def test_interrupted_plan_does_not_inherit_approval_after_source_change(tm
         error="simulated process exit",
         owner_id="crashed-worker",
     )
-    connector.members[policy.source_group].append(
+    connector.members[policy.effective_source_groups[1]].append(
         GroupMember("new-teacher@example.org")
     )
 
@@ -230,6 +382,98 @@ async def test_interrupted_plan_does_not_inherit_approval_after_source_change(tm
     assert result is None
     assert connector.calls == []
     assert store.get_plan(plan.id).status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_approved_plan_rejects_membership_change_in_second_source(tmp_path):
+    connector = _Connector()
+    store = _store(tmp_path)
+    policy = _group_policy(store)
+    service = EntitlementService(connector, "example.org", store)
+    plan = await service.plan(policy, approval_required=True)
+    assert store.approve_plan(plan.id)
+    connector.members["staff@example.org"].append(
+        GroupMember("new-teacher@example.org")
+    )
+
+    with pytest.raises(ValueError, match="live membership changed after preview"):
+        await service.apply(plan.id)
+
+    assert connector.calls == []
+    assert store.get_plan(plan.id).status == "stale"
+
+
+@pytest.mark.asyncio
+async def test_multiple_group_source_holds_missing_group_and_allows_one_empty(tmp_path):
+    connector = _Connector()
+    store = _store(tmp_path)
+    policy = _group_policy(store)
+    connector.members["administrators@example.org"] = []
+
+    allowed = await EntitlementService(connector, "example.org", store).plan(
+        policy, approval_required=True
+    )
+    assert set(allowed.adds) == {
+        "administrators@example.org",
+        "exceptions@example.org",
+        "staff@example.org",
+    }
+    assert "empty" not in allowed.hold_reason
+
+    missing = store.save_policy(
+        replace(
+            policy,
+            source_groups=(
+                "staff@example.org",
+                "missing@example.org",
+            ),
+        )
+    )
+    held = await EntitlementService(connector, "example.org", store).plan(
+        missing, approval_required=False
+    )
+    assert held.status == "held"
+    assert "source group was not found" in held.hold_reason
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multiple_group_source_holds_when_effective_union_is_empty(tmp_path):
+    connector = _Connector()
+    connector.members["staff@example.org"] = []
+    connector.members["administrators@example.org"] = []
+    store = _store(tmp_path)
+    policy = _group_policy(store)
+
+    held = await EntitlementService(connector, "example.org", store).plan(
+        policy, approval_required=False
+    )
+
+    assert held.status == "held"
+    assert "source groups are empty" in held.hold_reason
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multiple_group_source_holds_when_any_group_cannot_be_read(tmp_path):
+    connector = _Connector()
+    store = _store(tmp_path)
+    policy = _group_policy(store)
+    original = connector.list_group_members
+
+    async def fail_second_source(group):
+        if group == "staff@example.org":
+            raise RuntimeError("simulated source failure")
+        return await original(group)
+
+    connector.list_group_members = fail_second_source
+    held = await EntitlementService(connector, "example.org", store).plan(
+        policy, approval_required=False
+    )
+
+    assert held.status == "held"
+    assert "could not be read: staff@example.org" in held.hold_reason
+    assert connector.calls == []
 
 
 @pytest.mark.asyncio

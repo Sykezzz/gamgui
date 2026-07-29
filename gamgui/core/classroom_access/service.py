@@ -65,7 +65,8 @@ class EntitlementService:
         }
         if policy.target_group not in group_map:
             return self._held(policy, "The confirmed Classroom Teachers group was not found.")
-        if policy.source_group and policy.source_group == policy.target_group:
+        source_groups = policy.effective_source_groups
+        if policy.target_group in source_groups:
             return self._held(policy, "The source group cannot also be the target group.")
 
         source_emails: tuple[str, ...] = ()
@@ -73,23 +74,22 @@ class EntitlementService:
         desired_groups = list(policy.exception_groups)
         hold_reason = ""
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            if not policy.source_group or policy.source_group not in group_map:
+            if not source_groups:
+                return self._held(policy, "Choose at least one synchronized staff source group.")
+            missing_sources = [
+                group for group in source_groups if group not in group_map
+            ]
+            if missing_sources:
                 return self._held(policy, "The synchronized staff source group was not found.")
             try:
-                source_members = await self.connector.list_group_members(policy.source_group)
-            except Exception:
-                return self._held(policy, "The synchronized staff source group could not be read.")
-            source_identities = tuple(
-                sorted(
-                    f"{str(getattr(member, 'member_type', 'USER')).upper()}:{normalize_email(getattr(member, 'email', ''))}"
-                    for member in source_members
-                    if normalize_email(getattr(member, "email", ""))
+                source_hash, source_has_members = await self._google_source_state(
+                    policy
                 )
-            )
-            if not source_identities:
-                hold_reason = "The synchronized staff source group is empty."
-            desired_groups.append(policy.source_group)
-            source_hash = stable_hash("google_group", policy.source_group, source_identities)
+            except EntitlementValidationError as exc:
+                return self._held(policy, str(exc))
+            if not source_has_members:
+                hold_reason = "The synchronized staff source groups are empty."
+            desired_groups.extend(source_groups)
         elif policy.source_mode == SourceMode.CSV.value:
             try:
                 source_emails = await self._csv_source(policy)
@@ -467,19 +467,9 @@ class EntitlementService:
             *policy.exception_groups,
         }
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            required_groups.add(policy.source_group)
-            source_members = await self.connector.list_group_members(policy.source_group)
-            source_identities = tuple(
-                sorted(
-                    f"{str(getattr(member, 'member_type', 'USER')).upper()}:{normalize_email(getattr(member, 'email', ''))}"
-                    for member in source_members
-                    if normalize_email(getattr(member, "email", ""))
-                )
-            )
+            required_groups.update(policy.effective_source_groups)
             source_emails: tuple[str, ...] = ()
-            source_hash = stable_hash(
-                "google_group", policy.source_group, source_identities
-            )
+            source_hash, _source_has_members = await self._google_source_state(policy)
         else:
             source_emails = await self._csv_source(policy)
             source_hash = stable_hash("csv", source_emails)
@@ -547,15 +537,7 @@ class EntitlementService:
     async def _live_basis(self, policy: EntitlementPolicy, expected_source_hash: str) -> str:
         source: Sequence[str] = ()
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
-            source_members = await self.connector.list_group_members(policy.source_group)
-            identities = tuple(
-                sorted(
-                    f"{str(getattr(member, 'member_type', 'USER')).upper()}:{normalize_email(getattr(member, 'email', ''))}"
-                    for member in source_members
-                    if normalize_email(getattr(member, "email", ""))
-                )
-            )
-            source_hash = stable_hash("google_group", policy.source_group, identities)
+            source_hash, _source_has_members = await self._google_source_state(policy)
         else:
             source = await self._csv_source(policy)
             source_hash = stable_hash("csv", source)
@@ -584,13 +566,42 @@ class EntitlementService:
     ) -> tuple[str, ...]:
         if policy.source_mode == SourceMode.GOOGLE_GROUP.value:
             users = await self._require_active_users(policy.exception_users)
-            groups = (*policy.exception_groups, policy.source_group)
+            groups = (*policy.exception_groups, *policy.effective_source_groups)
         else:
             users = await self._require_active_users(
                 (*source_emails, *policy.exception_users)
             )
             groups = policy.exception_groups
         return normalize_email_tuple((*users, *groups), domain=self.domain)
+
+    async def _google_source_state(
+        self, policy: EntitlementPolicy
+    ) -> tuple[str, bool]:
+        """Read every configured group and build one boundary-safe source hash."""
+
+        snapshots: list[tuple[str, ...]] = []
+        has_members = False
+        for group in policy.effective_source_groups:
+            try:
+                source_members = await self.connector.list_group_members(group)
+            except Exception as exc:
+                raise EntitlementValidationError(
+                    f"The synchronized staff source group could not be read: {group}"
+                ) from exc
+            identities = tuple(
+                sorted(
+                    f"{str(getattr(member, 'member_type', 'USER')).upper()}:{normalize_email(getattr(member, 'email', ''))}"
+                    for member in source_members
+                    if normalize_email(getattr(member, "email", ""))
+                )
+            )
+            has_members = has_members or bool(identities)
+            snapshots.append((group, *identities))
+
+        if len(snapshots) == 1:
+            group, *identities = snapshots[0]
+            return stable_hash("google_group", group, identities), has_members
+        return stable_hash("google_groups", *snapshots), has_members
 
     async def _csv_source(self, policy: EntitlementPolicy) -> tuple[str, ...]:
         if policy.csv_mode == CSVMode.UPLOAD.value:
@@ -695,7 +706,7 @@ class EntitlementService:
             )
         for email in (
             policy.target_group,
-            policy.source_group,
+            *policy.effective_source_groups,
             *policy.exception_users,
             *policy.exception_groups,
         ):

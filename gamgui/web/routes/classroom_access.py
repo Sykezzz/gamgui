@@ -109,6 +109,7 @@ async def save_and_preview(
     request: Request,
     target_group: Annotated[str, Form()],
     source_mode: Annotated[str, Form()],
+    source_groups: Annotated[str, Form()] = "",
     source_group: Annotated[str, Form()] = "",
     csv_mode: Annotated[str, Form()] = CSVMode.UPLOAD.value,
     watched_path: Annotated[str, Form()] = "",
@@ -135,9 +136,18 @@ async def save_and_preview(
                 "Confirm that the selected target is the domain's special Classroom Teachers group."
             )
         target = normalize_email(target_group)
-        source = normalize_email(source_group)
         if source_mode not in {mode.value for mode in SourceMode}:
             raise ValueError("Choose a synchronized group or CSV source.")
+        synchronized_groups = (
+            parse_email_lines(source_groups or source_group)
+            if source_mode == SourceMode.GOOGLE_GROUP.value
+            else ()
+        )
+        if (
+            source_mode == SourceMode.GOOGLE_GROUP.value
+            and not synchronized_groups
+        ):
+            raise ValueError("Enter at least one synchronized staff source group.")
         if csv_mode not in {mode.value for mode in CSVMode}:
             raise ValueError("Choose an uploaded snapshot or watched CSV path.")
         if not 0 <= int(schedule_hour) <= 23 or not 0 <= int(schedule_minute) <= 59:
@@ -166,7 +176,17 @@ async def save_and_preview(
             domain=state.audit_domain,
             target_group=target,
             source_mode=source_mode,
-            source_group=source if source_mode == SourceMode.GOOGLE_GROUP.value else "",
+            source_group=(
+                synchronized_groups[0]
+                if source_mode == SourceMode.GOOGLE_GROUP.value
+                and synchronized_groups
+                else ""
+            ),
+            source_groups=(
+                synchronized_groups
+                if source_mode == SourceMode.GOOGLE_GROUP.value
+                else ()
+            ),
             csv_mode=csv_mode,
             csv_emails=tuple(csv_emails),
             watch_path=(

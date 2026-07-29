@@ -2,6 +2,8 @@
 {% block title %}Classroom — GamGUI Console{% endblock %}
 {% block container_class %}max-w-7xl{% endblock %}
 {% block content %}
+{% set classroom_section = "courses" %}
+{% include "_classroom_subnav.html" %}
 {% if not connected %}
 <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
   <p class="eyebrow text-brand-blueink">Not connected</p>

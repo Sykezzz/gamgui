@@ -27,10 +27,12 @@ class _Connector:
         self.groups = [
             GAMGroup("classroom_teachers@example.org", "Classroom Teachers"),
             GAMGroup("staff@example.org", "Staff"),
+            GAMGroup("administrators@example.org", "Administrators"),
         ]
         self.members = {
             "classroom_teachers@example.org": [],
             "staff@example.org": [GroupMember("teacher@example.org")],
+            "administrators@example.org": [GroupMember("admin@example.org")],
         }
         self.users = {
             "teacher@example.org": GAMUser("teacher@example.org"),
@@ -111,7 +113,11 @@ def test_group_policy_preview_then_approve_and_schedule(tmp_path):
             "target_group": "classroom_teachers@example.org",
             "target_confirmed": "yes",
             "source_mode": "google_group",
-            "source_group": "staff@example.org",
+            "source_groups": (
+                "Staff@Example.org\n"
+                "administrators@example.org\n"
+                "staff@example.org"
+            ),
             "csv_mode": "upload",
             "exception_users": "admin@example.org",
             "exception_groups": "",
@@ -124,7 +130,16 @@ def test_group_policy_preview_then_approve_and_schedule(tmp_path):
     assert "Review and approve this exact membership plan" in preview.text
     policy = state.entitlement_store.policy_for_domain("example.org")
     plan = state.entitlement_store.get_plan(policy.pending_plan_id)
-    assert set(plan.adds) == {"staff@example.org", "admin@example.org"}
+    assert policy.source_groups == (
+        "administrators@example.org",
+        "staff@example.org",
+    )
+    assert set(plan.adds) == {
+        "administrators@example.org",
+        "staff@example.org",
+        "admin@example.org",
+    }
+    assert "administrators@example.org, staff@example.org" in preview.text
 
     applied = client.post(
         "/classroom/access/approve",
@@ -163,6 +178,27 @@ def test_approving_disabled_schedule_unloads_existing_launch_agent(tmp_path):
     assert applied.status_code == 200
     assert state.entitlement_scheduler.disabled == [policy.id]
     assert state.entitlement_scheduler.installed == []
+
+
+def test_legacy_single_source_form_field_still_previews(tmp_path):
+    client, state = _client(tmp_path)
+
+    preview = client.post(
+        "/classroom/access/save",
+        data={
+            "target_group": "classroom_teachers@example.org",
+            "target_confirmed": "yes",
+            "source_mode": "google_group",
+            "source_group": "staff@example.org",
+            "schedule_hour": "2",
+            "schedule_minute": "0",
+        },
+    )
+
+    assert preview.status_code == 200
+    policy = state.entitlement_store.policy_for_domain("example.org")
+    assert policy.source_groups == ("staff@example.org",)
+    assert "Review and approve this exact membership plan" in preview.text
 
 
 def test_csv_upload_is_normalized_and_busy_apply_does_not_mutate(tmp_path):
