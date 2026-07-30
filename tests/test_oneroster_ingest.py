@@ -14,6 +14,8 @@ from gamgui.components.oneroster import (
     OneRosterService,
     SnapshotState,
     course_display_name,
+    normalize_course_name_template,
+    render_course_display_name,
     section_alias,
 )
 from gamgui.components.oneroster import ingest as ingest_module
@@ -495,6 +497,80 @@ def test_naming_and_alias_are_deterministic() -> None:
     assert course_display_name("Math", "P1", "Section A", "2026") == (
         "Math \u2013 P1 (2026)"
     )
+    assert render_course_display_name(
+        "{course_title}[[ \u2013 {class_code}]][[ ({school_year})]]",
+        "Math",
+        "",
+        "Section A",
+        "2026",
+    ) == "Math (2026)"
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{unknown}",
+        "{course_title.__class__}",
+        "{course_title!r}",
+        "{course_title:>20}",
+        "[[{course_title}]",
+        "[[literal]] {course_title}",
+        "literal only",
+        "{course_title}\n{class_title}",
+    ),
+)
+def test_course_naming_template_rejects_unsafe_or_ambiguous_syntax(
+    template: str,
+) -> None:
+    with pytest.raises(ValueError):
+        normalize_course_name_template(template)
+
+
+def test_course_naming_template_rebuilds_and_persists_per_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "custom-course-names"
+    service = OneRosterService("example.org", root)
+    snapshot = service.upload(zip_bytes(valid_files()))
+
+    configured = service.configure_course_naming(
+        snapshot.id,
+        "{class_title}[[ ({school_year})]]",
+    )
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert configured.ready_for_apply
+    assert configured.course_name_template == (
+        "{class_title}[[ ({school_year})]]"
+    )
+    assert course["name"] == "Algebra Section (2026-27)"
+
+    reopened = OneRosterService("example.org", root)
+    persisted = reopened.get_import(snapshot.id)
+    assert persisted.course_name_template == configured.course_name_template
+    assert reopened.preview(snapshot.id, "courses").items[0]["name"] == (
+        "Algebra Section (2026-27)"
+    )
+
+
+def test_rendered_course_name_over_google_limit_is_quarantined(
+    tmp_path: Path,
+) -> None:
+    files = valid_files()
+    files["courses.csv"] = files["courses.csv"].replace(
+        "Algebra I",
+        "A" * 751,
+    )
+    service = OneRosterService("example.org", tmp_path / "long-course-name")
+
+    snapshot = service.upload(zip_bytes(files))
+    courses = service.preview(snapshot.id, "courses").items
+    issues = service.preview(snapshot.id, "issues").items
+
+    assert snapshot.counts.quarantined_courses == 1
+    assert courses[0]["ready"] is False
+    assert "OR-COURSE-NAME-LENGTH" in courses[0]["quarantine_codes"]
+    assert any(issue["code"] == "OR-COURSE-NAME-LENGTH" for issue in issues)
 
 
 def test_blank_class_code_uses_class_title_only(tmp_path: Path) -> None:

@@ -69,6 +69,9 @@ class FakeOneRosterService:
                 "blocking_issue_count": 0,
                 "selected_session_id": "",
                 "ready_for_apply": False,
+                "course_name_template": (
+                    "{course_title} \u2013 {class_code} ({school_year})"
+                ),
             }
         }
         self.profile = {
@@ -158,6 +161,13 @@ class FakeOneRosterService:
             state="ready",
             ready_for_apply=True,
         )
+        self.snapshots[import_id] = snapshot
+        return snapshot
+
+    def configure_course_naming(self, import_id, template):
+        self.calls.append(("configure_course_naming", import_id, template))
+        snapshot = dict(self.snapshots[import_id])
+        snapshot["course_name_template"] = template
         self.snapshots[import_id] = snapshot
         return snapshot
 
@@ -623,6 +633,53 @@ def test_academic_session_selection_is_local_and_rebuilds_import():
     assert "term-2026" in selected.text
     assert ("select_session", "import-1", "term-2026") in service.calls
     assert not any(call[0] == "build_live_plan" for call in service.calls)
+
+
+def test_import_naming_scheme_is_discoverable_and_rebuilds_locally():
+    client, service = _client()
+    page = client.get("/classroom/imports/import/import-1")
+
+    assert page.status_code == 200
+    assert "Class naming" in page.text
+    assert "Apply naming and rebuild preview" in page.text
+    assert "{course_title}" in page.text
+    assert "stable" in page.text
+
+    configured = client.post(
+        "/classroom/imports/import/import-1/naming",
+        data={
+            "naming_choice": "custom",
+            "custom_template": (
+                "{course_title}[[ \u2013 {class_code}]]"
+                "[[ ({school_year})]]"
+            ),
+        },
+    )
+
+    assert configured.status_code == 200
+    assert "Class names were rebuilt locally" in configured.text
+    assert (
+        "configure_course_naming",
+        "import-1",
+        "{course_title}[[ \u2013 {class_code}]][[ ({school_year})]]",
+    ) in service.calls
+    assert not any(call[0] == "build_live_plan" for call in service.calls)
+
+
+def test_import_naming_rejects_invalid_choice_without_rebuilding():
+    client, service = _client()
+
+    response = client.post(
+        "/classroom/imports/import/import-1/naming",
+        data={"naming_choice": "unknown", "custom_template": "{class_title}"},
+    )
+
+    assert response.status_code == 200
+    assert "OR-NAMING-INVALID" in response.text
+    assert not any(
+        call[0] == "configure_course_naming"
+        for call in service.calls
+    )
 
 
 def test_gam_export_is_allowlisted_streamed_and_not_cached():

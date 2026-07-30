@@ -24,9 +24,10 @@ from gamgui.core.processes import current_process_identity, process_lease_is_dea
 
 from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
-from .ingest import rebuild_course_plans
+from .ingest import normalize_course_name_template, rebuild_course_plans
 from .models import (
     ClassroomImportManifest,
+    DEFAULT_COURSE_NAME_TEMPLATE,
     DashboardStatus,
     GateState,
     ImportAction,
@@ -89,8 +90,12 @@ class OneRosterStore:
                 INSERT INTO imports (
                     id, domain, filename, source_sha256, state, package_mode,
                     selected_session_id, imported_at, expires_at, counts_json,
-                    issue_count, blocking_issue_count, accepted_at
-                ) VALUES (?, ?, ?, '', 'preparing', 'invalid', '', ?, ?, '{}', 0, 0, 0)
+                    issue_count, blocking_issue_count, accepted_at,
+                    course_name_template
+                ) VALUES (
+                    ?, ?, ?, '', 'preparing', 'invalid', '', ?, ?, '{}',
+                    0, 0, 0, ?
+                )
                 """,
                 (
                     import_id,
@@ -98,6 +103,7 @@ class OneRosterStore:
                     Path(filename or "OneRoster.zip").name,
                     imported_at,
                     imported_at + (30 * 24 * 60 * 60),
+                    DEFAULT_COURSE_NAME_TEMPLATE,
                 ),
             )
         self._restrict_state_perms()
@@ -182,6 +188,7 @@ class OneRosterStore:
                 counts=snapshot.counts,
                 issue_count=snapshot.issue_count,
                 blocking_issue_count=snapshot.blocking_issue_count,
+                course_name_template=snapshot.course_name_template,
             )
         return snapshot
 
@@ -228,6 +235,7 @@ class OneRosterStore:
             self.normalized_path(import_id),
             domain=self.domain,
             selected_session_id=session_id,
+            course_name_template=snapshot.course_name_template,
         )
         blocking = sum(issue.blocking for issue in issues)
         state = (
@@ -245,6 +253,53 @@ class OneRosterStore:
             issue_count=len(issues),
             blocking_issue_count=blocking,
         )
+
+    def configure_course_naming(
+        self,
+        import_id: str,
+        template: str,
+    ) -> OneRosterSnapshot:
+        snapshot = self.get_import(import_id)
+        self._require_material(snapshot)
+        normalized_template = normalize_course_name_template(template)
+        counts, issues = rebuild_course_plans(
+            self.normalized_path(import_id),
+            domain=self.domain,
+            selected_session_id=snapshot.selected_session_id,
+            course_name_template=normalized_template,
+        )
+        blocking = sum(issue.blocking for issue in issues)
+        state = (
+            SnapshotState.READY
+            if (
+                snapshot.package_mode == "bulk"
+                and snapshot.selected_session_id
+                and blocking == 0
+            )
+            else SnapshotState.BLOCKED
+        )
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE imports
+                SET course_name_template = ?, state = ?, counts_json = ?,
+                    issue_count = ?, blocking_issue_count = ?
+                WHERE domain = ? AND id = ?
+                """,
+                (
+                    normalized_template,
+                    state.value,
+                    json.dumps(counts.to_dict(), sort_keys=True),
+                    len(issues),
+                    blocking,
+                    self.domain,
+                    import_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise KeyError("OneRoster import not found.")
+        self._restrict_state_perms()
+        return self.get_import(import_id)
 
     def preview(
         self,
@@ -1561,7 +1616,9 @@ class OneRosterStore:
                     package_mode TEXT NOT NULL, selected_session_id TEXT NOT NULL,
                     imported_at REAL NOT NULL, expires_at REAL NOT NULL,
                     counts_json TEXT NOT NULL, issue_count INTEGER NOT NULL,
-                    blocking_issue_count INTEGER NOT NULL, accepted_at REAL NOT NULL
+                    blocking_issue_count INTEGER NOT NULL, accepted_at REAL NOT NULL,
+                    course_name_template TEXT NOT NULL DEFAULT
+                        '{course_title} \u2013 {class_code} ({school_year})'
                 );
                 CREATE INDEX IF NOT EXISTS imports_domain_time
                     ON imports(domain, imported_at DESC);
@@ -1623,6 +1680,15 @@ class OneRosterStore:
                 CREATE INDEX IF NOT EXISTS accepted_aliases_domain_time
                     ON accepted_managed_aliases(domain, accepted_at DESC, alias);
                 """
+            )
+            _ensure_column(
+                conn,
+                "imports",
+                "course_name_template",
+                (
+                    "TEXT NOT NULL DEFAULT "
+                    "'{course_title} \u2013 {class_code} ({school_year})'"
+                ),
             )
             _ensure_column(
                 conn,
@@ -1750,6 +1816,9 @@ def _snapshot_from_row(row: sqlite3.Row) -> OneRosterSnapshot:
         counts=SnapshotCounts.from_mapping(json.loads(str(row["counts_json"]))),
         issue_count=int(row["issue_count"]),
         blocking_issue_count=int(row["blocking_issue_count"]),
+        course_name_template=str(
+            row["course_name_template"] or DEFAULT_COURSE_NAME_TEMPLATE
+        ),
     )
 
 

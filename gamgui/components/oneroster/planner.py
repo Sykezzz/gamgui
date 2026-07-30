@@ -33,7 +33,7 @@ from .store import OneRosterStore
 from .thresholds import evaluate_thresholds
 
 
-PLANNER_SCHEMA_VERSION = 1
+PLANNER_SCHEMA_VERSION = 2
 DIRECTORY_CONCURRENCY = 12
 COURSE_CONCURRENCY = 8
 # The current planner uses compact in-memory participant/action models. Keep
@@ -215,6 +215,7 @@ class OneRosterPlanner:
             {
                 "planner_schema": PLANNER_SCHEMA_VERSION,
                 "limited_import": effective_limited,
+                "course_name_template": snapshot.course_name_template,
                 "threshold_profile": profile.to_dict(),
             }
         )

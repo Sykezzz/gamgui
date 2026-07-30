@@ -11,9 +11,11 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
+import string
 import zipfile
 from collections import defaultdict
 from contextlib import closing
@@ -23,8 +25,12 @@ from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping, Optional, Sequence
 
 from .models import (
+    COURSE_NAME_VARIABLES,
+    DEFAULT_COURSE_NAME_TEMPLATE,
     ImportIssue,
     IssueSeverity,
+    MAX_COURSE_NAME_CHARS,
+    MAX_COURSE_NAME_TEMPLATE_CHARS,
     SnapshotCounts,
     SnapshotState,
 )
@@ -72,6 +78,7 @@ _CLASS_DERIVED_ISSUE_CODES = frozenset(
         "OR-OWNER-AMBIGUOUS",
         "OR-USER-MISSING",
         "OR-COURSE-NAME-INCOMPLETE",
+        "OR-COURSE-NAME-LENGTH",
         "OR-GAM-VALUE-INVALID",
     }
 )
@@ -265,7 +272,13 @@ def ingest_archive(
                 selected_session = _choose_current_session(
                     conn, domain, today or datetime.now(timezone.utc).date(), issues
                 )
-                _build_course_plans(conn, domain, selected_session, issues)
+                _build_course_plans(
+                    conn,
+                    domain,
+                    selected_session,
+                    issues,
+                    DEFAULT_COURSE_NAME_TEMPLATE,
+                )
                 _write_issues(conn, issues)
                 rebuild_preview_index(conn, domain)
             counts = _snapshot_counts(conn, domain)
@@ -285,6 +298,7 @@ def rebuild_course_plans(
     *,
     domain: str,
     selected_session_id: str,
+    course_name_template: str = DEFAULT_COURSE_NAME_TEMPLATE,
 ) -> tuple[SnapshotCounts, tuple[ImportIssue, ...]]:
     """Rebuild derived plans after an explicit operator term selection."""
 
@@ -312,7 +326,13 @@ def rebuild_course_plans(
                 DEFAULT_MAX_ISSUES,
                 tuple(_issues_from_db(conn)),
             )
-            _build_course_plans(conn, domain, selected_session_id, issues)
+            _build_course_plans(
+                conn,
+                domain,
+                selected_session_id,
+                issues,
+                normalize_course_name_template(course_name_template),
+            )
             _write_issues(conn, issues)
             rebuild_preview_index(conn, domain)
         counts = _snapshot_counts(conn, domain)
@@ -338,6 +358,97 @@ def course_display_name(course_title: str, class_code: str, class_title: str, sc
     if not title or not section or not year:
         return ""
     return f"{title} \u2013 {section} ({year})"
+
+
+_OPTIONAL_NAME_BLOCK = re.compile(r"\[\[([^\[\]]*)\]\]")
+_NAME_FORMATTER = string.Formatter()
+
+
+def normalize_course_name_template(value: str) -> str:
+    """Validate and normalize one safe, data-only Classroom naming template."""
+
+    template = str(value or "").strip() or DEFAULT_COURSE_NAME_TEMPLATE
+    if len(template) > MAX_COURSE_NAME_TEMPLATE_CHARS:
+        raise ValueError(
+            f"Class naming templates must be {MAX_COURSE_NAME_TEMPLATE_CHARS} "
+            "characters or fewer."
+        )
+    if any(ord(character) < 32 for character in template):
+        raise ValueError("Class naming templates cannot contain control characters.")
+    if template.count("[[") != template.count("]]"):
+        raise ValueError("Optional class-name segments must use matching [[ and ]].")
+    without_optional = _OPTIONAL_NAME_BLOCK.sub(
+        lambda match: match.group(1),
+        template,
+    )
+    if "[[" in without_optional or "]]" in without_optional:
+        raise ValueError("Optional class-name segments cannot be nested.")
+    fields = _course_name_fields(without_optional)
+    for match in _OPTIONAL_NAME_BLOCK.finditer(template):
+        if not _course_name_fields(match.group(1)):
+            raise ValueError(
+                "Each optional class-name segment must contain at least one variable."
+            )
+    if not fields:
+        raise ValueError("Class naming templates must include at least one variable.")
+    return template
+
+
+def render_course_display_name(
+    template: str,
+    course_title: str,
+    class_code: str,
+    class_title: str,
+    school_year: str,
+) -> str:
+    """Render a validated template without evaluating expressions or attributes."""
+
+    normalized = normalize_course_name_template(template)
+    if normalized == DEFAULT_COURSE_NAME_TEMPLATE:
+        return course_display_name(
+            course_title,
+            class_code,
+            class_title,
+            school_year,
+        )
+    values = {
+        "course_title": (course_title or "").strip(),
+        "class_code": (class_code or "").strip(),
+        "class_title": (class_title or "").strip(),
+        "school_year": (school_year or "").strip(),
+    }
+
+    def optional_segment(match: re.Match[str]) -> str:
+        segment = match.group(1)
+        fields = _course_name_fields(segment)
+        return segment if all(values[field] for field in fields) else ""
+
+    expanded = _OPTIONAL_NAME_BLOCK.sub(optional_segment, normalized)
+    rendered = expanded.format_map(values)
+    return re.sub(r"[ \t]+", " ", rendered).strip()
+
+
+def _course_name_fields(template: str) -> tuple[str, ...]:
+    try:
+        parsed = tuple(_NAME_FORMATTER.parse(template))
+    except ValueError as exc:
+        raise ValueError("Class naming template braces are not valid.") from exc
+    fields: list[str] = []
+    for _literal, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if (
+            field_name not in COURSE_NAME_VARIABLES
+            or format_spec
+            or conversion is not None
+        ):
+            allowed = ", ".join(f"{{{name}}}" for name in COURSE_NAME_VARIABLES)
+            raise ValueError(
+                "Class naming templates may use only these variables: "
+                f"{allowed}."
+            )
+        fields.append(field_name)
+    return tuple(fields)
 
 
 def _result(
@@ -1222,6 +1333,7 @@ def _build_course_plans(
     domain: str,
     selected_session_id: str,
     issues: list[ImportIssue],
+    course_name_template: str,
 ) -> None:
     conn.execute("DELETE FROM course_plans WHERE domain = ?", (domain,))
     aliases: dict[str, list[str]] = defaultdict(list)
@@ -1339,7 +1451,8 @@ def _build_course_plans(
         school_year = str(
             row["course_school_year"] or row["selected_school_year"] or ""
         ).strip()
-        name = course_display_name(
+        name = render_course_display_name(
+            course_name_template,
             str(row["course_title"] or ""),
             str(row["class_code"] or ""),
             str(row["title"] or ""),
@@ -1347,6 +1460,8 @@ def _build_course_plans(
         )
         if not name:
             codes.append("OR-COURSE-NAME-INCOMPLETE")
+        elif len(name) > MAX_COURSE_NAME_CHARS:
+            codes.append("OR-COURSE-NAME-LENGTH")
         owner_email = (
             str(stats["primary_email"] or "").casefold()
             if stats is not None and primary_count == 1
@@ -1706,6 +1821,9 @@ def _quarantine_message(code: str) -> str:
         "OR-OWNER-AMBIGUOUS": "Class does not have exactly one resolvable primary teacher.",
         "OR-USER-MISSING": "At least one class enrollment has no resolvable user email.",
         "OR-COURSE-NAME-INCOMPLETE": "Course name cannot be built from the required OneRoster fields.",
+        "OR-COURSE-NAME-LENGTH": (
+            "The rendered Classroom name exceeds Google's 750-character limit."
+        ),
         "OR-GAM-VALUE-INVALID": "A Classroom-bound value contains an unsafe control character.",
     }
     return messages.get(code, "Class cannot be applied until its source data is corrected.")

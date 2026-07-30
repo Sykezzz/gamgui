@@ -190,7 +190,10 @@ OneRoster Import Studio is a first-party optional application profile. The `core
 all ordinary Classroom and Drive administration but omits the OneRoster executable package,
 templates, and migrations. The `classroom-oneroster` profile adds validated OneRoster ZIP
 ingestion, import thresholds, immutable district manifests, and the student-enrollment release
-gate.
+gate. Each retained import also has a local class-naming step with common schemes and a safe custom
+template using `{course_title}`, `{class_code}`, `{class_title}`, and `{school_year}`. Naming
+changes rebuild the bounded preview and GAM-ready exports without changing stable `Section_`
+aliases or contacting Google.
 
 New installations offer the component during first-run setup. It can also be installed, disabled,
 enabled, or removed from **Settings → Components**. Installing or removing it stages a complete

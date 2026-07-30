@@ -1,12 +1,20 @@
 """First-party optional OneRoster Classroom component."""
 
 from .gate import DISTRICT_TIMEZONE
-from .ingest import SafetyLimits, course_display_name, section_alias
+from .ingest import (
+    SafetyLimits,
+    course_display_name,
+    normalize_course_name_template,
+    render_course_display_name,
+    section_alias,
+)
 from .models import (
     ActionLimit,
     BlackoutWindow,
     ClassroomImportManifest,
+    COURSE_NAME_VARIABLES,
     DashboardStatus,
+    DEFAULT_COURSE_NAME_TEMPLATE,
     ExecutionSummary,
     GateState,
     ImportAction,
@@ -35,8 +43,10 @@ __all__ = [
     "ActionLimit",
     "BlackoutWindow",
     "ClassroomImportManifest",
+    "COURSE_NAME_VARIABLES",
     "DISTRICT_TIMEZONE",
     "DashboardStatus",
+    "DEFAULT_COURSE_NAME_TEMPLATE",
     "ExecutionSummary",
     "GateState",
     "ImportAction",
@@ -63,5 +73,7 @@ __all__ = [
     "default_component_data_root",
     "evaluate_thresholds",
     "evaluation_hash",
+    "normalize_course_name_template",
+    "render_course_display_name",
     "section_alias",
 ]

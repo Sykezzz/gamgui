@@ -124,6 +124,16 @@ class OneRosterService:
     def select_session(self, import_id: str, session_id: str) -> OneRosterSnapshot:
         return self.store.select_session(import_id, session_id)
 
+    def configure_course_naming(
+        self,
+        import_id: str,
+        template: str,
+    ) -> OneRosterSnapshot:
+        try:
+            return self.store.configure_course_naming(import_id, template)
+        except ValueError as exc:
+            raise OneRosterError("OR-NAMING-INVALID", str(exc)) from exc
+
     def preview(
         self,
         import_id: str,

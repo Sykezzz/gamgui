@@ -88,7 +88,7 @@ TOKEN_COOKIE = "gamgui_token"
 
 
 def _local_update_notice() -> str:
-    """Return a generic local updater notice without exposing paths or command output."""
+    """Return an actionable updater notice without exposing paths or command output."""
     try:
         state = UpdateStateStore().load()
     except (OSError, RuntimeError):
@@ -101,7 +101,26 @@ def _local_update_notice() -> str:
     ):
         return "A verified update is ready. Quit and reopen GamGUI to install it."
     if state.last_error:
-        return "The automatic update could not be prepared. This version is still running normally."
+        code = state.component_error_code or "CMP-UPDATE-PREPARE-FAILED"
+        if code == "CMP-UPDATE-CHANNEL" or state.installed_signing_channel == "developer-id":
+            return (
+                "This installation uses the official release channel. Install a verified "
+                "notarized GamGUI release to update it. (CMP-UPDATE-CHANNEL)"
+            )
+        if code == "CMP-ACTIVE-JOB":
+            return (
+                "Update preparation was safely deferred while another administrative "
+                "task was active. GamGUI will try again after restart. (CMP-ACTIVE-JOB)"
+            )
+        if code == "CMP-UPDATE-SIGNING":
+            return (
+                'The Mac could not access the required "GamGUI Local" signing identity. '
+                "The current app was kept unchanged. (CMP-UPDATE-SIGNING)"
+            )
+        return (
+            "The automatic update could not be prepared. The current version is still "
+            f"running normally. ({code})"
+        )
     return ""
 
 
