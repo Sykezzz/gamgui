@@ -614,23 +614,25 @@ def test_preview_rejects_unallowlisted_kind_before_service():
     assert not any(call[0] == "preview" for call in service.calls)
 
 
-def test_academic_session_selection_is_local_and_rebuilds_import():
+def test_academic_sessions_explain_automatic_scope_without_selection_controls():
     client, service = _client()
     preview = client.get(
         "/classroom/imports/import/import-1/preview",
         params={"kind": "sessions"},
     )
     assert preview.status_code == 200
-    assert "Use this session" in preview.text
+    assert "automatically includes each class" in preview.text
+    assert "no single-session selection is required" in preview.text
+    assert "Use this session" not in preview.text
     assert "term-2026" in preview.text
 
+    # Stale clients can still post the old action without changing Google state.
     selected = client.post(
         "/classroom/imports/import/import-1/session",
         data={"session_id": "term-2026"},
     )
     assert selected.status_code == 200
-    assert "Academic session selected" in selected.text
-    assert "term-2026" in selected.text
+    assert "Automatic class and enrollment date scope refreshed" in selected.text
     assert ("select_session", "import-1", "term-2026") in service.calls
     assert not any(call[0] == "build_live_plan" for call in service.calls)
 

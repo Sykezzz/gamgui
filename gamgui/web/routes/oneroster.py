@@ -1220,7 +1220,7 @@ async def select_academic_session(
         {
             "snapshot": snapshot,
             "notice": (
-                "Academic session selected and course plans rebuilt locally. "
+                "Automatic class and enrollment date scope refreshed locally. "
                 "No Classroom changes were made."
             ),
         },

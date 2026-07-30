@@ -30,6 +30,7 @@ COURSE_NAME_VARIABLES = (
 )
 MAX_COURSE_NAME_TEMPLATE_CHARS = 500
 MAX_COURSE_NAME_CHARS = 750
+AUTOMATIC_SESSION_SCOPE = "__automatic__"
 
 
 class IssueSeverity(str, Enum):
@@ -131,7 +132,6 @@ class OneRosterSnapshot:
             self.state is SnapshotState.READY
             and self.package_mode == "bulk"
             and self.blocking_issue_count == 0
-            and bool(self.selected_session_id)
         )
 
 

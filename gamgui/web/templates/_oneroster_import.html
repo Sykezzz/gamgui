@@ -16,7 +16,10 @@
     <div><dt class="text-brand-blueink">Issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.issue_count | default(0) }}</dd></div>
     <div><dt class="text-brand-blueink">Blocking issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.blocking_issue_count | default(0) }}</dd></div>
     <div><dt class="text-brand-blueink">Ready for apply</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ "Yes" if snapshot.ready_for_apply else "No" }}</dd></div>
-    <div class="sm:col-span-2"><dt class="text-brand-blueink">Academic session</dt><dd class="mt-0.5 font-mono text-xs text-brand-black">{{ snapshot.selected_session_id | default("Selection required", true) }}</dd></div>
+    <div class="sm:col-span-2">
+      <dt class="text-brand-blueink">Roster date scope</dt>
+      <dd class="mt-0.5 font-semibold text-brand-black">Automatic from class terms and enrollment dates</dd>
+    </div>
   </dl>
 
   {% if snapshot.counts %}
@@ -147,7 +150,7 @@
         </div>
       </form>
       {% else %}
-      <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">Resolve blocking issues and select one academic session before building a live plan.</p>
+      <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">Resolve the blocking source issues before building a live plan. Academic session and enrollment dates are applied automatically.</p>
       {% endif %}
     </section>
   </div>

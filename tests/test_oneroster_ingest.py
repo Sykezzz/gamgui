@@ -5,11 +5,13 @@ import io
 import json
 import os
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
 from gamgui.components.oneroster import (
+    AUTOMATIC_SESSION_SCOPE,
     OneRosterError,
     OneRosterService,
     SnapshotState,
@@ -29,7 +31,7 @@ def test_valid_full_snapshot_normalizes_previews_and_exports(tmp_path: Path) -> 
     assert snapshot.state is SnapshotState.READY
     assert snapshot.ready_for_apply
     assert snapshot.domain == "example.org"
-    assert snapshot.selected_session_id == "term-1"
+    assert snapshot.selected_session_id == AUTOMATIC_SESSION_SCOPE
     assert snapshot.counts.ready_courses == 1
     assert snapshot.counts.students == 1
 
@@ -181,7 +183,7 @@ def test_unsupported_enrollment_role_quarantines_exact_class(tmp_path: Path) -> 
         snapshot.id, "issues", query="OR-ENROLLMENT-ROLE"
     ).items
     assert any(item["entity_kind"] == "enrollment" for item in rebuilt_issues)
-    assert not any(item["entity_kind"] == "class" for item in rebuilt_issues)
+    assert any(item["entity_kind"] == "class" for item in rebuilt_issues)
 
 
 def test_enrollment_with_missing_class_blocks_exact_state_apply(
@@ -223,8 +225,8 @@ def test_enrollment_with_missing_class_blocks_exact_state_apply(
             "academicSessions.csv",
             "term-1,active,",
             "term-1,tobedeleted,",
-            "OR-REFERENCE-TERM",
-            True,
+            "",
+            False,
         ),
     ),
 )
@@ -242,31 +244,183 @@ def test_deleted_reference_targets_never_produce_ready_courses(
         deleted_marker,
         1,
     )
-    service = OneRosterService("example.org", tmp_path / expected_code)
+    service = OneRosterService(
+        "example.org",
+        tmp_path / (expected_code or "inactive-session"),
+    )
 
     snapshot = service.upload(zip_bytes(files))
     course = service.preview(snapshot.id, "courses").items[0]
 
     assert course["ready"] is False
-    assert expected_code in course["quarantine_codes"]
+    if expected_code:
+        assert expected_code in course["quarantine_codes"]
+    else:
+        assert course["selected"] is False
+        assert course["quarantine_codes"] == ()
     assert (snapshot.state is SnapshotState.BLOCKED) is blocked
 
 
-def test_ambiguous_term_is_preview_only_until_selected(tmp_path: Path) -> None:
+def test_overlapping_terms_are_applied_automatically(tmp_path: Path) -> None:
     files = valid_files(term_ids="term-1,term-2")
     files["academicSessions.csv"] += (
         "term-2,active,Second Term,term,2000-01-01,2100-12-31,year-1,2026-27\n"
     )
     service = OneRosterService("example.org", tmp_path / "component")
     snapshot = service.upload(zip_bytes(files))
-    assert snapshot.state is SnapshotState.BLOCKED
-    assert snapshot.selected_session_id == ""
-    assert not snapshot.ready_for_apply
+    assert snapshot.state is SnapshotState.READY
+    assert snapshot.selected_session_id == AUTOMATIC_SESSION_SCOPE
+    assert snapshot.ready_for_apply
+    assert snapshot.counts.ready_courses == 1
 
-    selected = service.select_session(snapshot.id, "term-1")
-    assert selected.state is SnapshotState.READY
-    assert selected.selected_session_id == "term-1"
-    assert selected.counts.ready_courses == 1
+
+def test_session_dates_scope_each_class_and_treat_end_as_exclusive(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    files = valid_files(term_ids="term-current")
+    files["academicSessions.csv"] = csv_text(
+        (
+            "sourcedId",
+            "status",
+            "title",
+            "type",
+            "startDate",
+            "endDate",
+            "parentSourcedId",
+            "schoolYear",
+        ),
+        (
+            {
+                "sourcedId": "year-1",
+                "status": "active",
+                "title": "School Year",
+                "type": "schoolYear",
+                "startDate": (today - timedelta(days=30)).isoformat(),
+                "endDate": (today + timedelta(days=30)).isoformat(),
+                "parentSourcedId": "",
+                "schoolYear": "2026-27",
+            },
+            {
+                "sourcedId": "term-current",
+                "status": "active",
+                "title": "Current Term",
+                "type": "term",
+                "startDate": (today - timedelta(days=1)).isoformat(),
+                "endDate": (today + timedelta(days=1)).isoformat(),
+                "parentSourcedId": "year-1",
+                "schoolYear": "2026-27",
+            },
+            {
+                "sourcedId": "term-ended",
+                "status": "active",
+                "title": "Ended Term",
+                "type": "term",
+                "startDate": (today - timedelta(days=10)).isoformat(),
+                "endDate": today.isoformat(),
+                "parentSourcedId": "year-1",
+                "schoolYear": "2026-27",
+            },
+        ),
+    )
+    files["classes.csv"] += (
+        "ended-class,active,Ended Class,P2,,course-1,term-ended,school-1,9\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "dated-sessions")
+
+    snapshot = service.upload(zip_bytes(files))
+    courses = {
+        item["class_id"]: item
+        for item in service.preview(snapshot.id, "courses").items
+    }
+
+    assert snapshot.ready_for_apply
+    assert courses["101"]["selected"] is True
+    assert courses["101"]["ready"] is True
+    assert courses["ended-class"]["selected"] is False
+    assert courses["ended-class"]["quarantine_codes"] == ()
+    assert snapshot.counts.ready_courses == 1
+    assert snapshot.counts.quarantined_courses == 0
+
+
+def test_enrollment_dates_filter_current_roster_and_use_exclusive_end(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    files = valid_files()
+    files["enrollments.csv"] = files["enrollments.csv"].replace(
+        ",student,false,,",
+        (
+            f",student,false,{(today - timedelta(days=10)).isoformat()},"
+            f"{today.isoformat()}"
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "dated-enrollments")
+
+    snapshot = service.upload(zip_bytes(files))
+    students = io.StringIO()
+
+    assert snapshot.ready_for_apply
+    assert snapshot.counts.teachers == 1
+    assert snapshot.counts.students == 0
+    assert service.write_export(snapshot.id, "students.csv", students) == 0
+    enrollment = service.preview(
+        snapshot.id,
+        "enrollments",
+        query="enrollment-student-1",
+    ).items[0]
+    assert enrollment["in_scope"] is False
+
+
+def test_ended_enrollment_does_not_block_on_stale_class_reference(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    files = valid_files()
+    files["enrollments.csv"] = files["enrollments.csv"].replace(
+        "enrollment-student-1,active,101,",
+        "enrollment-student-1,active,missing-old-class,",
+    ).replace(
+        ",student,false,,",
+        (
+            f",student,false,{(today - timedelta(days=10)).isoformat()},"
+            f"{today.isoformat()}"
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "stale-ended-enrollment")
+
+    snapshot = service.upload(zip_bytes(files))
+
+    assert snapshot.ready_for_apply
+    assert snapshot.blocking_issue_count == 0
+    assert service.preview(
+        snapshot.id,
+        "issues",
+        query="OR-REFERENCE-ENROLLMENT",
+    ).total == 0
+
+
+def test_parent_session_does_not_keep_an_ended_child_term_active(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    files = valid_files(term_ids="year-1,term-1")
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "2000-01-01,2100-12-31,year-1,2026-27",
+        (
+            f"{(today - timedelta(days=10)).isoformat()},"
+            f"{today.isoformat()},year-1,2026-27"
+        ),
+        1,
+    )
+    service = OneRosterService("example.org", tmp_path / "specific-session")
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.ready_for_apply
+    assert course["selected"] is False
+    assert course["quarantine_codes"] == ()
 
 
 def test_session_reselection_does_not_amplify_existing_inactive_term_issues(
@@ -290,7 +444,7 @@ def test_session_reselection_does_not_amplify_existing_inactive_term_issues(
         item["code"] for item in service.preview(snapshot.id, "issues", limit=50).items
     }
     assert "OR-ISSUE-LIMIT" not in initial_codes
-    assert snapshot.issue_count == 1
+    assert snapshot.issue_count == 0
 
     rebuilt = service.select_session(snapshot.id, "year-1")
     rebuilt_codes = {
@@ -300,7 +454,9 @@ def test_session_reselection_does_not_amplify_existing_inactive_term_issues(
     assert rebuilt.issue_count == 0
 
 
-def test_session_selection_recomputes_selected_class_issues(tmp_path: Path) -> None:
+def test_manual_session_compatibility_call_does_not_filter_automatic_scope(
+    tmp_path: Path,
+) -> None:
     files = valid_files(term_ids="term-1,term-2")
     files["academicSessions.csv"] += (
         "term-2,active,Second Term,term,2000-01-01,2100-12-31,year-1,2026-27\n"
@@ -314,14 +470,15 @@ def test_session_selection_recomputes_selected_class_issues(tmp_path: Path) -> N
     initial_codes = {
         item["code"] for item in service.preview(snapshot.id, "issues", limit=50).items
     }
-    assert "OR-TERM-AMBIGUOUS" in initial_codes
-    assert "OR-OWNER-MISSING" not in initial_codes
+    assert "OR-TERM-AMBIGUOUS" not in initial_codes
+    assert "OR-OWNER-MISSING" in initial_codes
 
     first = service.select_session(snapshot.id, "term-1")
     first_codes = {
         item["code"] for item in service.preview(first.id, "issues", limit=50).items
     }
-    assert "OR-OWNER-MISSING" not in first_codes
+    assert first.selected_session_id == AUTOMATIC_SESSION_SCOPE
+    assert "OR-OWNER-MISSING" in first_codes
 
     second = service.select_session(snapshot.id, "term-2")
     second_codes = {
@@ -329,12 +486,7 @@ def test_session_selection_recomputes_selected_class_issues(tmp_path: Path) -> N
     }
     assert "OR-OWNER-MISSING" in second_codes
 
-    restored = service.select_session(snapshot.id, "term-1")
-    restored_codes = {
-        item["code"]
-        for item in service.preview(restored.id, "issues", limit=50).items
-    }
-    assert "OR-OWNER-MISSING" not in restored_codes
+    assert second.selected_session_id == AUTOMATIC_SESSION_SCOPE
 
 
 def test_bounded_cursor_search_and_domain_isolation(tmp_path: Path) -> None:
@@ -418,6 +570,42 @@ def test_legacy_snapshot_preview_index_is_prepared_with_writable_migration(
 
     assert page.total == 1
     assert page.items[0]["alias"] == "Section_101"
+
+
+def test_legacy_selected_session_snapshot_migrates_to_automatic_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "legacy-session-scope"
+    service = OneRosterService("example.org", root)
+    snapshot = service.upload(zip_bytes(valid_files()))
+    normalized = service.store.normalized_path(snapshot.id)
+    with sqlite3.connect(normalized) as conn:
+        conn.execute("ALTER TABLE enrollments DROP COLUMN in_scope")
+        conn.execute("UPDATE preview_index_meta SET version = 1")
+    with sqlite3.connect(service.store.state_path) as conn:
+        conn.execute(
+            """
+            UPDATE imports SET selected_session_id = ?
+            WHERE domain = ? AND id = ?
+            """,
+            ("term-1", "example.org", snapshot.id),
+        )
+
+    reopened = OneRosterService("example.org", root)
+    upgraded = reopened.get_import(snapshot.id)
+
+    assert upgraded.selected_session_id == AUTOMATIC_SESSION_SCOPE
+    assert upgraded.ready_for_apply
+    with sqlite3.connect(normalized) as conn:
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(enrollments)").fetchall()
+        }
+        preview_version = int(
+            conn.execute("SELECT version FROM preview_index_meta").fetchone()[0]
+        )
+    assert "in_scope" in columns
+    assert preview_version == 2
 
 
 def test_retention_removes_material_but_keeps_history(tmp_path: Path) -> None:

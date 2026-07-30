@@ -10,6 +10,7 @@ from .ingest import (
 )
 from .models import (
     ActionLimit,
+    AUTOMATIC_SESSION_SCOPE,
     BlackoutWindow,
     ClassroomImportManifest,
     COURSE_NAME_VARIABLES,
@@ -41,6 +42,7 @@ from .thresholds import evaluate_thresholds, evaluation_hash
 
 __all__ = [
     "ActionLimit",
+    "AUTOMATIC_SESSION_SCOPE",
     "BlackoutWindow",
     "ClassroomImportManifest",
     "COURSE_NAME_VARIABLES",

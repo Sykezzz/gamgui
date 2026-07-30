@@ -15,7 +15,7 @@ import stat
 import time
 from contextlib import closing
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Mapping, Optional, Sequence, TextIO
 
@@ -26,6 +26,7 @@ from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
 from .ingest import normalize_course_name_template, rebuild_course_plans
 from .models import (
+    AUTOMATIC_SESSION_SCOPE,
     ClassroomImportManifest,
     DEFAULT_COURSE_NAME_TEMPLATE,
     DashboardStatus,
@@ -190,7 +191,53 @@ class OneRosterStore:
                 blocking_issue_count=snapshot.blocking_issue_count,
                 course_name_template=snapshot.course_name_template,
             )
+        if (
+            snapshot.package_mode == "bulk"
+            and snapshot.state not in {SnapshotState.PREPARING, SnapshotState.EXPIRED}
+            and snapshot.selected_session_id != AUTOMATIC_SESSION_SCOPE
+        ):
+            return self._refresh_automatic_scope(snapshot)
         return snapshot
+
+    def _refresh_automatic_scope(
+        self,
+        snapshot: OneRosterSnapshot,
+        *,
+        today: Optional[date] = None,
+    ) -> OneRosterSnapshot:
+        counts, issues = rebuild_course_plans(
+            self.normalized_path(snapshot.id),
+            domain=self.domain,
+            selected_session_id=AUTOMATIC_SESSION_SCOPE,
+            course_name_template=snapshot.course_name_template,
+            today=today,
+        )
+        blocking = sum(issue.blocking for issue in issues)
+        state = (
+            SnapshotState.READY
+            if snapshot.package_mode == "bulk" and blocking == 0
+            else SnapshotState.BLOCKED
+        )
+        return self.complete_import(
+            snapshot.id,
+            source_sha256=snapshot.source_sha256,
+            state=state,
+            package_mode=snapshot.package_mode,
+            selected_session_id=AUTOMATIC_SESSION_SCOPE,
+            counts=counts,
+            issue_count=len(issues),
+            blocking_issue_count=blocking,
+        )
+
+    def refresh_schedule_scope(
+        self,
+        import_id: str,
+        *,
+        today: Optional[date] = None,
+    ) -> OneRosterSnapshot:
+        snapshot = self.get_import(import_id)
+        self._require_material(snapshot)
+        return self._refresh_automatic_scope(snapshot, today=today)
 
     def history(self, limit: int = MAX_PAGE_SIZE) -> tuple[OneRosterSnapshot, ...]:
         page_size = max(1, min(int(limit or MAX_PAGE_SIZE), MAX_PAGE_SIZE))
@@ -229,30 +276,10 @@ class OneRosterStore:
         return tuple(_snapshot_from_row(row) for row in rows)
 
     def select_session(self, import_id: str, session_id: str) -> OneRosterSnapshot:
-        snapshot = self.get_import(import_id)
-        self._require_material(snapshot)
-        counts, issues = rebuild_course_plans(
-            self.normalized_path(import_id),
-            domain=self.domain,
-            selected_session_id=session_id,
-            course_name_template=snapshot.course_name_template,
-        )
-        blocking = sum(issue.blocking for issue in issues)
-        state = (
-            SnapshotState.READY
-            if snapshot.package_mode == "bulk" and blocking == 0
-            else SnapshotState.BLOCKED
-        )
-        return self.complete_import(
-            import_id,
-            source_sha256=snapshot.source_sha256,
-            state=state,
-            package_mode=snapshot.package_mode,
-            selected_session_id=session_id,
-            counts=counts,
-            issue_count=len(issues),
-            blocking_issue_count=blocking,
-        )
+        """Compatibility shim: roster scope is now derived automatically."""
+
+        del session_id
+        return self.refresh_schedule_scope(import_id)
 
     def configure_course_naming(
         self,
@@ -271,11 +298,7 @@ class OneRosterStore:
         blocking = sum(issue.blocking for issue in issues)
         state = (
             SnapshotState.READY
-            if (
-                snapshot.package_mode == "bulk"
-                and snapshot.selected_session_id
-                and blocking == 0
-            )
+            if snapshot.package_mode == "bulk" and blocking == 0
             else SnapshotState.BLOCKED
         )
         with closing(self._conn()) as conn, conn:
@@ -728,7 +751,7 @@ class OneRosterStore:
         if not snapshot.ready_for_apply:
             raise OneRosterError(
                 "OR-IMPORT-BLOCKED",
-                "Only a valid full snapshot with a selected term can create an apply manifest.",
+                "Only a valid full snapshot can create an apply manifest.",
             )
         normalized_kind = str(plan_kind or "").strip().casefold()
         if normalized_kind not in {"ordinary", "limited", "archive", "ownership"}:
@@ -1832,6 +1855,8 @@ def _preview_item(kind: str, row: sqlite3.Row) -> Mapping[str, Any]:
         item["blocking"] = bool(item["blocking"])
     if "is_primary" in item:
         item["is_primary"] = bool(item["is_primary"])
+    if "in_scope" in item:
+        item["in_scope"] = bool(item["in_scope"])
     return item
 
 
@@ -1855,7 +1880,8 @@ def _export_query(kind: str) -> Optional[tuple[tuple[str, ...], str]]:
               ON e.domain = p.domain AND e.class_id = p.class_id
             JOIN users u ON u.domain = e.domain AND u.sourced_id = e.user_id
             WHERE p.domain = ? AND p.selected = 1 AND p.ready = 1
-              AND e.status != 'tobedeleted' AND e.role = 'teacher'
+              AND e.status != 'tobedeleted' AND e.in_scope = 1
+              AND e.role = 'teacher'
               AND trim(u.email) != ''
             ORDER BY p.alias, u.email
             """,
@@ -1868,7 +1894,8 @@ def _export_query(kind: str) -> Optional[tuple[tuple[str, ...], str]]:
               ON e.domain = p.domain AND e.class_id = p.class_id
             JOIN users u ON u.domain = e.domain AND u.sourced_id = e.user_id
             WHERE p.domain = ? AND p.selected = 1 AND p.ready = 1
-              AND e.status != 'tobedeleted' AND e.role = 'student'
+              AND e.status != 'tobedeleted' AND e.in_scope = 1
+              AND e.role = 'student'
               AND trim(u.email) != ''
             ORDER BY p.alias, u.email
             """,
