@@ -740,10 +740,10 @@ class AppState:
         self.ensure_component_services()
         self._schedule_oneroster_gate()
 
-    def has_active_admin_jobs(self) -> bool:
+    def has_active_admin_jobs(self, *, include_registry: bool = True) -> bool:
         """Return whether rebinding services could interrupt an administrative mutation."""
 
-        if self.activity_registry.is_active():
+        if include_registry and self.activity_registry.is_active():
             return True
         terminal = {"completed", "failed", "cancelled", "interrupted"}
         for job in self.jobs.values():

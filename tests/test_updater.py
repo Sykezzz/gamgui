@@ -311,6 +311,44 @@ def test_automatic_update_prepares_without_workspace_canary(tmp_path):
     assert not state.last_error
 
 
+def test_no_candidate_clears_stale_manual_check_error(tmp_path):
+    store = UpdateStateStore(tmp_path / "state.json")
+    store.save(
+        UpdateState(
+            installed_sha="b" * 40,
+            last_error="old failure",
+            component_error_code="CMP-UPDATE-PREPARE-FAILED",
+        )
+    )
+
+    class Source:
+        def discover(self, *_args):
+            return None
+
+    assert UpdateCoordinator(store, Source()).check_and_prepare() is None
+    state = store.load()
+    assert state.last_checked_at > 0
+    assert state.last_error == ""
+    assert state.component_error_code == ""
+
+
+def test_recheck_of_ready_update_persists_time_and_clears_stale_error(tmp_path):
+    pending = _app_bundle(tmp_path / "pending" / "GamGUI.app", "candidate")
+    store = UpdateStateStore(tmp_path / "state.json")
+    state = _ready_state(pending)
+    state.last_error = "old failure"
+    state.component_error_code = "CMP-UPDATE-PREPARE-FAILED"
+    store.save(state)
+
+    checked = UpdateCoordinator(store=store).check_and_prepare()
+
+    refreshed = store.load()
+    assert checked == pending
+    assert refreshed.last_checked_at > 0
+    assert refreshed.last_error == ""
+    assert refreshed.component_error_code == ""
+
+
 def test_coordinator_fails_closed_when_job_active(tmp_path):
     store = UpdateStateStore(tmp_path / "state.json")
     coordinator = UpdateCoordinator(store=store, active_jobs=lambda: True)

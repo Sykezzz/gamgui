@@ -10,12 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import sys
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Iterable
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from ...core.updater import (
+    ACTIVATION_PROBE_ENV,
+    UpdateCoordinator,
+    UpdateStateStore,
+    activation_evidence_valid,
+    candidate_is_blocked,
+    installed_app_path,
+)
 from ..server import TEMPLATES
 
 router = APIRouter(prefix="/components")
@@ -211,6 +223,177 @@ def _active_admin_job(request: Request) -> bool:
     return bool(checker()) if callable(checker) else False
 
 
+def _active_admin_job_without_registry(state: Any) -> bool:
+    """Ignore only the updater's own lease while retaining every other job check."""
+
+    checker = getattr(state, "has_active_admin_jobs", None)
+    if not callable(checker):
+        return False
+    try:
+        signature = inspect.signature(checker)
+        signature.bind(include_registry=False)
+    except (TypeError, ValueError):
+        return bool(checker())
+    return bool(checker(include_registry=False))
+
+
+def _update_store(request: Request) -> UpdateStateStore | None:
+    manager = _manager(request)
+    store = getattr(manager, "store", None)
+    return store if isinstance(store, UpdateStateStore) else None
+
+
+def _manual_update_supported() -> bool:
+    return bool(
+        sys.platform == "darwin"
+        and installed_app_path() is not None
+        and os.environ.get(ACTIVATION_PROBE_ENV) != "1"
+        and not os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
+    )
+
+
+def _update_thread(state: Any) -> threading.Thread | None:
+    thread = getattr(state, "update_check_thread", None)
+    return thread if isinstance(thread, threading.Thread) else None
+
+
+def _safe_update_error(code: str) -> str:
+    return {
+        "CMP-ACTIVE-JOB": (
+            "The check was safely skipped because another administrative task is "
+            "active. Try again after it finishes."
+        ),
+        "CMP-UPDATE-CHANNEL": (
+            "This installation uses the official release channel. Install a verified "
+            "notarized GamGUI release to update it."
+        ),
+        "CMP-UPDATE-SIGNING": (
+            'The Mac could not access the required "GamGUI Local" signing identity. '
+            "The current app was kept unchanged."
+        ),
+    }.get(
+        code,
+        "GamGUI could not prepare the update. The current version is still running normally.",
+    )
+
+
+def _format_checked_at(value: float) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromtimestamp(value).astimezone().strftime(
+            "%Y-%m-%d %I:%M %p %Z"
+        )
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def application_update_context(request: Request) -> dict[str, Any]:
+    state = request.app.state.gamgui
+    store = _update_store(request)
+    updater_state = store.load() if store is not None else None
+    checking = bool(
+        (thread := _update_thread(state)) is not None and thread.is_alive()
+    )
+    supported = _manual_update_supported()
+    ready = bool(
+        updater_state is not None
+        and updater_state.pending_app
+        and updater_state.candidate_sha
+        and activation_evidence_valid(updater_state)
+        and not candidate_is_blocked(updater_state)
+    )
+    error_code = (
+        str(updater_state.component_error_code or "CMP-UPDATE-PREPARE-FAILED")
+        if updater_state is not None and updater_state.last_error
+        else ""
+    )
+    if checking:
+        status = "checking"
+        status_label = "Checking"
+        message = (
+            "GamGUI is checking the validated release channel and will prepare a "
+            "matching update in the background if one is available."
+        )
+    elif ready:
+        status = "ready"
+        status_label = "Update ready"
+        message = (
+            "A verified update is ready. Quit and reopen GamGUI to review the "
+            "install-and-restart prompt."
+        )
+    elif error_code:
+        status = "error"
+        status_label = "Check needs attention"
+        message = _safe_update_error(error_code)
+    elif updater_state is not None and updater_state.last_checked_at:
+        status = "current"
+        status_label = "No validated update"
+        message = (
+            "No newer release has completed the exact-version update checks yet. "
+            "GamGUI will keep using the current version."
+        )
+    elif not supported:
+        status = "unavailable"
+        status_label = "Installed app required"
+        message = (
+            "Manual update checks are available from the installed GamGUI app on macOS."
+        )
+    else:
+        status = "idle"
+        status_label = "Not checked"
+        message = "Check the validated release channel without restarting GamGUI."
+
+    installed_artifact = (
+        updater_state.installed_artifact if updater_state is not None else None
+    )
+    candidate_artifact = (
+        updater_state.candidate_artifact if updater_state is not None else None
+    )
+    return {
+        "status": status,
+        "status_label": status_label,
+        "message": message,
+        "checking": checking,
+        "supported": supported and store is not None,
+        "last_checked_at": _format_checked_at(
+            updater_state.last_checked_at if updater_state is not None else 0.0
+        ),
+        "installed_version": str(
+            getattr(installed_artifact, "version", "") or ""
+        ),
+        "candidate_version": str(
+            getattr(candidate_artifact, "version", "") or ""
+        ),
+        "channel": str(
+            updater_state.installed_signing_channel
+            if updater_state is not None
+            else ""
+        ),
+        "error_code": error_code,
+    }
+
+
+def _application_update_response(request: Request) -> HTMLResponse:
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_application_update_status.html",
+        {"update": application_update_context(request)},
+    )
+
+
+def _build_update_coordinator(request: Request) -> UpdateCoordinator:
+    state = request.app.state.gamgui
+    store = _update_store(request)
+    if store is None:
+        raise RuntimeError("The local update state is unavailable.")
+    return UpdateCoordinator(
+        store=store,
+        active_jobs=lambda: _active_admin_job_without_registry(state),
+        activity_registry=state.activity_registry,
+    )
+
+
 async def _invoke_action(
     manager: Any,
     action: str,
@@ -353,8 +536,50 @@ async def components_page(request: Request) -> HTMLResponse:
     return TEMPLATES.TemplateResponse(
         request,
         "components.html",
-        {"component": await component_context(request)},
+        {
+            "component": await component_context(request),
+            "update": application_update_context(request),
+        },
     )
+
+
+@router.get("/update/status", response_class=HTMLResponse)
+async def application_update_status(request: Request) -> HTMLResponse:
+    return _application_update_response(request)
+
+
+@router.post("/update/check", response_class=HTMLResponse)
+async def check_for_application_update(request: Request) -> HTMLResponse:
+    state = request.app.state.gamgui
+    if not _manual_update_supported() or _update_store(request) is None:
+        return _application_update_response(request)
+    if _active_admin_job(request):
+        store = _update_store(request)
+        updater_state = store.load()
+        updater_state.last_checked_at = datetime.now().timestamp()
+        updater_state.last_error = (
+            "An administrative operation is active; update preparation was deferred."
+        )
+        updater_state.component_error_code = "CMP-ACTIVE-JOB"
+        store.save(updater_state)
+        return _application_update_response(request)
+
+    lock = getattr(state, "update_check_lock", None)
+    if not isinstance(lock, type(threading.Lock())):
+        lock = threading.Lock()
+        setattr(state, "update_check_lock", lock)
+    with lock:
+        current = _update_thread(state)
+        if current is None or not current.is_alive():
+            coordinator = _build_update_coordinator(request)
+            current = threading.Thread(
+                target=coordinator.check_and_prepare,
+                name="gamgui-manual-update-check",
+                daemon=True,
+            )
+            setattr(state, "update_check_thread", current)
+            current.start()
+    return _application_update_response(request)
 
 
 @core_deep_link_router.get("/classroom/imports", response_class=HTMLResponse)
@@ -376,6 +601,7 @@ async def core_oneroster_deep_link(request: Request) -> HTMLResponse:
         {
             "component": component,
             "deep_link": True,
+            "update": application_update_context(request),
         },
     )
 

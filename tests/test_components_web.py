@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from gamgui.core.activity import ActivityRegistry
+from gamgui.core.updater import UpdateState, UpdateStateStore
 from gamgui.web.routes.components import core_deep_link_router, router
 
 TEMPLATES = Path(__file__).parents[1] / "gamgui" / "web" / "templates"
@@ -81,6 +85,7 @@ def _client(manager=None, *, active=False):
     state = SimpleNamespace(
         component_manager=manager,
         has_active_admin_jobs=lambda: active,
+        activity_registry=ActivityRegistry(),
     )
     app = FastAPI()
     app.state.gamgui = state
@@ -96,6 +101,8 @@ def test_components_page_is_permanent_local_settings_surface():
     assert response.status_code == 200
     assert "Settings" in response.text
     assert "OneRoster Classroom" in response.text
+    assert "Keep GamGUI current" in response.text
+    assert "Check for updates" in response.text
     assert "Install OneRoster" in response.text
     assert "participant identifiers" in response.text
     assert "Purge OneRoster data" in response.text
@@ -325,6 +332,133 @@ def test_component_controls_have_accessible_status_and_focus_contracts():
     assert "focus-visible:ring-2" in response.text
     assert 'aria-labelledby="oneroster-component-heading"' in response.text
     assert '<form' in response.text and "<button" in response.text
+
+
+def test_manual_update_check_runs_once_and_reports_no_validated_release(
+    tmp_path,
+    monkeypatch,
+):
+    manager = FakeComponentManager()
+    manager.store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    client = _client(manager)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Coordinator:
+        def check_and_prepare(self):
+            calls.append("check")
+            started.set()
+            assert release.wait(timeout=5)
+            state = manager.store.load()
+            state.last_checked_at = time.time()
+            state.last_error = ""
+            state.component_error_code = ""
+            manager.store.save(state)
+
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._manual_update_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._build_update_coordinator",
+        lambda _request: Coordinator(),
+    )
+
+    response = client.post("/components/update/check")
+    assert started.wait(timeout=2)
+    assert response.status_code == 200
+    assert "Checking for updates" in response.text
+    assert 'hx-get="/components/update/status"' in response.text
+
+    duplicate = client.post("/components/update/check")
+    assert duplicate.status_code == 200
+    assert calls == ["check"]
+
+    release.set()
+    for _attempt in range(50):
+        status = client.get("/components/update/status")
+        if "No validated update" in status.text:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("manual update status did not finish")
+
+    assert "No newer release has completed" in status.text
+    assert "Last checked" in status.text
+    assert "Check for updates" in status.text
+
+
+def test_manual_update_check_refuses_active_admin_work(tmp_path, monkeypatch):
+    manager = FakeComponentManager()
+    manager.store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._manual_update_supported",
+        lambda: True,
+    )
+
+    response = _client(manager, active=True).post("/components/update/check")
+
+    assert response.status_code == 200
+    assert "Check needs attention" in response.text
+    assert "CMP-ACTIVE-JOB" in response.text
+    assert "safely skipped" in response.text
+
+
+def test_manual_update_status_never_exposes_private_failure_detail(
+    tmp_path,
+    monkeypatch,
+):
+    manager = FakeComponentManager()
+    manager.store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    manager.store.save(
+        UpdateState(
+            last_checked_at=time.time(),
+            last_error="/Users/admin/private/signing/output",
+            component_error_code="CMP-UPDATE-PREPARE-FAILED",
+        )
+    )
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._manual_update_supported",
+        lambda: True,
+    )
+
+    response = _client(manager).get("/components/update/status")
+
+    assert response.status_code == 200
+    assert "current version is still running normally" in response.text
+    assert "CMP-UPDATE-PREPARE-FAILED" in response.text
+    assert "/Users/admin" not in response.text
+
+
+def test_manual_update_status_reports_a_verified_ready_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    manager = FakeComponentManager()
+    manager.store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    manager.store.save(
+        UpdateState(
+            candidate_sha="a" * 40,
+            pending_app=str(tmp_path / "pending" / "GamGUI.app"),
+            last_checked_at=time.time(),
+        )
+    )
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._manual_update_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "gamgui.web.routes.components.activation_evidence_valid",
+        lambda _state: True,
+    )
+
+    response = _client(manager).get("/components/update/status")
+
+    assert response.status_code == 200
+    assert "Update ready" in response.text
+    assert "Quit and reopen GamGUI" in response.text
+    assert "Check for updates" in response.text
 
 
 def test_shared_navigation_and_discovery_cards_point_to_components():

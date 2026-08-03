@@ -1190,6 +1190,9 @@ class UpdateCoordinator:
             and existing.is_dir()
         ):
             if activation_evidence_valid(state):
+                state.last_error = ""
+                state.component_error_code = ""
+                self.store.save(state)
                 return existing
             self.block(
                 state.candidate_sha,
@@ -1221,6 +1224,7 @@ class UpdateCoordinator:
             )
             if candidate is None:
                 state.last_error = ""
+                state.component_error_code = ""
                 self.store.save(state)
                 return None
             if READY_CHECK not in candidate.successful_checks:

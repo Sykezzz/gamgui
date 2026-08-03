@@ -26,6 +26,10 @@
     {% endif %}
   </header>
 
+  {% if not deep_link %}
+    {% include "_application_update_status.html" %}
+  {% endif %}
+
   {% set context = "settings" %}
   {% include "_component_card.html" %}
 
