@@ -18,18 +18,26 @@
     <div><dt class="text-brand-blueink">Ready for apply</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ "Yes" if snapshot.ready_for_apply else "No" }}</dd></div>
     <div class="sm:col-span-2">
       <dt class="text-brand-blueink">Roster date scope</dt>
-      <dd class="mt-0.5 font-semibold text-brand-black">Automatic from class terms and enrollment dates</dd>
+      <dd class="mt-0.5 font-semibold text-brand-black">
+        {{ snapshot.scope_date | default("Not resolved", true) }}
+        {% if snapshot.school_year_title or snapshot.school_year_id %}
+        · {{ snapshot.school_year_title | default(snapshot.school_year_id, true) }}
+        <span class="font-mono text-xs">({{ snapshot.school_year_id }})</span>
+        {% endif %}
+      </dd>
     </div>
   </dl>
 
+  {% if snapshot.counts.future_ready_courses | default(0) > 0 %}
+  <div class="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900" role="status">
+    <p class="font-semibold">{{ snapshot.counts.future_ready_courses }} future-term {{ "class creates" if snapshot.counts.future_ready_courses == 1 else "classes create" }} now for teacher setup.</p>
+    <p class="mt-1">Teachers are included immediately. Students with an explicit future enrollment date remain out of the roster until that date.</p>
+  </div>
+  {% endif %}
+
   {% if snapshot.state == "ready" and snapshot.counts.deferred_courses | default(0) > 0 %}
   <div class="mt-4 rounded-lg border border-brand-blue/30 bg-paper px-4 py-3 text-sm text-brand-blueink" role="status">
-    {% if snapshot.counts.ready_courses | default(0) == 0 and snapshot.counts.quarantined_courses | default(0) == 0 %}
-    <p class="font-semibold text-brand-black">No classes are scheduled for today, and the import is still valid.</p>
-    <p class="mt-1">This is expected for a summer or future-term snapshot. {{ snapshot.counts.deferred_courses }} {{ "class is" if snapshot.counts.deferred_courses == 1 else "classes are" }} retained outside today’s date window and will be reconsidered automatically when a live plan is built on or after {{ "its" if snapshot.counts.deferred_courses == 1 else "their" }} session start dates.</p>
-    {% else %}
-    <p><span class="font-semibold text-brand-black">{{ snapshot.counts.deferred_courses }} classes are outside today’s date window.</span> They are retained and protected from removal or archive decisions until their session dates apply.</p>
-    {% endif %}
+    <p><span class="font-semibold text-brand-black">{{ snapshot.counts.deferred_courses }} {{ "class is" if snapshot.counts.deferred_courses == 1 else "classes are" }} out of scope.</span> Ended terms and other school years are retained so their Classroom aliases remain protected from removal or archive decisions.</p>
   </div>
   {% endif %}
 
@@ -40,7 +48,7 @@
       <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink"><tr><th class="px-3 py-2" scope="col">Entity</th><th class="px-3 py-2" scope="col">Rows</th></tr></thead>
       <tbody class="divide-y divide-brand-gray/20">
         {% for name, count in snapshot.counts.items() %}
-        <tr><th class="px-3 py-2 font-medium text-brand-black" scope="row">{{ name | replace("_", " ") | title }}</th><td class="px-3 py-2 tabular-nums text-brand-blueink">{{ count }}</td></tr>
+        <tr><th class="px-3 py-2 font-medium text-brand-black" scope="row">{{ "Out Of Scope Courses" if name == "deferred_courses" else name | replace("_", " ") | title }}</th><td class="px-3 py-2 tabular-nums text-brand-blueink">{{ count }}</td></tr>
         {% endfor %}
       </tbody>
     </table>

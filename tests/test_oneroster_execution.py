@@ -343,6 +343,74 @@ async def test_course_naming_change_invalidates_live_plan_configuration(
 
 
 @pytest.mark.asyncio
+async def test_future_class_creates_with_all_teachers_but_defers_dated_student(
+    tmp_path: Path,
+):
+    today = datetime.now(timezone.utc).date()
+    start = today + timedelta(days=9)
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        (
+            "term-1,active,Future Term,term,"
+            f"{start.isoformat()},{(start + timedelta(days=120)).isoformat()}"
+        ),
+    )
+    files["users.csv"] += (
+        "teacher-2,active,teacher2,teacher2@example.org,Tess,Teacher,t2,school-1\n"
+    )
+    files["enrollments.csv"] = files["enrollments.csv"].replace(
+        "teacher,true,,",
+        f"teacher,true,{start.isoformat()},",
+    ).replace(
+        "student,false,,",
+        f"student,false,{start.isoformat()},",
+    )
+    files["enrollments.csv"] += (
+        "enrollment-teacher-2,active,101,school-1,teacher-2,teacher,false,"
+        f"{start.isoformat()},\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "future-class")
+    snapshot = service.upload(zip_bytes(files))
+    service.save_threshold_profile(ThresholdProfile(configured=True))
+    service.mark_scope_ready()
+    connector = FakeClassroom()
+    connector.users["teacher2@example.org"] = GAMUser(
+        "teacher2@example.org",
+        user_id="teacher2-id",
+    )
+
+    plan = await service.build_live_plan(connector, snapshot.id)
+
+    assert any(action.kind == "course_create" for action in plan.actions)
+    assert any(
+        action.kind == "teacher_add"
+        and action.target == "teacher2@example.org"
+        for action in plan.actions
+    )
+    assert not any(action.kind == "student_add" for action in plan.actions)
+
+
+@pytest.mark.asyncio
+async def test_crossing_roster_date_invalidates_unpersisted_live_plan(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    planned_at = datetime(2026, 8, 3, 23, 59, tzinfo=timezone.utc)
+    plan = await service.build_live_plan(connector, import_id, now=planned_at)
+
+    with pytest.raises(OneRosterError) as stale:
+        service.persist_live_plan(
+            plan,
+            now=planned_at + timedelta(days=1),
+        )
+
+    assert stale.value.code == "OR-SCOPE-DRIFT"
+    assert connector.batches == []
+
+
+@pytest.mark.asyncio
 async def test_teacher_prep_then_exact_manifest_student_release(tmp_path: Path):
     service, import_id = _ready_service(tmp_path)
     connector = FakeClassroom()

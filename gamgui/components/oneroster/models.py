@@ -81,6 +81,8 @@ class SnapshotCounts:
     academic_sessions: int = 0
     orgs: int = 0
     ready_courses: int = 0
+    current_courses: int = 0
+    future_ready_courses: int = 0
     quarantined_courses: int = 0
     deferred_courses: int = 0
     teachers: int = 0
@@ -95,6 +97,8 @@ class SnapshotCounts:
             "academic_sessions": self.academic_sessions,
             "orgs": self.orgs,
             "ready_courses": self.ready_courses,
+            "current_courses": self.current_courses,
+            "future_ready_courses": self.future_ready_courses,
             "quarantined_courses": self.quarantined_courses,
             "deferred_courses": self.deferred_courses,
             "teachers": self.teachers,
@@ -127,6 +131,9 @@ class OneRosterSnapshot:
     issue_count: int
     blocking_issue_count: int
     course_name_template: str
+    scope_date: str = ""
+    school_year_id: str = ""
+    school_year_title: str = ""
 
     @property
     def ready_for_apply(self) -> bool:
@@ -441,6 +448,7 @@ class LivePlanningResult:
         compare=False,
         repr=False,
     )
+    scope_hash: str = ""
 
     def actions_for(self, plan_kind: str) -> Tuple[ImportAction, ...]:
         kind = str(plan_kind or "").strip().casefold()

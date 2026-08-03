@@ -344,7 +344,7 @@ def test_session_dates_scope_each_class_and_treat_end_as_exclusive(
     assert snapshot.counts.deferred_courses == 1
 
 
-def test_future_sessions_are_deferred_without_blocking_summer_import(
+def test_future_sessions_are_ready_now_for_teacher_setup(
     tmp_path: Path,
 ) -> None:
     today = date.today()
@@ -365,11 +365,199 @@ def test_future_sessions_are_deferred_without_blocking_summer_import(
     assert snapshot.state is SnapshotState.READY
     assert snapshot.ready_for_apply
     assert snapshot.blocking_issue_count == 0
-    assert snapshot.counts.ready_courses == 0
+    assert snapshot.counts.ready_courses == 1
+    assert snapshot.counts.future_ready_courses == 1
     assert snapshot.counts.quarantined_courses == 0
-    assert snapshot.counts.deferred_courses == 1
-    assert course["selected"] is False
+    assert snapshot.counts.deferred_courses == 0
+    assert course["selected"] is True
+    assert course["ready"] is True
+    assert course["scope_state"] == "future-ready"
     assert course["quarantine_codes"] == ()
+
+
+def test_future_teacher_enrollment_is_immediate_but_future_student_waits(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    start = today + timedelta(days=9)
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        (
+            "term-1,active,Future Term,term,"
+            f"{start.isoformat()},{(start + timedelta(days=120)).isoformat()}"
+        ),
+    )
+    files["enrollments.csv"] = files["enrollments.csv"].replace(
+        "teacher,true,,",
+        f"teacher,true,{start.isoformat()},",
+    ).replace(
+        "student,false,,",
+        f"student,false,{start.isoformat()},",
+    )
+    service = OneRosterService("example.org", tmp_path / "future-enrollments")
+
+    snapshot = service.upload(zip_bytes(files))
+    teachers = io.StringIO()
+    students = io.StringIO()
+
+    assert snapshot.counts.teachers == 1
+    assert snapshot.counts.students == 0
+    assert service.write_export(snapshot.id, "teachers.csv", teachers) == 1
+    assert "teacher@example.org" in teachers.getvalue()
+    assert service.write_export(snapshot.id, "students.csv", students) == 0
+
+    effective = service.store.refresh_schedule_scope(snapshot.id, today=start)
+    students = io.StringIO()
+    assert effective.counts.students == 1
+    assert service.write_export(snapshot.id, "students.csv", students) == 1
+    assert "student@example.org" in students.getvalue()
+
+
+def test_selects_nearest_upcoming_school_year_during_summer(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    year_start = today + timedelta(days=20)
+    files = valid_files()
+    files["academicSessions.csv"] = csv_text(
+        (
+            "sourcedId",
+            "status",
+            "title",
+            "type",
+            "startDate",
+            "endDate",
+            "parentSourcedId",
+            "schoolYear",
+        ),
+        (
+            {
+                "sourcedId": "year-1",
+                "status": "active",
+                "title": "2026-27 School Year",
+                "type": "schoolYear",
+                "startDate": year_start.isoformat(),
+                "endDate": (year_start + timedelta(days=300)).isoformat(),
+                "parentSourcedId": "",
+                "schoolYear": "2026-27",
+            },
+            {
+                "sourcedId": "term-1",
+                "status": "active",
+                "title": "Fall Term",
+                "type": "term",
+                "startDate": (year_start + timedelta(days=10)).isoformat(),
+                "endDate": (year_start + timedelta(days=130)).isoformat(),
+                "parentSourcedId": "year-1",
+                "schoolYear": "2026-27",
+            },
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "summer-year")
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.ready_for_apply
+    assert snapshot.school_year_id == "year-1"
+    assert snapshot.school_year_title == "2026-27 School Year"
+    assert course["scope_state"] == "future-ready"
+    assert course["ready"] is True
+
+
+def test_later_semester_is_ready_but_next_school_year_is_out_of_scope(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    later_start = today + timedelta(days=90)
+    files = valid_files()
+    files["academicSessions.csv"] += (
+        "term-later,active,Later Semester,term,"
+        f"{later_start.isoformat()},{(later_start + timedelta(days=90)).isoformat()},"
+        "year-1,2026-27\n"
+        "year-2,active,Next School Year,schoolYear,2101-01-01,2200-12-31,,2027-28\n"
+        "term-next,active,Next Fall,term,2101-08-01,2101-12-20,year-2,2027-28\n"
+    )
+    files["courses.csv"] += (
+        "course-2,active,Geometry,year-1,school-1,9\n"
+        "course-3,active,Physics,year-2,school-1,10\n"
+    )
+    files["classes.csv"] += (
+        "202,active,Geometry Section,P2,202,course-2,term-later,school-1,9\n"
+        "303,active,Physics Section,P3,303,course-3,term-next,school-1,10\n"
+    )
+    files["enrollments.csv"] += (
+        "enrollment-teacher-202,active,202,school-1,teacher-1,teacher,true,,\n"
+        "enrollment-teacher-303,active,303,school-1,teacher-1,teacher,true,,\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "multi-year-scope")
+
+    snapshot = service.upload(zip_bytes(files))
+    courses = {
+        item["class_id"]: item
+        for item in service.preview(snapshot.id, "courses", limit=50).items
+    }
+
+    assert snapshot.ready_for_apply
+    assert courses["202"]["scope_state"] == "future-ready"
+    assert courses["202"]["ready"] is True
+    assert courses["303"]["scope_state"] == "other-year"
+    assert courses["303"]["selected"] is False
+    assert courses["303"]["ready"] is False
+
+
+def test_overlapping_current_school_years_hold_the_import(tmp_path: Path) -> None:
+    files = valid_files()
+    files["academicSessions.csv"] += (
+        "year-2,active,Conflicting Year,schoolYear,2001-01-01,2099-12-31,,2027-28\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "overlapping-years")
+
+    snapshot = service.upload(zip_bytes(files))
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert not snapshot.ready_for_apply
+    assert service.preview(
+        snapshot.id,
+        "issues",
+        query="OR-SCHOOL-YEAR-AMBIGUOUS",
+    ).total == 1
+
+
+def test_invalid_school_year_dates_hold_automatic_selection(tmp_path: Path) -> None:
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "year-1,active,School Year,schoolYear,2000-01-01,2100-12-31",
+        "year-1,active,School Year,schoolYear,not-a-date,2100-12-31",
+    )
+    service = OneRosterService("example.org", tmp_path / "invalid-year-dates")
+
+    snapshot = service.upload(zip_bytes(files))
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert not snapshot.school_year_id
+    assert service.preview(
+        snapshot.id,
+        "issues",
+        query="OR-SESSION-DATE",
+    ).total >= 1
+
+
+def test_term_with_missing_school_year_parent_holds_the_import(tmp_path: Path) -> None:
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term,2000-01-01,2100-12-31,year-1,2026-27",
+        "term,2000-01-01,2100-12-31,missing-year,2026-27",
+    )
+    service = OneRosterService("example.org", tmp_path / "missing-year-parent")
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert course["scope_state"] == "uncertain"
+    assert "OR-SCHOOL-YEAR-HIERARCHY" in course["quarantine_codes"]
 
 
 def test_enrollment_dates_filter_current_roster_and_use_exclusive_end(
@@ -634,7 +822,45 @@ def test_legacy_selected_session_snapshot_migrates_to_automatic_scope(
             conn.execute("SELECT version FROM preview_index_meta").fetchone()[0]
         )
     assert "in_scope" in columns
-    assert preview_version == 2
+    assert preview_version == 3
+
+
+def test_legacy_snapshot_rebuilds_persisted_course_scope_before_preview(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "legacy-course-scope"
+    service = OneRosterService("example.org", root)
+    snapshot = service.upload(zip_bytes(valid_files()))
+    normalized = service.store.normalized_path(snapshot.id)
+    with sqlite3.connect(normalized) as conn:
+        conn.execute("DROP TABLE schedule_scope")
+        for column in (
+            "scope_state",
+            "scope_date",
+            "school_year_id",
+            "term_start",
+            "term_end",
+        ):
+            conn.execute(f"ALTER TABLE course_plans DROP COLUMN {column}")
+        conn.execute("UPDATE preview_index_meta SET version = 1")
+    with sqlite3.connect(service.store.state_path) as conn:
+        conn.execute(
+            """
+            UPDATE imports SET scope_date = '', school_year_id = '',
+                school_year_title = ''
+            WHERE domain = ? AND id = ?
+            """,
+            ("example.org", snapshot.id),
+        )
+
+    reopened = OneRosterService("example.org", root)
+    course = reopened.preview(snapshot.id, "courses").items[0]
+    upgraded = reopened.get_import(snapshot.id)
+
+    assert upgraded.scope_date == date.today().isoformat()
+    assert upgraded.school_year_id == "year-1"
+    assert course["scope_state"] == "current"
+    assert course["school_year_id"] == "year-1"
 
 
 def test_retention_removes_material_but_keeps_history(tmp_path: Path) -> None:

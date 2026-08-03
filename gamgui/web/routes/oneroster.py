@@ -60,6 +60,18 @@ _PREVIEW_KINDS = {
     "issues",
     "excluded",
 }
+_PREFERRED_PREVIEW_COLUMNS = {
+    "courses": (
+        "class_id",
+        "alias",
+        "name",
+        "owner_email",
+        "scope_state",
+        "school_year_id",
+        "selected",
+        "ready",
+    ),
+}
 _EXPORT_KINDS = {
     "courses",
     "teachers",
@@ -1679,7 +1691,16 @@ async def preview_snapshot(
     rows = _records(page.get("items", page.get("rows", [])))[:page_size]
     columns = page.get("columns")
     if not isinstance(columns, (list, tuple)):
-        columns = list(rows[0].keys())[:8] if rows else []
+        available = list(rows[0].keys()) if rows else []
+        preferred = [
+            column
+            for column in _PREFERRED_PREVIEW_COLUMNS.get(kind, ())
+            if column in available
+        ]
+        columns = [
+            *preferred,
+            *(column for column in available if column not in preferred),
+        ][:8]
     columns = [str(column) for column in columns][:8]
     context = {
             "import_id": import_id,

@@ -589,13 +589,23 @@ def test_folder_upload_accepts_future_session_snapshot_without_error(
     )
 
     assert response.status_code == 200
-    assert "No classes are scheduled for today" in response.text
-    assert "summer or future-term snapshot" in response.text
+    assert "creates now for teacher setup" in response.text
+    assert "Students with an explicit future enrollment date" in response.text
     assert "Error code" not in response.text
     snapshot = service.history()[0]
     assert snapshot.ready_for_apply
-    assert snapshot.counts.ready_courses == 0
-    assert snapshot.counts.deferred_courses == 1
+    assert snapshot.counts.ready_courses == 1
+    assert snapshot.counts.future_ready_courses == 1
+    assert snapshot.counts.deferred_courses == 0
+    preview = client.get(
+        f"/classroom/imports/import/{snapshot.id}/preview",
+        params={"kind": "courses"},
+    )
+    assert preview.status_code == 200
+    assert "Scope State" in preview.text
+    assert "future-ready" in preview.text
+    assert "Selected" in preview.text
+    assert "Ready" in preview.text
     assert not registry.is_active()
 
 
@@ -757,8 +767,8 @@ def test_academic_sessions_explain_automatic_scope_without_selection_controls():
         params={"kind": "sessions"},
     )
     assert preview.status_code == 200
-    assert "automatically includes each class" in preview.text
-    assert "no single-session selection is required" in preview.text
+    assert "automatically selects the current or nearest upcoming school year" in preview.text
+    assert "including future terms" in preview.text
     assert "Use this session" not in preview.text
     assert "term-2026" in preview.text
 

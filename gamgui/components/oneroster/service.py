@@ -7,13 +7,11 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Optional, Sequence, TextIO
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from gamgui.core.activity import ActivityRegistry
 from gamgui.core.setup import ONEROSTER_DWD_SCOPES
 
-from .ingest import SafetyLimits, copy_upload, ingest_archive
-from .gate import DISTRICT_TIMEZONE
+from .ingest import SafetyLimits, copy_upload, district_roster_date, ingest_archive
 from .models import (
     ClassroomImportManifest,
     DashboardStatus,
@@ -304,24 +302,6 @@ class OneRosterService:
         from .planner import OneRosterPlanner
 
         self.require_scope_ready()
-        try:
-            district_zone = ZoneInfo(DISTRICT_TIMEZONE)
-        except ZoneInfoNotFoundError:
-            district_zone = None
-        roster_date = (
-            now.astimezone(district_zone).date()
-            if now is not None and now.tzinfo is not None and district_zone is not None
-            else (
-                now.date()
-                if now is not None
-                else (
-                    datetime.now(district_zone).date()
-                    if district_zone is not None
-                    else datetime.now().date()
-                )
-            )
-        )
-        self.store.refresh_schedule_scope(import_id, today=roster_date)
         return await OneRosterPlanner(self.store, connector).plan(
             import_id,
             limited_import=limited_import,
@@ -333,9 +313,15 @@ class OneRosterService:
         planning: LivePlanningResult,
         *,
         pilot_evidence: str = "",
+        now: Optional[datetime] = None,
     ) -> PlannedManifestSet:
         """Persist one district plan plus separately approvable archive/owner plans."""
-        snapshot = self.store.get_import(planning.import_id)
+        from .planner import planner_configuration_hash
+
+        snapshot = self.store.refresh_schedule_scope(
+            planning.import_id,
+            today=district_roster_date(now),
+        )
         if snapshot.source_sha256 != planning.source_hash:
             raise OneRosterError(
                 "OR-SOURCE-DRIFT",
@@ -344,6 +330,23 @@ class OneRosterService:
         evaluation = planning.threshold_evaluation
         profile = self.store.get_threshold_profile()
         if evaluation.profile_hash != canonical_hash(profile.to_dict()):
+            raise OneRosterError(
+                "OR-CONFIG-DRIFT",
+                "District import configuration changed after live planning.",
+            )
+        schedule_scope = self.store.schedule_scope(planning.import_id)
+        if planning.scope_hash and planning.scope_hash != canonical_hash(schedule_scope):
+            raise OneRosterError(
+                "OR-SCOPE-DRIFT",
+                "The roster date or selected school year changed after live planning.",
+            )
+        expected_config_hash = planner_configuration_hash(
+            limited_import=planning.limited_import,
+            course_name_template=snapshot.course_name_template,
+            threshold_profile=profile.to_dict(),
+            schedule_scope=schedule_scope,
+        )
+        if expected_config_hash != planning.config_hash:
             raise OneRosterError(
                 "OR-CONFIG-DRIFT",
                 "District import configuration changed after live planning.",
