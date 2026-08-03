@@ -257,6 +257,23 @@ def _update_thread(state: Any) -> threading.Thread | None:
     return thread if isinstance(thread, threading.Thread) else None
 
 
+def _update_check_in_progress(state: Any) -> bool:
+    """Recognize the updater's own lease without admitting other activity kinds."""
+
+    thread = _update_thread(state)
+    if thread is not None and thread.is_alive():
+        return True
+    registry = getattr(state, "activity_registry", None)
+    snapshot = getattr(registry, "snapshot", None)
+    if not callable(snapshot):
+        return False
+    try:
+        active = snapshot()
+    except Exception:
+        return False
+    return bool(active is not None and getattr(active, "kind", "") == "app-update")
+
+
 def _safe_update_error(code: str) -> str:
     return {
         "CMP-ACTIVE-JOB": (
@@ -292,9 +309,7 @@ def application_update_context(request: Request) -> dict[str, Any]:
     state = request.app.state.gamgui
     store = _update_store(request)
     updater_state = store.load() if store is not None else None
-    checking = bool(
-        (thread := _update_thread(state)) is not None and thread.is_alive()
-    )
+    checking = _update_check_in_progress(state)
     supported = _manual_update_supported()
     ready = bool(
         updater_state is not None
@@ -552,6 +567,8 @@ async def application_update_status(request: Request) -> HTMLResponse:
 async def check_for_application_update(request: Request) -> HTMLResponse:
     state = request.app.state.gamgui
     if not _manual_update_supported() or _update_store(request) is None:
+        return _application_update_response(request)
+    if _update_check_in_progress(state):
         return _application_update_response(request)
     if _active_admin_job(request):
         store = _update_store(request)

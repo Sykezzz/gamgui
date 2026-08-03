@@ -2221,10 +2221,18 @@ def _valid_status(
     status = _status(row)
     if status in {"active", "tobedeleted"}:
         return True
+    if entity_kind == "academicSessions" and status == "inactive":
+        # Bulk exporters commonly retain this legacy session token. It is only
+        # accepted structurally; automatic date scope still determines readiness.
+        return True
     issues.append(
         _issue(
             "OR-STATUS-INVALID",
-            "OneRoster status must be active or tobedeleted.",
+            (
+                "Academic-session status must be active, inactive, or tobedeleted."
+                if entity_kind == "academicSessions"
+                else "OneRoster status must be active or tobedeleted."
+            ),
             entity_kind,
             str(row.get("sourcedId", "") or ""),
             row_number,

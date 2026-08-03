@@ -405,6 +405,43 @@ def test_manual_update_check_refuses_active_admin_work(tmp_path, monkeypatch):
     assert "safely skipped" in response.text
 
 
+def test_manual_update_check_ignores_its_own_updater_lease(tmp_path, monkeypatch):
+    manager = FakeComponentManager()
+    manager.store = UpdateStateStore(tmp_path / "updates" / "state.json")
+    registry = ActivityRegistry()
+    state = SimpleNamespace(
+        component_manager=manager,
+        activity_registry=registry,
+        has_active_admin_jobs=lambda *, include_registry=True: (
+            include_registry and registry.is_active()
+        ),
+    )
+    app = FastAPI()
+    app.state.gamgui = state
+    app.include_router(router)
+    client = TestClient(app)
+    coordinator_requests = []
+
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._manual_update_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "gamgui.web.routes.components._build_update_coordinator",
+        lambda _request: coordinator_requests.append("started"),
+    )
+
+    with registry.acquire("app-update"):
+        assert state.has_active_admin_jobs()
+        assert not state.has_active_admin_jobs(include_registry=False)
+        response = client.post("/components/update/check")
+
+    assert response.status_code == 200
+    assert "Checking for updates" in response.text
+    assert "CMP-ACTIVE-JOB" not in response.text
+    assert coordinator_requests == []
+
+
 def test_manual_update_status_never_exposes_private_failure_detail(
     tmp_path,
     monkeypatch,
