@@ -16,7 +16,10 @@
     <div><dt class="text-brand-blueink">Issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.issue_count | default(0) }}</dd></div>
     <div><dt class="text-brand-blueink">Blocking issues</dt><dd class="mt-0.5 font-semibold tabular-nums text-brand-black">{{ snapshot.blocking_issue_count | default(0) }}</dd></div>
     <div><dt class="text-brand-blueink">Ready for apply</dt><dd class="mt-0.5 font-semibold text-brand-black">{{ "Yes" if snapshot.ready_for_apply else "No" }}</dd></div>
-    <div class="sm:col-span-2"><dt class="text-brand-blueink">Academic session</dt><dd class="mt-0.5 font-mono text-xs text-brand-black">{{ snapshot.selected_session_id | default("Selection required", true) }}</dd></div>
+    <div class="sm:col-span-2">
+      <dt class="text-brand-blueink">Roster date scope</dt>
+      <dd class="mt-0.5 font-semibold text-brand-black">Automatic from class terms and enrollment dates</dd>
+    </div>
   </dl>
 
   {% if snapshot.counts %}
@@ -32,6 +35,77 @@
     </table>
   </div>
   {% endif %}
+
+  <section class="mt-5 rounded-xl border border-brand-blue/30 bg-paper/60 p-4" aria-labelledby="oneroster-naming-heading">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h3 id="oneroster-naming-heading" class="font-semibold text-brand-black">Class naming</h3>
+        <p id="oneroster-naming-help" class="mt-1 max-w-3xl text-sm text-brand-blueink">
+          Choose how Classroom names will be generated for this import. This rebuilds
+          the local preview only; stable <code class="font-mono">Section_</code> aliases
+          do not change.
+        </p>
+      </div>
+      <div class="max-w-full rounded-lg border border-brand-gray/40 bg-brand-white px-3 py-2 text-xs text-brand-blueink">
+        Current template:
+        <code class="ml-1 break-all font-mono text-brand-black">{{ snapshot.course_name_template }}</code>
+      </div>
+    </div>
+
+    <form class="mt-4" hx-post="/classroom/imports/import/{{ snapshot.id }}/naming"
+          hx-target="#oneroster-workspace" hx-swap="innerHTML">
+      <fieldset aria-describedby="oneroster-naming-help oneroster-naming-variables">
+        <legend class="text-sm font-semibold text-brand-black">Naming scheme</legend>
+        <div class="mt-2 grid gap-2 sm:grid-cols-2">
+          {% set naming_options = (
+            ("default", "District standard", "Course title \u2013 period (school year); classes without a period use the class title."),
+            ("course_and_class", "Course and class title", "Course title \u2013 class title (school year)."),
+            ("course_and_period", "Course and period, flexible", "Course title with period and school year omitted when their source fields are blank."),
+            ("class_title", "Class title only", "Use the title supplied in classes.csv.")
+          ) %}
+          {% for value, label, description in naming_options %}
+          <label class="flex cursor-pointer gap-3 rounded-lg border border-brand-gray/50 bg-brand-white p-3 text-sm focus-within:ring-2 focus-within:ring-brand-blue">
+            <input type="radio" name="naming_choice" value="{{ value }}"
+                   class="mt-1 size-4 accent-brand-blueink"
+                   {% if snapshot.course_name_choice == value %}checked{% endif %} />
+            <span>
+              <span class="block font-medium text-brand-black">{{ label }}</span>
+              <span class="mt-0.5 block text-xs text-brand-blueink">{{ description }}</span>
+            </span>
+          </label>
+          {% endfor %}
+          <label class="flex cursor-pointer gap-3 rounded-lg border border-brand-gray/50 bg-brand-white p-3 text-sm focus-within:ring-2 focus-within:ring-brand-blue sm:col-span-2">
+            <input type="radio" name="naming_choice" value="custom"
+                   class="mt-1 size-4 accent-brand-blueink"
+                   {% if snapshot.course_name_choice == "custom" %}checked{% endif %} />
+            <span class="min-w-0 flex-1">
+              <span class="block font-medium text-brand-black">Custom template</span>
+              <span class="mt-0.5 block text-xs text-brand-blueink">Enter an exact template using the approved variables below.</span>
+              <input type="text" name="custom_template" maxlength="500"
+                     value="{{ snapshot.custom_course_name_template }}"
+                     placeholder="{course_title} – {class_code}[[ ({school_year})]]"
+                     aria-label="Custom class naming template"
+                     class="mt-2 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 font-mono text-sm text-ink placeholder:text-brand-gray focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+            </span>
+          </label>
+        </div>
+      </fieldset>
+      <p id="oneroster-naming-variables" class="mt-3 text-xs text-brand-blueink">
+        Variables:
+        <code>{course_title}</code>,
+        <code>{class_code}</code>,
+        <code>{class_title}</code>, and
+        <code>{school_year}</code>.
+        Wrap a segment in <code>[[ ]]</code> to omit it when one of its variables is blank.
+      </p>
+      <div class="mt-3 flex flex-wrap items-center gap-3">
+        <button type="submit" class="rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">
+          Apply naming and rebuild preview
+        </button>
+        <span class="text-xs text-brand-blueink">Google allows Classroom course names from 1 to 750 characters.</span>
+      </div>
+    </form>
+  </section>
 
   <div class="mt-5 flex flex-wrap gap-3">
     <button type="button" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
@@ -76,7 +150,7 @@
         </div>
       </form>
       {% else %}
-      <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">Resolve blocking issues and select one academic session before building a live plan.</p>
+      <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">Resolve the blocking source issues before building a live plan. Academic session and enrollment dates are applied automatically.</p>
       {% endif %}
     </section>
   </div>

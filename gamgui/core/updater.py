@@ -1200,12 +1200,16 @@ class UpdateCoordinator:
         lease = None
         try:
             if state.installed_signing_channel == "developer-id":
-                raise RuntimeError(
+                raise ComponentError(
+                    "CMP-UPDATE-CHANNEL",
                     "Official-channel updates must be installed from a verified "
                     "notarized release file; the installed app was not changed."
                 )
             if self.active_jobs():
-                raise RuntimeError("An administrative operation is active; update preparation was deferred.")
+                raise ComponentError(
+                    "CMP-ACTIVE-JOB",
+                    "An administrative operation is active; update preparation was deferred.",
+                )
             lease = self.activity_registry.acquire("app-update")
             profile = normalize_profile(
                 state.desired_profile,
@@ -1224,7 +1228,10 @@ class UpdateCoordinator:
                     "The candidate did not include the required exact-SHA validation check."
                 )
             if self.active_jobs():
-                raise RuntimeError("An administrative operation became active; update preparation was deferred.")
+                raise ComponentError(
+                    "CMP-ACTIVE-JOB",
+                    "An administrative operation became active; update preparation was deferred.",
+                )
             pending = _prepare_builder(
                 self.builder,
                 candidate,
@@ -1238,7 +1245,10 @@ class UpdateCoordinator:
                     "The built application did not match the validated candidate SHA.",
                 )
             if self.active_jobs():
-                raise RuntimeError("An administrative operation became active; update activation was deferred.")
+                raise ComponentError(
+                    "CMP-ACTIVE-JOB",
+                    "An administrative operation became active; update activation was deferred.",
+                )
             state.candidate_sha = candidate.sha
             state.pending_app = str(pending)
             # Exact-SHA CI, sealed artifact identity, and the staged bundle's
@@ -1264,12 +1274,22 @@ class UpdateCoordinator:
             state.component_error_code = exc.error_code
             self.store.save(state)
             return None
+        except ComponentError as exc:
+            state.last_error = str(exc)
+            state.component_error_code = exc.error_code
+            self.store.save(state)
+            return None
         except Exception as exc:
             # Preparation failures can be environmental or transient (network, toolchain,
             # certificate, or offline self-test). Only a failed activation/rollback blocklists a
             # SHA; otherwise the same validated commit may be retried after the environment is
             # repaired.
             state.last_error = str(exc)
+            state.component_error_code = (
+                "CMP-UPDATE-SIGNING"
+                if "signing identity" in state.last_error.casefold()
+                else "CMP-UPDATE-PREPARE-FAILED"
+            )
             self.store.save(state)
             return None
         finally:

@@ -7,11 +7,13 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Optional, Sequence, TextIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from gamgui.core.activity import ActivityRegistry
 from gamgui.core.setup import ONEROSTER_DWD_SCOPES
 
 from .ingest import SafetyLimits, copy_upload, ingest_archive
+from .gate import DISTRICT_TIMEZONE
 from .models import (
     ClassroomImportManifest,
     DashboardStatus,
@@ -123,6 +125,16 @@ class OneRosterService:
 
     def select_session(self, import_id: str, session_id: str) -> OneRosterSnapshot:
         return self.store.select_session(import_id, session_id)
+
+    def configure_course_naming(
+        self,
+        import_id: str,
+        template: str,
+    ) -> OneRosterSnapshot:
+        try:
+            return self.store.configure_course_naming(import_id, template)
+        except ValueError as exc:
+            raise OneRosterError("OR-NAMING-INVALID", str(exc)) from exc
 
     def preview(
         self,
@@ -292,6 +304,24 @@ class OneRosterService:
         from .planner import OneRosterPlanner
 
         self.require_scope_ready()
+        try:
+            district_zone = ZoneInfo(DISTRICT_TIMEZONE)
+        except ZoneInfoNotFoundError:
+            district_zone = None
+        roster_date = (
+            now.astimezone(district_zone).date()
+            if now is not None and now.tzinfo is not None and district_zone is not None
+            else (
+                now.date()
+                if now is not None
+                else (
+                    datetime.now(district_zone).date()
+                    if district_zone is not None
+                    else datetime.now().date()
+                )
+            )
+        )
+        self.store.refresh_schedule_scope(import_id, today=roster_date)
         return await OneRosterPlanner(self.store, connector).plan(
             import_id,
             limited_import=limited_import,

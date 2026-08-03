@@ -33,7 +33,7 @@ from .store import OneRosterStore
 from .thresholds import evaluate_thresholds
 
 
-PLANNER_SCHEMA_VERSION = 1
+PLANNER_SCHEMA_VERSION = 2
 DIRECTORY_CONCURRENCY = 12
 COURSE_CONCURRENCY = 8
 # The current planner uses compact in-memory participant/action models. Keep
@@ -130,7 +130,7 @@ class OneRosterPlanner:
         if not snapshot.ready_for_apply:
             raise OneRosterError(
                 "OR-IMPORT-BLOCKED",
-                "Only a valid full snapshot with a selected term can be planned.",
+                "Only a valid full snapshot can be planned.",
             )
 
         normalized_path = self.store.normalized_path(import_id)
@@ -215,6 +215,7 @@ class OneRosterPlanner:
             {
                 "planner_schema": PLANNER_SCHEMA_VERSION,
                 "limited_import": effective_limited,
+                "course_name_template": snapshot.course_name_template,
                 "threshold_profile": profile.to_dict(),
             }
         )
@@ -948,6 +949,7 @@ def _read_desired_courses(
               ON u.domain = e.domain AND u.sourced_id = e.user_id
              AND u.status != 'tobedeleted'
             WHERE e.domain = ? AND e.status != 'tobedeleted'
+              AND e.in_scope = 1
               AND e.role IN ('teacher', 'student')
             ORDER BY e.class_id, e.role, e.sourced_id
             """,
@@ -1020,6 +1022,7 @@ def _enforce_planning_source_limits(path: Any, domain: str) -> None:
                   ON p.domain = e.domain AND p.class_id = e.class_id
                  AND p.selected = 1 AND p.ready = 1
                 WHERE e.domain = ? AND e.status != 'tobedeleted'
+                  AND e.in_scope = 1
                   AND e.role IN ('teacher', 'student')
                 """,
                 (domain,),

@@ -19,6 +19,18 @@ COMPONENT_ID = "classroom-oneroster"
 MAX_PAGE_SIZE = 50
 RETENTION_DAYS = 30
 SCOPE_READINESS_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_COURSE_NAME_TEMPLATE = (
+    "{course_title} \u2013 {class_code} ({school_year})"
+)
+COURSE_NAME_VARIABLES = (
+    "course_title",
+    "class_code",
+    "class_title",
+    "school_year",
+)
+MAX_COURSE_NAME_TEMPLATE_CHARS = 500
+MAX_COURSE_NAME_CHARS = 750
+AUTOMATIC_SESSION_SCOPE = "__automatic__"
 
 
 class IssueSeverity(str, Enum):
@@ -112,6 +124,7 @@ class OneRosterSnapshot:
     counts: SnapshotCounts
     issue_count: int
     blocking_issue_count: int
+    course_name_template: str
 
     @property
     def ready_for_apply(self) -> bool:
@@ -119,7 +132,6 @@ class OneRosterSnapshot:
             self.state is SnapshotState.READY
             and self.package_mode == "bulk"
             and self.blocking_issue_count == 0
-            and bool(self.selected_session_id)
         )
 
 

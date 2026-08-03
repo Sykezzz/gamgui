@@ -13,6 +13,11 @@
       <button type="submit" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Search</button>
     </form>
   </div>
+  {% if kind == "sessions" %}
+  <p class="border-b border-brand-gray/30 bg-paper px-4 py-3 text-sm text-brand-blueink" role="note">
+    GamGUI automatically includes each class while its most-specific referenced session is active. Session start dates are inclusive and end dates are exclusive; no single-session selection is required.
+  </p>
+  {% endif %}
   {% if rows %}
   <div class="overflow-x-auto">
     <table class="min-w-full text-left text-sm">
@@ -20,21 +25,12 @@
       <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
         <tr>
           {% for column in columns %}<th class="px-3 py-2 font-semibold" scope="col">{{ column | replace("_", " ") | title }}</th>{% endfor %}
-          {% if kind == "sessions" %}<th class="px-3 py-2 font-semibold" scope="col">Selection</th>{% endif %}
         </tr>
       </thead>
       <tbody class="divide-y divide-brand-gray/20">
         {% for row in rows %}
         <tr>
           {% for column in columns %}<td class="max-w-80 truncate px-3 py-2 text-brand-blueink">{{ row.get(column, "") }}</td>{% endfor %}
-          {% if kind == "sessions" %}
-          <td class="px-3 py-2">
-            <form hx-post="/classroom/imports/import/{{ import_id }}/session" hx-target="#oneroster-workspace" hx-swap="innerHTML">
-              <input type="hidden" name="session_id" value="{{ row.get('_session_id', '') }}" />
-              <button type="submit" {% if not row.get('_session_id') %}disabled{% endif %} class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue disabled:cursor-not-allowed disabled:opacity-50">Use this session</button>
-            </form>
-          </td>
-          {% endif %}
         </tr>
         {% endfor %}
       </tbody>

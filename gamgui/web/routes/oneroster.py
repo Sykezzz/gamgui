@@ -70,6 +70,19 @@ _THRESHOLD_KEYS = {
     for measure in ("count", "percent")
 }
 _CHECKED_VALUES = {"1", "true", "yes", "on"}
+_DEFAULT_COURSE_NAME_TEMPLATE = (
+    "{course_title} \u2013 {class_code} ({school_year})"
+)
+_COURSE_NAME_PRESETS = {
+    "default": _DEFAULT_COURSE_NAME_TEMPLATE,
+    "course_and_class": (
+        "{course_title} \u2013 {class_title}[[ ({school_year})]]"
+    ),
+    "course_and_period": (
+        "{course_title}[[ \u2013 {class_code}]][[ ({school_year})]]"
+    ),
+    "class_title": "{class_title}",
+}
 
 
 class _BoundedUploadStream:
@@ -169,6 +182,22 @@ def _snapshot_record(value: Any) -> dict[str, Any]:
     result["counts"] = counts or {}
     if "ready_for_apply" not in result:
         result["ready_for_apply"] = bool(getattr(value, "ready_for_apply", False))
+    template = str(
+        result.get("course_name_template", "")
+        or _DEFAULT_COURSE_NAME_TEMPLATE
+    )
+    result["course_name_template"] = template
+    result["course_name_choice"] = next(
+        (
+            name
+            for name, preset in _COURSE_NAME_PRESETS.items()
+            if preset == template
+        ),
+        "custom",
+    )
+    result["custom_course_name_template"] = (
+        template if result["course_name_choice"] == "custom" else ""
+    )
     return result
 
 
@@ -1191,8 +1220,88 @@ async def select_academic_session(
         {
             "snapshot": snapshot,
             "notice": (
-                "Academic session selected and course plans rebuilt locally. "
+                "Automatic class and enrollment date scope refreshed locally. "
                 "No Classroom changes were made."
+            ),
+        },
+    )
+
+
+@router.post("/import/{import_id}/naming", response_class=HTMLResponse)
+async def configure_course_naming(
+    request: Request,
+    import_id: str,
+    naming_choice: Annotated[str, Form()] = "default",
+    custom_template: Annotated[str, Form()] = "",
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(import_id):
+        return _status(
+            request,
+            error="That import identifier is invalid.",
+            error_code="OR-IMPORT-NOT-FOUND",
+        )
+    choice = naming_choice.strip().casefold()
+    if choice == "custom":
+        template = custom_template.strip()
+        if not template:
+            return _status(
+                request,
+                error="Enter a custom class naming template.",
+                error_code="OR-NAMING-INVALID",
+            )
+    elif choice in _COURSE_NAME_PRESETS:
+        template = _COURSE_NAME_PRESETS[choice]
+    else:
+        return _status(
+            request,
+            error="Choose one of the available class naming schemes.",
+            error_code="OR-NAMING-INVALID",
+        )
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "oneroster-course-naming")
+    if lease is None:
+        return _status(
+            request,
+            error=ADMIN_ACTIVITY_BUSY_MESSAGE,
+            error_code="CMP-ACTIVE-JOB",
+        )
+    try:
+        value = await _call(
+            feature["service"],
+            ("configure_course_naming", "configure_naming"),
+            (
+                ((import_id, template), {}),
+                (
+                    (),
+                    {
+                        "import_id": import_id,
+                        "template": template,
+                    },
+                ),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-NAMING-INVALID")
+        return _status(request, error=message, error_code=code)
+    finally:
+        lease.release()
+    snapshot = _snapshot_record(value)
+    snapshot.setdefault("id", import_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_oneroster_import.html",
+        {
+            "snapshot": snapshot,
+            "notice": (
+                "Class names were rebuilt locally with the selected scheme. "
+                "Review the Courses preview before building a live plan."
             ),
         },
     )

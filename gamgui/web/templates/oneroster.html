@@ -69,24 +69,24 @@
     </div>
   </div>
 
-  <div class="grid items-start gap-6 xl:grid-cols-2">
-    <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="threshold-heading">
-      <div class="flex items-center justify-between gap-3">
-        <div>
+  <div class="grid min-w-0 items-start gap-6 xl:grid-cols-2">
+    <section class="min-w-0 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="threshold-heading">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0 flex-1">
           <h2 id="threshold-heading" class="font-serif text-xl text-brand-black">Import thresholds</h2>
           <p class="mt-1 text-sm text-brand-blueink/80">Count and percentage limits are evaluated against the last accepted snapshot.</p>
         </div>
         <button type="button" class="text-sm font-medium text-brand-blueink underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue"
                 hx-get="/classroom/imports/thresholds" hx-target="#oneroster-thresholds" hx-swap="innerHTML">Configure</button>
       </div>
-      <div id="oneroster-thresholds" class="mt-4">
+      <div id="oneroster-thresholds" class="mt-4 min-w-0">
         {% include "_oneroster_thresholds.html" %}
       </div>
     </section>
 
-    <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="student-gate-heading">
-      <div class="flex items-center justify-between gap-3">
-        <div>
+    <section class="min-w-0 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="student-gate-heading">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0 flex-1">
           <h2 id="student-gate-heading" class="font-serif text-xl text-brand-black">Student enrollment gate</h2>
           <p class="mt-1 text-sm text-brand-blueink/80">Student membership remains blocked until an approved manifest is armed or opened.</p>
         </div>
@@ -99,9 +99,9 @@
     </section>
   </div>
 
-  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="history-heading">
-    <div class="flex items-center justify-between gap-3">
-      <div>
+  <section class="min-w-0 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="history-heading">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div class="min-w-0 flex-1">
         <h2 id="history-heading" class="font-serif text-xl text-brand-black">Import history</h2>
         <p class="mt-1 text-sm text-brand-blueink/80">Up to 50 retained snapshots. Expired raw and normalized data is purged by Core.</p>
       </div>

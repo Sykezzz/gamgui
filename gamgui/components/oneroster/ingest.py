@@ -11,20 +11,29 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
+import string
 import zipfile
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .gate import DISTRICT_TIMEZONE
 from .models import (
+    AUTOMATIC_SESSION_SCOPE,
+    COURSE_NAME_VARIABLES,
+    DEFAULT_COURSE_NAME_TEMPLATE,
     ImportIssue,
     IssueSeverity,
+    MAX_COURSE_NAME_CHARS,
+    MAX_COURSE_NAME_TEMPLATE_CHARS,
     SnapshotCounts,
     SnapshotState,
 )
@@ -65,6 +74,7 @@ _CLASS_DERIVED_ISSUE_CODES = frozenset(
         "OR-REFERENCE-TERM",
         "OR-REFERENCE-COURSE",
         "OR-REFERENCE-SCHOOL-YEAR",
+        "OR-SESSION-DATE",
         "OR-ALIAS-MISSING",
         "OR-ALIAS-COLLISION",
         "OR-ENROLLMENT-ROLE",
@@ -72,9 +82,11 @@ _CLASS_DERIVED_ISSUE_CODES = frozenset(
         "OR-OWNER-AMBIGUOUS",
         "OR-USER-MISSING",
         "OR-COURSE-NAME-INCOMPLETE",
+        "OR-COURSE-NAME-LENGTH",
         "OR-GAM-VALUE-INVALID",
     }
 )
+_ENROLLMENT_DERIVED_ISSUE_CODES = frozenset({"OR-ENROLLMENT-DATE"})
 
 REQUIRED_HEADERS: Mapping[str, frozenset[str]] = {
     "manifest.csv": frozenset(("propertyName", "value")),
@@ -261,11 +273,16 @@ def ingest_archive(
                     issues,
                     limits,
                 )
-                _validate_references(conn, domain, issues)
-                selected_session = _choose_current_session(
-                    conn, domain, today or datetime.now(timezone.utc).date(), issues
+                current_date = today or _current_roster_date()
+                _validate_references(conn, domain, issues, current_date)
+                selected_session = AUTOMATIC_SESSION_SCOPE
+                _build_course_plans(
+                    conn,
+                    domain,
+                    issues,
+                    DEFAULT_COURSE_NAME_TEMPLATE,
+                    today=current_date,
                 )
-                _build_course_plans(conn, domain, selected_session, issues)
                 _write_issues(conn, issues)
                 rebuild_preview_index(conn, domain)
             counts = _snapshot_counts(conn, domain)
@@ -284,20 +301,17 @@ def rebuild_course_plans(
     normalized_path: Path,
     *,
     domain: str,
-    selected_session_id: str,
+    selected_session_id: str = AUTOMATIC_SESSION_SCOPE,
+    course_name_template: str = DEFAULT_COURSE_NAME_TEMPLATE,
+    today: Optional[date] = None,
 ) -> tuple[SnapshotCounts, tuple[ImportIssue, ...]]:
-    """Rebuild derived plans after an explicit operator term selection."""
+    """Rebuild plans using each class and enrollment's effective dated scope.
+
+    ``selected_session_id`` remains accepted for compatibility with older callers,
+    but manual term selection no longer changes roster scope.
+    """
 
     with closing(_normalized_conn(normalized_path)) as conn:
-        row = conn.execute(
-            """
-            SELECT 1 FROM academic_sessions
-            WHERE domain = ? AND sourced_id = ? AND status != 'tobedeleted'
-            """,
-            (domain, selected_session_id),
-        ).fetchone()
-        if row is None:
-            raise KeyError("Academic session not found in this import.")
         with conn:
             conn.execute(
                 "DELETE FROM issues WHERE code = 'OR-TERM-AMBIGUOUS'"
@@ -308,11 +322,23 @@ def rebuild_course_plans(
                 ),
                 tuple(_CLASS_DERIVED_ISSUE_CODES),
             )
+            conn.execute(
+                "DELETE FROM issues WHERE entity_kind = 'enrollment' AND code IN ({})".format(
+                    ", ".join("?" for _ in _ENROLLMENT_DERIVED_ISSUE_CODES)
+                ),
+                tuple(_ENROLLMENT_DERIVED_ISSUE_CODES),
+            )
             issues = _IssueCollector(
                 DEFAULT_MAX_ISSUES,
                 tuple(_issues_from_db(conn)),
             )
-            _build_course_plans(conn, domain, selected_session_id, issues)
+            _build_course_plans(
+                conn,
+                domain,
+                issues,
+                normalize_course_name_template(course_name_template),
+                today=today or _current_roster_date(),
+            )
             _write_issues(conn, issues)
             rebuild_preview_index(conn, domain)
         counts = _snapshot_counts(conn, domain)
@@ -340,6 +366,97 @@ def course_display_name(course_title: str, class_code: str, class_title: str, sc
     return f"{title} \u2013 {section} ({year})"
 
 
+_OPTIONAL_NAME_BLOCK = re.compile(r"\[\[([^\[\]]*)\]\]")
+_NAME_FORMATTER = string.Formatter()
+
+
+def normalize_course_name_template(value: str) -> str:
+    """Validate and normalize one safe, data-only Classroom naming template."""
+
+    template = str(value or "").strip() or DEFAULT_COURSE_NAME_TEMPLATE
+    if len(template) > MAX_COURSE_NAME_TEMPLATE_CHARS:
+        raise ValueError(
+            f"Class naming templates must be {MAX_COURSE_NAME_TEMPLATE_CHARS} "
+            "characters or fewer."
+        )
+    if any(ord(character) < 32 for character in template):
+        raise ValueError("Class naming templates cannot contain control characters.")
+    if template.count("[[") != template.count("]]"):
+        raise ValueError("Optional class-name segments must use matching [[ and ]].")
+    without_optional = _OPTIONAL_NAME_BLOCK.sub(
+        lambda match: match.group(1),
+        template,
+    )
+    if "[[" in without_optional or "]]" in without_optional:
+        raise ValueError("Optional class-name segments cannot be nested.")
+    fields = _course_name_fields(without_optional)
+    for match in _OPTIONAL_NAME_BLOCK.finditer(template):
+        if not _course_name_fields(match.group(1)):
+            raise ValueError(
+                "Each optional class-name segment must contain at least one variable."
+            )
+    if not fields:
+        raise ValueError("Class naming templates must include at least one variable.")
+    return template
+
+
+def render_course_display_name(
+    template: str,
+    course_title: str,
+    class_code: str,
+    class_title: str,
+    school_year: str,
+) -> str:
+    """Render a validated template without evaluating expressions or attributes."""
+
+    normalized = normalize_course_name_template(template)
+    if normalized == DEFAULT_COURSE_NAME_TEMPLATE:
+        return course_display_name(
+            course_title,
+            class_code,
+            class_title,
+            school_year,
+        )
+    values = {
+        "course_title": (course_title or "").strip(),
+        "class_code": (class_code or "").strip(),
+        "class_title": (class_title or "").strip(),
+        "school_year": (school_year or "").strip(),
+    }
+
+    def optional_segment(match: re.Match[str]) -> str:
+        segment = match.group(1)
+        fields = _course_name_fields(segment)
+        return segment if all(values[field] for field in fields) else ""
+
+    expanded = _OPTIONAL_NAME_BLOCK.sub(optional_segment, normalized)
+    rendered = expanded.format_map(values)
+    return re.sub(r"[ \t]+", " ", rendered).strip()
+
+
+def _course_name_fields(template: str) -> tuple[str, ...]:
+    try:
+        parsed = tuple(_NAME_FORMATTER.parse(template))
+    except ValueError as exc:
+        raise ValueError("Class naming template braces are not valid.") from exc
+    fields: list[str] = []
+    for _literal, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if (
+            field_name not in COURSE_NAME_VARIABLES
+            or format_spec
+            or conversion is not None
+        ):
+            allowed = ", ".join(f"{{{name}}}" for name in COURSE_NAME_VARIABLES)
+            raise ValueError(
+                "Class naming templates may use only these variables: "
+                f"{allowed}."
+            )
+        fields.append(field_name)
+    return tuple(fields)
+
+
 def _result(
     source_hash: str,
     package_mode: str,
@@ -350,7 +467,7 @@ def _result(
     blocking = any(issue.blocking for issue in issues)
     state = (
         SnapshotState.READY
-        if package_mode == "bulk" and selected_session_id and not blocking
+        if package_mode == "bulk" and not blocking
         else SnapshotState.BLOCKED
     )
     return IngestionResult(
@@ -1087,8 +1204,8 @@ def _insert_enrollments(
         """
         INSERT INTO enrollments (
             domain, sourced_id, status, class_id, school_id, user_id,
-            role, is_primary, begin_date, end_date, row_number
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            role, is_primary, begin_date, end_date, in_scope, row_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             domain,
@@ -1101,6 +1218,7 @@ def _insert_enrollments(
             1 if _truthy(row.get("primary", "")) else 0,
             row.get("beginDate", ""),
             row.get("endDate", ""),
+            1,
             row_number,
         ),
     ):
@@ -1111,10 +1229,12 @@ def _validate_references(
     conn: sqlite3.Connection,
     domain: str,
     issues: list[ImportIssue],
+    today: date,
 ) -> None:
     for row in conn.execute(
         """
-        SELECT e.sourced_id, e.class_id, e.user_id, e.row_number,
+        SELECT e.sourced_id, e.class_id, e.user_id, e.begin_date, e.end_date,
+               e.row_number,
                c.sourced_id AS found_class, u.sourced_id AS found_user
         FROM enrollments e
         LEFT JOIN classes c ON c.domain = e.domain AND c.sourced_id = e.class_id
@@ -1126,6 +1246,13 @@ def _validate_references(
         """,
         (domain,),
     ):
+        enrollment_in_scope, dates_valid = _enrollment_scope(
+            str(row["begin_date"] or ""),
+            str(row["end_date"] or ""),
+            today,
+        )
+        if dates_valid and not enrollment_in_scope:
+            continue
         missing = "class" if row["found_class"] is None else "user"
         issues.append(
             _issue(
@@ -1157,101 +1284,196 @@ def _validate_references(
                 blocking=False,
             )
         )
-def _choose_current_session(
+@dataclass(frozen=True)
+class _SessionWindow:
+    sourced_id: str
+    start: Optional[date]
+    end: Optional[date]
+    parent_id: str
+    school_year: str
+
+    @property
+    def valid(self) -> bool:
+        return self.start is not None and self.end is not None and self.start < self.end
+
+    def includes(self, value: date) -> bool:
+        return bool(self.valid and self.start <= value < self.end)
+
+
+def _session_windows(
     conn: sqlite3.Connection,
     domain: str,
-    today: date,
-    issues: list[ImportIssue],
-) -> str:
-    referenced: set[str] = set()
-    for row in conn.execute(
-        "SELECT term_ids FROM classes WHERE domain = ? AND status != 'tobedeleted'",
-        (domain,),
-    ):
-        referenced.update(_split_ids(row["term_ids"]))
-
-    candidates: list[sqlite3.Row] = []
+) -> dict[str, _SessionWindow]:
+    windows: dict[str, _SessionWindow] = {}
     for row in conn.execute(
         """
-        SELECT * FROM academic_sessions
+        SELECT sourced_id, start_date, end_date, parent_id, school_year
+        FROM academic_sessions
         WHERE domain = ? AND status != 'tobedeleted'
         """,
         (domain,),
     ):
-        if row["sourced_id"] not in referenced:
-            continue
         try:
             start = date.fromisoformat(str(row["start_date"]))
             end = date.fromisoformat(str(row["end_date"]))
         except ValueError:
-            issues.append(
-                _issue(
-                    "OR-SESSION-DATE",
-                    "Academic session has an invalid ISO date.",
-                    "academicSession",
-                    row["sourced_id"],
-                    row["row_number"],
-                )
-            )
-            continue
-        if start <= today <= end:
-            candidates.append(row)
+            start = None
+            end = None
+        source_id = str(row["sourced_id"])
+        windows[source_id] = _SessionWindow(
+            sourced_id=source_id,
+            start=start,
+            end=end,
+            parent_id=str(row["parent_id"] or "").strip(),
+            school_year=str(row["school_year"] or "").strip(),
+        )
+    return windows
 
-    non_year = [
-        row
-        for row in candidates
-        if str(row["session_type"]).casefold().replace(" ", "")
-        not in {"schoolyear", "academicyear"}
-    ]
-    if non_year:
-        candidates = non_year
-    if len(candidates) == 1:
-        return str(candidates[0]["sourced_id"])
-    issues.append(
-        _issue(
-            "OR-TERM-AMBIGUOUS",
-            "Select the academic session for this import before it can be applied.",
-            "academicSession",
+
+def _is_session_ancestor(
+    ancestor_id: str,
+    descendant_id: str,
+    windows: Mapping[str, _SessionWindow],
+) -> bool:
+    current = descendant_id
+    visited: set[str] = set()
+    while current and current not in visited:
+        visited.add(current)
+        window = windows.get(current)
+        if window is None or not window.parent_id:
+            return False
+        if window.parent_id == ancestor_id:
+            return True
+        current = window.parent_id
+    return False
+
+
+def _effective_session_windows(
+    term_ids: Sequence[str],
+    windows: Mapping[str, _SessionWindow],
+) -> tuple[_SessionWindow, ...]:
+    known_ids = tuple(dict.fromkeys(item for item in term_ids if item in windows))
+    leaf_ids = tuple(
+        source_id
+        for source_id in known_ids
+        if not any(
+            source_id != other
+            and _is_session_ancestor(source_id, other, windows)
+            for other in known_ids
         )
     )
-    return ""
+    return tuple(windows[source_id] for source_id in leaf_ids)
+
+
+def _refresh_enrollment_scope(
+    conn: sqlite3.Connection,
+    domain: str,
+    today: date,
+    issues: list[ImportIssue],
+) -> None:
+    for row in conn.execute(
+        """
+        SELECT sourced_id, begin_date, end_date, row_number
+        FROM enrollments
+        WHERE domain = ? AND status != 'tobedeleted'
+        """,
+        (domain,),
+    ):
+        in_scope, valid = _enrollment_scope(
+            str(row["begin_date"] or ""),
+            str(row["end_date"] or ""),
+            today,
+        )
+        conn.execute(
+            """
+            UPDATE enrollments SET in_scope = ?
+            WHERE domain = ? AND sourced_id = ?
+            """,
+            (int(in_scope), domain, row["sourced_id"]),
+        )
+        if not valid:
+            issues.append(
+                _issue(
+                    "OR-ENROLLMENT-DATE",
+                    "Enrollment begin/end dates are invalid or reversed.",
+                    "enrollment",
+                    str(row["sourced_id"]),
+                    int(row["row_number"]),
+                    blocking=False,
+                )
+            )
+
+
+def _enrollment_scope(
+    begin_value: str,
+    end_value: str,
+    today: date,
+) -> tuple[bool, bool]:
+    begin_text = str(begin_value or "").strip()
+    end_text = str(end_value or "").strip()
+    try:
+        begin = date.fromisoformat(begin_text) if begin_text else None
+        end = date.fromisoformat(end_text) if end_text else None
+        valid = begin is None or end is None or begin < end
+    except ValueError:
+        return False, False
+    return (
+        bool(
+            valid
+            and (begin is None or begin <= today)
+            and (end is None or today < end)
+        ),
+        valid,
+    )
+
+
+def _current_roster_date() -> date:
+    try:
+        district_zone = ZoneInfo(DISTRICT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        # Some Windows Python distributions omit the IANA timezone database.
+        # The signed macOS app has it; local calendar time is the safe fallback.
+        return date.today()
+    return datetime.now(district_zone).date()
 
 
 def _build_course_plans(
     conn: sqlite3.Connection,
     domain: str,
-    selected_session_id: str,
     issues: list[ImportIssue],
+    course_name_template: str,
+    *,
+    today: date,
 ) -> None:
+    _ensure_enrollment_scope_column(conn)
     conn.execute("DELETE FROM course_plans WHERE domain = ?", (domain,))
+    _refresh_enrollment_scope(conn, domain, today, issues)
     aliases: dict[str, list[str]] = defaultdict(list)
     class_rows = conn.execute(
         """
         SELECT c.*, x.title AS course_title, x.school_year_id,
-               y.school_year AS course_school_year,
-               s.school_year AS selected_school_year
+               y.school_year AS course_school_year
         FROM classes c
         LEFT JOIN courses x ON x.domain = c.domain AND x.sourced_id = c.course_id
                            AND x.status != 'tobedeleted'
         LEFT JOIN academic_sessions y
           ON y.domain = x.domain AND y.sourced_id = x.school_year_id
          AND y.status != 'tobedeleted'
-        LEFT JOIN academic_sessions s
-          ON s.domain = c.domain AND s.sourced_id = ?
-         AND s.status != 'tobedeleted'
         WHERE c.domain = ? AND c.status != 'tobedeleted'
         ORDER BY c.sourced_id
         """,
-        (selected_session_id, domain),
+        (domain,),
     ).fetchall()
     for row in class_rows:
         aliases[section_alias(row["sourced_id"]).casefold()].append(row["sourced_id"])
-    known_sessions = {
+    session_windows = _session_windows(conn, domain)
+    known_sessions = set(session_windows)
+    inactive_sessions = {
         str(row[0])
         for row in conn.execute(
             """
             SELECT sourced_id FROM academic_sessions
-            WHERE domain = ? AND status != 'tobedeleted'
+            WHERE domain = ? AND status = 'tobedeleted'
             """,
             (domain,),
         )
@@ -1294,7 +1516,7 @@ def _build_course_plans(
             LEFT JOIN users u
               ON u.domain = e.domain AND u.sourced_id = e.user_id
              AND u.status != 'tobedeleted'
-            WHERE e.domain = ? AND e.status != 'tobedeleted'
+            WHERE e.domain = ? AND e.status != 'tobedeleted' AND e.in_scope = 1
             GROUP BY e.class_id
             """,
             (domain,),
@@ -1305,12 +1527,22 @@ def _build_course_plans(
         class_id = str(row["sourced_id"])
         alias = section_alias(class_id)
         term_ids = _split_ids(row["term_ids"])
-        selected = bool(selected_session_id) and selected_session_id in term_ids
         codes: list[str] = []
-        if not selected_session_id:
-            codes.append("OR-TERM-AMBIGUOUS")
-        if not term_ids or any(item not in known_sessions for item in term_ids):
+        has_unknown_session = not term_ids or any(
+            item not in known_sessions and item not in inactive_sessions
+            for item in term_ids
+        )
+        if has_unknown_session:
             codes.append("OR-REFERENCE-TERM")
+        effective_sessions = _effective_session_windows(term_ids, session_windows)
+        has_invalid_session = any(not window.valid for window in effective_sessions)
+        if has_invalid_session:
+            codes.append("OR-SESSION-DATE")
+        current_sessions = tuple(
+            window for window in effective_sessions if window.includes(today)
+        )
+        scope_is_uncertain = has_unknown_session or has_invalid_session
+        selected = bool(current_sessions) or scope_is_uncertain
         if row["course_title"] is None:
             codes.append("OR-REFERENCE-COURSE")
         elif (
@@ -1336,10 +1568,17 @@ def _build_course_plans(
         if stats is not None and int(stats["missing_user_count"] or 0):
             codes.append("OR-USER-MISSING")
 
-        school_year = str(
-            row["course_school_year"] or row["selected_school_year"] or ""
-        ).strip()
-        name = course_display_name(
+        dated_school_year = next(
+            (
+                window.school_year
+                for window in (*current_sessions, *effective_sessions)
+                if window.school_year
+            ),
+            "",
+        )
+        school_year = str(row["course_school_year"] or dated_school_year).strip()
+        name = render_course_display_name(
+            course_name_template,
             str(row["course_title"] or ""),
             str(row["class_code"] or ""),
             str(row["title"] or ""),
@@ -1347,6 +1586,8 @@ def _build_course_plans(
         )
         if not name:
             codes.append("OR-COURSE-NAME-INCOMPLETE")
+        elif len(name) > MAX_COURSE_NAME_CHARS:
+            codes.append("OR-COURSE-NAME-LENGTH")
         owner_email = (
             str(stats["primary_email"] or "").casefold()
             if stats is not None and primary_count == 1
@@ -1370,6 +1611,10 @@ def _build_course_plans(
         ):
             codes.append("OR-GAM-VALUE-INVALID")
 
+        if not selected and not scope_is_uncertain:
+            # Historical and future classes are intentionally deferred. Their
+            # participant completeness is irrelevant until their dated term is active.
+            codes = []
         codes = sorted(set(codes))
         ready = int(selected and not codes)
         conn.execute(
@@ -1396,8 +1641,6 @@ def _build_course_plans(
         )
         if selected:
             for code in codes:
-                if code in {"OR-TERM-AMBIGUOUS"}:
-                    continue
                 issues.append(
                     _issue(
                         code,
@@ -1425,7 +1668,8 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
         SELECT
           SUM(CASE WHEN role = 'teacher' THEN 1 ELSE 0 END),
           SUM(CASE WHEN role = 'student' THEN 1 ELSE 0 END)
-        FROM enrollments WHERE domain = ? AND status != 'tobedeleted'
+        FROM enrollments
+        WHERE domain = ? AND status != 'tobedeleted' AND in_scope = 1
         """,
         (domain,),
     ).fetchone()
@@ -1441,6 +1685,18 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
         teachers=int(participant_counts[0] or 0),
         students=int(participant_counts[1] or 0),
     )
+
+
+def _ensure_enrollment_scope_column(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(enrollments)").fetchall()
+    }
+    if "in_scope" not in columns:
+        conn.execute(
+            "ALTER TABLE enrollments "
+            "ADD COLUMN in_scope INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 def _create_normalized_db(path: Path) -> None:
@@ -1483,7 +1739,8 @@ def _create_normalized_db(path: Path) -> None:
                 domain TEXT NOT NULL, sourced_id TEXT NOT NULL, status TEXT NOT NULL,
                 class_id TEXT NOT NULL, school_id TEXT NOT NULL, user_id TEXT NOT NULL,
                 role TEXT NOT NULL, is_primary INTEGER NOT NULL, begin_date TEXT NOT NULL,
-                end_date TEXT NOT NULL, row_number INTEGER NOT NULL,
+                end_date TEXT NOT NULL, in_scope INTEGER NOT NULL,
+                row_number INTEGER NOT NULL,
                 PRIMARY KEY(domain, sourced_id)
             );
             CREATE TABLE course_plans (
@@ -1700,12 +1957,17 @@ def _issue(
 def _quarantine_message(code: str) -> str:
     messages = {
         "OR-REFERENCE-COURSE": "Course reference is missing; class is quarantined.",
+        "OR-REFERENCE-TERM": "Class term reference is missing; class is quarantined.",
+        "OR-SESSION-DATE": "Class term dates are invalid; class is quarantined.",
         "OR-ALIAS-MISSING": "Class has no stable Section_ alias.",
         "OR-ALIAS-COLLISION": "More than one class resolves to the same Section_ alias.",
         "OR-OWNER-MISSING": "Class has no teacher enrollment and no safe owner.",
         "OR-OWNER-AMBIGUOUS": "Class does not have exactly one resolvable primary teacher.",
         "OR-USER-MISSING": "At least one class enrollment has no resolvable user email.",
         "OR-COURSE-NAME-INCOMPLETE": "Course name cannot be built from the required OneRoster fields.",
+        "OR-COURSE-NAME-LENGTH": (
+            "The rendered Classroom name exceeds Google's 750-character limit."
+        ),
         "OR-GAM-VALUE-INVALID": "A Classroom-bound value contains an unsafe control character.",
     }
     return messages.get(code, "Class cannot be applied until its source data is corrected.")
