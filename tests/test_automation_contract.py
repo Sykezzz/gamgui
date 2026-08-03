@@ -49,6 +49,8 @@ def test_automation_merge_helper_requires_the_new_exact_sha_ci_run():
         encoding="utf-8"
     )
     assert "workflow_dispatch" in script
+    assert "pull_request" in script
+    assert "/approve" in script
     assert "previous_run_ids" in script
     assert 'run.get("headSha") == head_sha' in script
     assert 'selected.get("conclusion") != "success"' in script

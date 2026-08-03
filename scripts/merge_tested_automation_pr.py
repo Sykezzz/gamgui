@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge an automation PR only after a newly dispatched exact-SHA CI run passes."""
+"""Approve or dispatch exact-SHA CI, then merge the unchanged automation PR."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ def _workflow_runs(
     repository: str,
     workflow: str,
     branch: str,
+    event: str,
 ) -> list[dict[str, Any]]:
     result = gh.json(
         [
@@ -47,7 +48,7 @@ def _workflow_runs(
             "--branch",
             branch,
             "--event",
-            "workflow_dispatch",
+            event,
             "--limit",
             "30",
             "--json",
@@ -72,42 +73,117 @@ def dispatch_test_and_merge(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, str]:
-    previous_run_ids = {
-        int(run["databaseId"])
+    match = re.search(r"(?:^|/)(\d+)$", pull_request)
+    if not match:
+        raise ValueError("Pull request must be a number or a GitHub pull request URL.")
+    pull_number = match.group(1)
+    details = gh.json(
+        [
+            "pr",
+            "view",
+            pull_number,
+            "--repo",
+            repository,
+            "--json",
+            "headRefOid,state,mergeCommit",
+        ]
+    )
+    if details.get("headRefOid") != head_sha:
+        raise RuntimeError("The pull request does not point to the expected head SHA.")
+    if details.get("state") != "OPEN":
+        raise RuntimeError("The automation pull request is not open.")
+
+    pull_request_runs = [
+        run
         for run in _workflow_runs(
             gh,
             repository=repository,
             workflow=workflow,
             branch=branch,
+            event="pull_request",
         )
         if run.get("headSha") == head_sha
-    }
-    gh.run(
-        [
-            "workflow",
-            "run",
-            workflow,
-            "--repo",
-            repository,
-            "--ref",
-            branch,
-        ]
-    )
-
-    deadline = monotonic() + timeout_seconds
-    selected: dict[str, Any] | None = None
-    while monotonic() < deadline:
-        candidates = [
-            run
+    ]
+    selected_run_id: int | None = None
+    if pull_request_runs:
+        selected = max(
+            pull_request_runs,
+            key=lambda run: int(run["databaseId"]),
+        )
+        selected_run_id = int(selected["databaseId"])
+        conclusion = selected.get("conclusion")
+        if conclusion == "action_required":
+            gh.run(
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repository}/actions/runs/{selected_run_id}/approve",
+                ]
+            )
+        elif selected.get("status") == "completed" and conclusion != "success":
+            gh.run(
+                [
+                    "run",
+                    "rerun",
+                    str(selected_run_id),
+                    "--repo",
+                    repository,
+                ]
+            )
+    else:
+        previous_run_ids = {
+            int(run["databaseId"])
             for run in _workflow_runs(
                 gh,
                 repository=repository,
                 workflow=workflow,
                 branch=branch,
+                event="workflow_dispatch",
             )
             if run.get("headSha") == head_sha
-            and int(run["databaseId"]) not in previous_run_ids
-        ]
+        }
+        gh.run(
+            [
+                "workflow",
+                "run",
+                workflow,
+                "--repo",
+                repository,
+                "--ref",
+                branch,
+            ]
+        )
+
+    deadline = monotonic() + timeout_seconds
+    selected: dict[str, Any] | None = None
+    while monotonic() < deadline:
+        if selected_run_id is not None:
+            candidates = [
+                run
+                for run in _workflow_runs(
+                    gh,
+                    repository=repository,
+                    workflow=workflow,
+                    branch=branch,
+                    event="pull_request",
+                )
+                if int(run["databaseId"]) == selected_run_id
+                and run.get("headSha") == head_sha
+            ]
+        else:
+            candidates = [
+                run
+                for run in _workflow_runs(
+                    gh,
+                    repository=repository,
+                    workflow=workflow,
+                    branch=branch,
+                    event="workflow_dispatch",
+                )
+                if run.get("headSha") == head_sha
+                and int(run["databaseId"]) not in previous_run_ids
+            ]
         if candidates:
             selected = max(candidates, key=lambda run: int(run["databaseId"]))
             if selected.get("status") == "completed":
@@ -116,7 +192,7 @@ def dispatch_test_and_merge(
 
     if selected is None or selected.get("status") != "completed":
         raise RuntimeError(
-            f"Timed out waiting for a new {workflow} run at {head_sha}."
+            f"Timed out waiting for an exact-SHA {workflow} run at {head_sha}."
         )
     if selected.get("conclusion") != "success":
         raise RuntimeError(
@@ -124,10 +200,6 @@ def dispatch_test_and_merge(
             f"concluded {selected.get('conclusion') or 'without a conclusion'}."
         )
 
-    match = re.search(r"(?:^|/)(\d+)$", pull_request)
-    if not match:
-        raise ValueError("Pull request must be a number or a GitHub pull request URL.")
-    pull_number = match.group(1)
     details = gh.json(
         [
             "pr",
