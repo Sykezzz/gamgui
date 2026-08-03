@@ -16,12 +16,13 @@ def test_upstream_sync_is_non_forcing_and_targets_district_branch():
     assert "gh repo sync" not in workflow
     assert "--force" not in workflow
     assert "--base district-main" in workflow
-    assert "gh workflow run ci.yml" in workflow
+    assert "scripts/merge_tested_automation_pr.py" in workflow
     assert "gh workflow run post-merge-validation.yml" in workflow
-    assert "mergeCommit.oid" in workflow
-    assert "gh pr merge" in workflow and "--auto" in workflow
+    assert "gh pr merge" not in workflow
     assert "Upstream sync blocked" in workflow
     assert "Report blocked upstream integration" in workflow
+    assert "continue-on-error: true" in workflow
+    assert "held=true" in workflow
     assert "if: failure()" in workflow
     assert "Nothing was force-synced or installed." in workflow
 
@@ -34,13 +35,26 @@ def test_gam_update_refreshes_every_pinned_contract_before_auto_merge():
     assert "tests/fixtures/mock_gam.sh" in workflow
     assert "tests/test_acceptance_privacy.py" in workflow
     assert "steps.branch.outputs.pr" in workflow
-    assert "gh workflow run ci.yml" in workflow
+    assert "scripts/merge_tested_automation_pr.py" in workflow
     assert "gh workflow run post-merge-validation.yml" in workflow
-    assert "mergeCommit.oid" in workflow
-    assert "gh pr merge" in workflow and "--auto" in workflow
+    assert "gh pr merge" not in workflow
+    assert "headRefName" in workflow
     assert "TAG: ${{ steps.release.outputs.tag }}" in workflow
     assert 'scripts/bump_gam.py --tag "$TAG"' in workflow
     assert 'scripts/bump_gam.py --tag "${{ steps.release.outputs.tag }}"' not in workflow
+
+
+def test_automation_merge_helper_requires_the_new_exact_sha_ci_run():
+    script = (ROOT / "scripts" / "merge_tested_automation_pr.py").read_text(
+        encoding="utf-8"
+    )
+    assert "workflow_dispatch" in script
+    assert "previous_run_ids" in script
+    assert 'run.get("headSha") == head_sha' in script
+    assert 'selected.get("conclusion") != "success"' in script
+    assert 'details.get("headRefOid") != head_sha' in script
+    assert '"sha": head_sha' in script
+    assert "merge_method" in script
 
 
 def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
