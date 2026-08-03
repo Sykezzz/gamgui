@@ -316,6 +316,7 @@ def test_coordinator_fails_closed_when_job_active(tmp_path):
     coordinator = UpdateCoordinator(store=store, active_jobs=lambda: True)
     assert coordinator.check_and_prepare() is None
     assert "operation is active" in store.load().last_error
+    assert store.load().component_error_code == "CMP-ACTIVE-JOB"
 
 
 def test_official_install_never_silently_builds_a_local_update(tmp_path):
@@ -339,7 +340,9 @@ def test_official_install_never_silently_builds_a_local_update(tmp_path):
             raise AssertionError("official channel must not build a local artifact")
 
     assert UpdateCoordinator(store, Source(), Builder()).check_and_prepare() is None
-    assert "Official-channel updates" in store.load().last_error
+    state = store.load()
+    assert "Official-channel updates" in state.last_error
+    assert state.component_error_code == "CMP-UPDATE-CHANNEL"
 
 
 @pytest.mark.parametrize(
@@ -391,6 +394,7 @@ def test_preparation_failure_is_retryable_and_does_not_block_sha(tmp_path):
     state = store.load()
     assert SHA not in state.blocked_shas
     assert "signing identity" in state.last_error
+    assert state.component_error_code == "CMP-UPDATE-SIGNING"
 
 
 def test_coordinator_refuses_candidate_without_ready_check_evidence(tmp_path):
@@ -635,6 +639,57 @@ def test_update_notice_requires_activation_evidence(monkeypatch, tmp_path):
     assert _local_update_notice() == (
         "A verified update is ready. Quit and reopen GamGUI to install it."
     )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            UpdateState(
+                installed_signing_channel="developer-id",
+                last_error="sensitive command output",
+            ),
+            "official release channel",
+        ),
+        (
+            UpdateState(
+                component_error_code="CMP-ACTIVE-JOB",
+                last_error="sensitive activity detail",
+            ),
+            "safely deferred",
+        ),
+        (
+            UpdateState(
+                component_error_code="CMP-UPDATE-SIGNING",
+                last_error="/Users/admin/private/path",
+            ),
+            '"GamGUI Local" signing identity',
+        ),
+        (
+            UpdateState(
+                component_error_code="CMP-UPDATE-PREPARE-FAILED",
+                last_error="/Users/admin/private/path",
+            ),
+            "CMP-UPDATE-PREPARE-FAILED",
+        ),
+    ],
+)
+def test_update_notice_reports_safe_actionable_category(
+    monkeypatch,
+    tmp_path,
+    state,
+    expected,
+):
+    from gamgui.web.server import _local_update_notice
+
+    monkeypatch.setenv("GAMGUI_APP_DATA_DIR", str(tmp_path / "data"))
+    UpdateStateStore().save(state)
+
+    notice = _local_update_notice()
+
+    assert expected in notice
+    assert "/Users/admin/private/path" not in notice
+    assert "sensitive" not in notice
 
 
 def _database(path: Path, value: str) -> None:

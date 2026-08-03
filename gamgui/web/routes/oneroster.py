@@ -13,6 +13,7 @@ import inspect
 import json
 import re
 import tempfile
+import zipfile
 from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncIterator, Iterable
@@ -28,6 +29,26 @@ from .components import component_context
 router = APIRouter(prefix="/classroom/imports")
 
 _MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+_MAX_FOLDER_FILES = 32
+_FOLDER_ALLOWED_FILES = frozenset(
+    {
+        "manifest.csv",
+        "academicsessions.csv",
+        "classes.csv",
+        "courses.csv",
+        "enrollments.csv",
+        "orgs.csv",
+        "users.csv",
+        "categories.csv",
+        "classresources.csv",
+        "courseresources.csv",
+        "demographics.csv",
+        "lineitems.csv",
+        "resources.csv",
+        "results.csv",
+    }
+)
+_FOLDER_IGNORED_FILES = frozenset({".ds_store"})
 _IMPORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _MANIFEST_HASH = re.compile(r"^[0-9a-f]{64}$")
 _PREVIEW_KINDS = {
@@ -70,6 +91,28 @@ _THRESHOLD_KEYS = {
     for measure in ("count", "percent")
 }
 _CHECKED_VALUES = {"1", "true", "yes", "on"}
+_DEFAULT_COURSE_NAME_TEMPLATE = (
+    "{course_title} \u2013 {class_code} ({school_year})"
+)
+_COURSE_NAME_PRESETS = {
+    "default": _DEFAULT_COURSE_NAME_TEMPLATE,
+    "course_and_class": (
+        "{course_title} \u2013 {class_title}[[ ({school_year})]]"
+    ),
+    "course_and_period": (
+        "{course_title}[[ \u2013 {class_code}]][[ ({school_year})]]"
+    ),
+    "class_title": "{class_title}",
+}
+
+
+class _LocalUploadError(ValueError):
+    """Safe validation failure produced before the component service runs."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(message)
 
 
 class _BoundedUploadStream:
@@ -86,8 +129,109 @@ class _BoundedUploadStream:
         data = self._source.read(request_size)
         self._read += len(data)
         if self._read > self._maximum:
-            raise ValueError("The package exceeds the 250 MB upload limit.")
+            raise _LocalUploadError(
+                "OR-ZIP-SIZE",
+                "The package exceeds the 250 MB upload limit.",
+            )
         return data
+
+
+def _folder_upload_archive(
+    uploads: Iterable[UploadFile],
+) -> tuple[Any, str]:
+    """Build a flat, stored ZIP from a browser-selected OneRoster folder."""
+
+    selected = tuple(uploads)
+    if not selected:
+        raise _LocalUploadError(
+            "OR-FOLDER-EMPTY",
+            "Choose a folder containing the OneRoster CSV files.",
+        )
+    if len(selected) > _MAX_FOLDER_FILES:
+        raise _LocalUploadError(
+            "OR-FOLDER-FILE-LIMIT",
+            f"The selected folder contains more than {_MAX_FOLDER_FILES} files.",
+        )
+
+    archive = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    names: set[str] = set()
+    roots: set[str] = set()
+    total = 0
+    try:
+        with zipfile.ZipFile(
+            archive,
+            "w",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=True,
+        ) as package:
+            for upload in selected:
+                supplied_name = str(upload.filename or "").replace("\\", "/")
+                parts = tuple(
+                    part for part in supplied_name.split("/") if part
+                )
+                if (
+                    not parts
+                    or any(part in {".", ".."} for part in parts)
+                    or "\x00" in supplied_name
+                ):
+                    raise _LocalUploadError(
+                        "OR-FOLDER-PATH",
+                        "The selected folder contains an invalid file path.",
+                    )
+                if len(parts) > 1:
+                    roots.add(parts[0])
+                member_name = parts[-1]
+                folded = member_name.casefold()
+                if folded in _FOLDER_IGNORED_FILES:
+                    continue
+                if folded not in _FOLDER_ALLOWED_FILES:
+                    raise _LocalUploadError(
+                        "OR-FOLDER-UNEXPECTED-FILE",
+                        f"The selected folder contains an unsupported file: "
+                        f"{member_name}.",
+                    )
+                if folded in names:
+                    raise _LocalUploadError(
+                        "OR-FOLDER-DUPLICATE-FILE",
+                        f"The selected folder contains duplicate OneRoster files: "
+                        f"{member_name}.",
+                    )
+                names.add(folded)
+                with package.open(member_name, "w", force_zip64=True) as target:
+                    while True:
+                        chunk = upload.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        if not isinstance(chunk, (bytes, bytearray)):
+                            raise TypeError(
+                                "Folder uploads must contain binary file streams."
+                            )
+                        total += len(chunk)
+                        if total > _MAX_UPLOAD_BYTES:
+                            raise _LocalUploadError(
+                                "OR-FOLDER-SIZE",
+                                "The selected folder exceeds the 250 MB upload limit.",
+                            )
+                        target.write(chunk)
+        if not names:
+            raise _LocalUploadError(
+                "OR-FOLDER-EMPTY",
+                "The selected folder does not contain OneRoster CSV files.",
+            )
+        archive.seek(0, 2)
+        if archive.tell() > _MAX_UPLOAD_BYTES:
+            raise _LocalUploadError(
+                "OR-FOLDER-SIZE",
+                "The selected folder exceeds the 250 MB upload limit.",
+            )
+        archive.seek(0)
+        root_name = next(iter(roots)) if len(roots) == 1 else "OneRoster folder"
+        safe_root = re.sub(r"[^A-Za-z0-9 ._-]+", "_", root_name).strip(" ._-")
+        filename = f"{(safe_root or 'OneRoster folder')[:80]}.zip"
+        return archive, filename
+    except BaseException:
+        archive.close()
+        raise
 
 
 def _record(value: Any) -> dict[str, Any]:
@@ -169,6 +313,22 @@ def _snapshot_record(value: Any) -> dict[str, Any]:
     result["counts"] = counts or {}
     if "ready_for_apply" not in result:
         result["ready_for_apply"] = bool(getattr(value, "ready_for_apply", False))
+    template = str(
+        result.get("course_name_template", "")
+        or _DEFAULT_COURSE_NAME_TEMPLATE
+    )
+    result["course_name_template"] = template
+    result["course_name_choice"] = next(
+        (
+            name
+            for name, preset in _COURSE_NAME_PRESETS.items()
+            if preset == template
+        ),
+        "custom",
+    )
+    result["custom_course_name_template"] = (
+        template if result["course_name_choice"] == "custom" else ""
+    )
     return result
 
 
@@ -576,6 +736,49 @@ def _status(
         request,
         "_oneroster_status.html",
         {"notice": notice, "error": error, "error_code": error_code},
+    )
+
+
+async def _ingest_uploaded_stream(
+    service: Any,
+    source: Any,
+    filename: str,
+) -> Any:
+    return await _call(
+        service,
+        ("upload", "ingest_upload", "upload_snapshot", "ingest_zip"),
+        (
+            (
+                (source,),
+                {"filename": filename, "max_bytes": _MAX_UPLOAD_BYTES},
+            ),
+            ((source,), {"filename": filename}),
+            (
+                (),
+                {
+                    "upload": source,
+                    "filename": filename,
+                    "max_bytes": _MAX_UPLOAD_BYTES,
+                },
+            ),
+        ),
+    )
+
+
+def _uploaded_snapshot_response(request: Request, value: Any) -> HTMLResponse:
+    snapshot = _snapshot_record(value)
+    import_id = str(snapshot.get("id", snapshot.get("import_id", "")) or "")
+    if not _valid_import_id(import_id):
+        return _status(
+            request,
+            error="The import service returned an invalid import identifier.",
+            error_code="OR-IMPORT-FAILED",
+        )
+    snapshot.setdefault("id", import_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_oneroster_import.html",
+        {"snapshot": snapshot},
     )
 
 
@@ -1061,46 +1264,58 @@ async def upload_snapshot(
         )
     bounded_source = _BoundedUploadStream(package.file, _MAX_UPLOAD_BYTES)
     try:
-        value = await _call(
+        value = await _ingest_uploaded_stream(
             feature["service"],
-            ("upload", "ingest_upload", "upload_snapshot", "ingest_zip"),
-            (
-                (
-                    (bounded_source,),
-                    {"filename": filename, "max_bytes": _MAX_UPLOAD_BYTES},
-                ),
-                ((bounded_source,), {"filename": filename}),
-                ((package,), {"max_bytes": _MAX_UPLOAD_BYTES}),
-                ((package,), {}),
-                (
-                    (),
-                    {
-                        "upload": package,
-                        "filename": filename,
-                        "max_bytes": _MAX_UPLOAD_BYTES,
-                    },
-                ),
-            ),
+            bounded_source,
+            filename,
         )
     except Exception as exc:  # noqa: BLE001 - stable local error contract
         code, message = _safe_error(exc, "OR-ZIP-INVALID")
         return _status(request, error=message, error_code=code)
     finally:
         lease.release()
-    snapshot = _snapshot_record(value)
-    import_id = str(snapshot.get("id", snapshot.get("import_id", "")) or "")
-    if not _valid_import_id(import_id):
+    return _uploaded_snapshot_response(request, value)
+
+
+@router.post("/upload-folder", response_class=HTMLResponse)
+async def upload_snapshot_folder(
+    request: Request,
+    folder_files: Annotated[list[UploadFile], File()],
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
         return _status(
             request,
-            error="The import service returned an invalid import identifier.",
-            error_code="OR-IMPORT-FAILED",
+            error=feature["message"],
+            error_code=feature["code"],
         )
-    snapshot.setdefault("id", import_id)
-    return TEMPLATES.TemplateResponse(
-        request,
-        "_oneroster_import.html",
-        {"snapshot": snapshot},
-    )
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "oneroster-folder-upload")
+    if lease is None:
+        return _status(
+            request,
+            error=ADMIN_ACTIVITY_BUSY_MESSAGE,
+            error_code="CMP-ACTIVE-JOB",
+        )
+    archive = None
+    try:
+        archive, filename = await asyncio.to_thread(
+            _folder_upload_archive,
+            folder_files,
+        )
+        value = await _ingest_uploaded_stream(
+            feature["service"],
+            archive,
+            filename,
+        )
+    except Exception as exc:  # noqa: BLE001 - stable local error contract
+        code, message = _safe_error(exc, "OR-FOLDER-INVALID")
+        return _status(request, error=message, error_code=code)
+    finally:
+        if archive is not None:
+            archive.close()
+        lease.release()
+    return _uploaded_snapshot_response(request, value)
 
 
 @router.get("/import/{import_id}", response_class=HTMLResponse)
@@ -1191,8 +1406,88 @@ async def select_academic_session(
         {
             "snapshot": snapshot,
             "notice": (
-                "Academic session selected and course plans rebuilt locally. "
+                "Automatic class and enrollment date scope refreshed locally. "
                 "No Classroom changes were made."
+            ),
+        },
+    )
+
+
+@router.post("/import/{import_id}/naming", response_class=HTMLResponse)
+async def configure_course_naming(
+    request: Request,
+    import_id: str,
+    naming_choice: Annotated[str, Form()] = "default",
+    custom_template: Annotated[str, Form()] = "",
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(import_id):
+        return _status(
+            request,
+            error="That import identifier is invalid.",
+            error_code="OR-IMPORT-NOT-FOUND",
+        )
+    choice = naming_choice.strip().casefold()
+    if choice == "custom":
+        template = custom_template.strip()
+        if not template:
+            return _status(
+                request,
+                error="Enter a custom class naming template.",
+                error_code="OR-NAMING-INVALID",
+            )
+    elif choice in _COURSE_NAME_PRESETS:
+        template = _COURSE_NAME_PRESETS[choice]
+    else:
+        return _status(
+            request,
+            error="Choose one of the available class naming schemes.",
+            error_code="OR-NAMING-INVALID",
+        )
+    state = request.app.state.gamgui
+    lease = try_acquire_admin_activity(state, "oneroster-course-naming")
+    if lease is None:
+        return _status(
+            request,
+            error=ADMIN_ACTIVITY_BUSY_MESSAGE,
+            error_code="CMP-ACTIVE-JOB",
+        )
+    try:
+        value = await _call(
+            feature["service"],
+            ("configure_course_naming", "configure_naming"),
+            (
+                ((import_id, template), {}),
+                (
+                    (),
+                    {
+                        "import_id": import_id,
+                        "template": template,
+                    },
+                ),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-NAMING-INVALID")
+        return _status(request, error=message, error_code=code)
+    finally:
+        lease.release()
+    snapshot = _snapshot_record(value)
+    snapshot.setdefault("id", import_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_oneroster_import.html",
+        {
+            "snapshot": snapshot,
+            "notice": (
+                "Class names were rebuilt locally with the selected scheme. "
+                "Review the Courses preview before building a live plan."
             ),
         },
     )

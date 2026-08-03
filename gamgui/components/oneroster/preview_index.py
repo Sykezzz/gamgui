@@ -1,9 +1,9 @@
 """Indexed, keyset-paginated OneRoster snapshot previews.
 
-The normalized snapshot is immutable between explicit term-selection rebuilds, so
-preview search can be materialized once without consulting Google or GAM.  FTS
-rowids provide a stable cursor order; source rows remain authoritative and are
-loaded in one bounded query per page.
+The normalized snapshot is immutable between local scope/naming rebuilds, so preview
+search can be materialized once without consulting Google or GAM. FTS rowids provide
+a stable cursor order; source rows remain authoritative and are loaded in one bounded
+query per page.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-PREVIEW_INDEX_VERSION = 1
+PREVIEW_INDEX_VERSION = 2
 FILTERED_TOTAL_CAP = 10_000
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -47,7 +47,8 @@ _SOURCES = {
     ),
     "enrollments": PreviewSource(
         "SELECT e.sourced_id AS _entity_key, e.sourced_id, e.status, e.class_id, "
-        "e.user_id, e.role, e.is_primary, u.email FROM enrollments e "
+        "e.user_id, e.role, e.is_primary, e.begin_date, e.end_date, e.in_scope, "
+        "u.email FROM enrollments e "
         "LEFT JOIN users u ON u.domain = e.domain AND u.sourced_id = e.user_id "
         "WHERE e.domain = ?",
         ("sourced_id", "class_id", "user_id", "role", "email"),
@@ -58,7 +59,8 @@ _SOURCES = {
         "u.email, e.is_primary FROM enrollments e "
         "JOIN course_plans p ON p.domain = e.domain AND p.class_id = e.class_id "
         "LEFT JOIN users u ON u.domain = e.domain AND u.sourced_id = e.user_id "
-        "WHERE e.domain = ? AND e.role = 'teacher' AND e.status != 'tobedeleted'",
+        "WHERE e.domain = ? AND e.role = 'teacher' AND e.status != 'tobedeleted' "
+        "AND e.in_scope = 1",
         ("alias", "class_id", "user_id", "email"),
         "alias, is_primary DESC, email COLLATE NOCASE, _entity_key",
     ),
@@ -67,7 +69,8 @@ _SOURCES = {
         "u.email FROM enrollments e "
         "JOIN course_plans p ON p.domain = e.domain AND p.class_id = e.class_id "
         "LEFT JOIN users u ON u.domain = e.domain AND u.sourced_id = e.user_id "
-        "WHERE e.domain = ? AND e.role = 'student' AND e.status != 'tobedeleted'",
+        "WHERE e.domain = ? AND e.role = 'student' AND e.status != 'tobedeleted' "
+        "AND e.in_scope = 1",
         ("alias", "class_id", "user_id", "email"),
         "alias, email COLLATE NOCASE, _entity_key",
     ),

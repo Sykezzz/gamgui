@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from io import BytesIO
 import json
@@ -20,6 +20,7 @@ from gamgui.core.activity import ActivityRegistry
 from gamgui.web.routes import oneroster as oneroster_routes
 from gamgui.web.routes.oneroster import (
     _BoundedUploadStream,
+    _folder_upload_archive,
     _planning_confirmation_hash,
     _planning_record,
     router,
@@ -69,6 +70,9 @@ class FakeOneRosterService:
                 "blocking_issue_count": 0,
                 "selected_session_id": "",
                 "ready_for_apply": False,
+                "course_name_template": (
+                    "{course_title} \u2013 {class_code} ({school_year})"
+                ),
             }
         }
         self.profile = {
@@ -158,6 +162,13 @@ class FakeOneRosterService:
             state="ready",
             ready_for_apply=True,
         )
+        self.snapshots[import_id] = snapshot
+        return snapshot
+
+    def configure_course_naming(self, import_id, template):
+        self.calls.append(("configure_course_naming", import_id, template))
+        snapshot = dict(self.snapshots[import_id])
+        snapshot["course_name_template"] = template
         self.snapshots[import_id] = snapshot
         return snapshot
 
@@ -453,6 +464,141 @@ def test_upload_rejects_non_zip_before_service_and_accepts_zip_stream():
     assert not registry.is_active()
 
 
+def test_folder_upload_builds_flat_zip_and_uses_folder_name():
+    uploads = [
+        SimpleNamespace(
+            filename=f"Summer Export/{name}",
+            file=BytesIO(value.encode()),
+        )
+        for name, value in valid_files().items()
+    ]
+
+    archive, filename = _folder_upload_archive(uploads)
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(archive) as package:
+            assert {
+                item.casefold() for item in package.namelist()
+            } == {item.casefold() for item in valid_files()}
+            assert all("/" not in item for item in package.namelist())
+        assert filename == "Summer Export.zip"
+    finally:
+        archive.close()
+
+
+def test_folder_upload_endpoint_accepts_selected_directory():
+    client, service = _client()
+    registry = ActivityRegistry()
+    client.app.state.gamgui.activity_registry = registry
+    files = [
+        (
+            "folder_files",
+            (
+                f"District Roster/{name}",
+                value.encode(),
+                "text/csv",
+            ),
+        )
+        for name, value in valid_files().items()
+    ]
+
+    response = client.post("/classroom/imports/upload-folder", files=files)
+
+    assert response.status_code == 200
+    assert "District Roster.zip" in response.text
+    assert ("upload", "District Roster.zip") in service.calls
+    assert not registry.is_active()
+
+
+def test_folder_upload_rejects_unexpected_or_duplicate_files():
+    unexpected = [
+        SimpleNamespace(filename="Roster/manifest.csv", file=BytesIO(b"ok")),
+        SimpleNamespace(filename="Roster/passwords.txt", file=BytesIO(b"no")),
+    ]
+    with pytest.raises(ValueError, match="unsupported file"):
+        _folder_upload_archive(unexpected)
+
+    duplicate = [
+        SimpleNamespace(filename="Roster/users.csv", file=BytesIO(b"one")),
+        SimpleNamespace(filename="Roster/USERS.CSV", file=BytesIO(b"two")),
+    ]
+    with pytest.raises(ValueError, match="duplicate OneRoster files"):
+        _folder_upload_archive(duplicate)
+
+
+def test_folder_upload_endpoint_returns_specific_validation_error():
+    client, service = _client()
+    response = client.post(
+        "/classroom/imports/upload-folder",
+        files={
+            "folder_files": (
+                "Roster/notes.txt",
+                b"not OneRoster",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert "unsupported file: notes.txt" in response.text
+    assert "OR-FOLDER-UNEXPECTED-FILE" in response.text
+    assert not any(call[0] == "upload" for call in service.calls)
+
+
+def test_folder_upload_accepts_future_session_snapshot_without_error(
+    tmp_path: Path,
+):
+    today = datetime.now().date()
+    source_files = valid_files()
+    source_files["academicSessions.csv"] = source_files[
+        "academicSessions.csv"
+    ].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        (
+            "term-1,active,Future Term,term,"
+            f"{(today + timedelta(days=7)).isoformat()},"
+            f"{(today + timedelta(days=180)).isoformat()}"
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "future-folder")
+    registry = ActivityRegistry()
+    state = SimpleNamespace(
+        component_manager=FakeComponentManager(),
+        oneroster_service=service,
+        audit_domain="example.org",
+        connector=object(),
+        oneroster_manifest_tasks={},
+        oneroster_manifest_errors={},
+        activity_registry=registry,
+    )
+    app = FastAPI()
+    app.state.gamgui = state
+    app.include_router(router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/classroom/imports/upload-folder",
+        files=[
+            (
+                "folder_files",
+                (f"Summer Roster/{name}", value.encode(), "text/csv"),
+            )
+            for name, value in source_files.items()
+        ],
+    )
+
+    assert response.status_code == 200
+    assert "No classes are scheduled for today" in response.text
+    assert "summer or future-term snapshot" in response.text
+    assert "Error code" not in response.text
+    snapshot = service.history()[0]
+    assert snapshot.ready_for_apply
+    assert snapshot.counts.ready_courses == 0
+    assert snapshot.counts.deferred_courses == 1
+    assert not registry.is_active()
+
+
 def test_historical_session_reselection_allows_next_upload_without_active_job(
     tmp_path: Path,
 ):
@@ -604,25 +750,74 @@ def test_preview_rejects_unallowlisted_kind_before_service():
     assert not any(call[0] == "preview" for call in service.calls)
 
 
-def test_academic_session_selection_is_local_and_rebuilds_import():
+def test_academic_sessions_explain_automatic_scope_without_selection_controls():
     client, service = _client()
     preview = client.get(
         "/classroom/imports/import/import-1/preview",
         params={"kind": "sessions"},
     )
     assert preview.status_code == 200
-    assert "Use this session" in preview.text
+    assert "automatically includes each class" in preview.text
+    assert "no single-session selection is required" in preview.text
+    assert "Use this session" not in preview.text
     assert "term-2026" in preview.text
 
+    # Stale clients can still post the old action without changing Google state.
     selected = client.post(
         "/classroom/imports/import/import-1/session",
         data={"session_id": "term-2026"},
     )
     assert selected.status_code == 200
-    assert "Academic session selected" in selected.text
-    assert "term-2026" in selected.text
+    assert "Automatic class and enrollment date scope refreshed" in selected.text
     assert ("select_session", "import-1", "term-2026") in service.calls
     assert not any(call[0] == "build_live_plan" for call in service.calls)
+
+
+def test_import_naming_scheme_is_discoverable_and_rebuilds_locally():
+    client, service = _client()
+    page = client.get("/classroom/imports/import/import-1")
+
+    assert page.status_code == 200
+    assert "Class naming" in page.text
+    assert "Apply naming and rebuild preview" in page.text
+    assert "{course_title}" in page.text
+    assert "stable" in page.text
+
+    configured = client.post(
+        "/classroom/imports/import/import-1/naming",
+        data={
+            "naming_choice": "custom",
+            "custom_template": (
+                "{course_title}[[ \u2013 {class_code}]]"
+                "[[ ({school_year})]]"
+            ),
+        },
+    )
+
+    assert configured.status_code == 200
+    assert "Class names were rebuilt locally" in configured.text
+    assert (
+        "configure_course_naming",
+        "import-1",
+        "{course_title}[[ \u2013 {class_code}]][[ ({school_year})]]",
+    ) in service.calls
+    assert not any(call[0] == "build_live_plan" for call in service.calls)
+
+
+def test_import_naming_rejects_invalid_choice_without_rebuilding():
+    client, service = _client()
+
+    response = client.post(
+        "/classroom/imports/import/import-1/naming",
+        data={"naming_choice": "unknown", "custom_template": "{class_title}"},
+    )
+
+    assert response.status_code == 200
+    assert "OR-NAMING-INVALID" in response.text
+    assert not any(
+        call[0] == "configure_course_naming"
+        for call in service.calls
+    )
 
 
 def test_gam_export_is_allowlisted_streamed_and_not_cached():
@@ -952,6 +1147,9 @@ def test_import_controls_have_semantics_live_regions_and_focus_styles():
     assert "focus-visible:ring-2" in response.text
     assert 'aria-labelledby="oneroster-upload-heading"' in response.text
     assert 'enctype="multipart/form-data"' in response.text
+    assert 'hx-post="/classroom/imports/upload-folder"' in response.text
+    assert "webkitdirectory" in response.text
+    assert "Choose folder" in response.text
     assert "current_manifest_hash" not in response.text
 
 
@@ -1257,4 +1455,6 @@ async def test_district_plan_render_and_confirmation_hash_run_off_event_loop(
     assert context["planning"]["import_id"] == "import-offload"
     assert len(digest) == 64
     assert worker_threads and all(item != main_thread for item in worker_threads)
-    assert heartbeat >= 5
+    # Thread identity proves both blocking operations were offloaded. Windows
+    # timer granularity can coalesce several of the nominal 5 ms heartbeats.
+    assert heartbeat >= 1
