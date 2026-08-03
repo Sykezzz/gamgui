@@ -12,7 +12,6 @@ import io
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import string
@@ -1682,6 +1681,7 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
         orgs=count("orgs"),
         ready_courses=count("course_plans", "ready = 1"),
         quarantined_courses=count("course_plans", "selected = 1 AND ready = 0"),
+        deferred_courses=count("course_plans", "selected = 0"),
         teachers=int(participant_counts[0] or 0),
         students=int(participant_counts[1] or 0),
     )

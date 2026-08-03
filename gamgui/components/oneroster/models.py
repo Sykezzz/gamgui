@@ -82,6 +82,7 @@ class SnapshotCounts:
     orgs: int = 0
     ready_courses: int = 0
     quarantined_courses: int = 0
+    deferred_courses: int = 0
     teachers: int = 0
     students: int = 0
 
@@ -95,6 +96,7 @@ class SnapshotCounts:
             "orgs": self.orgs,
             "ready_courses": self.ready_courses,
             "quarantined_courses": self.quarantined_courses,
+            "deferred_courses": self.deferred_courses,
             "teachers": self.teachers,
             "students": self.students,
         }

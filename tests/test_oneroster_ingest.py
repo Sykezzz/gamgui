@@ -341,6 +341,35 @@ def test_session_dates_scope_each_class_and_treat_end_as_exclusive(
     assert courses["ended-class"]["quarantine_codes"] == ()
     assert snapshot.counts.ready_courses == 1
     assert snapshot.counts.quarantined_courses == 0
+    assert snapshot.counts.deferred_courses == 1
+
+
+def test_future_sessions_are_deferred_without_blocking_summer_import(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        (
+            "term-1,active,Future Term,term,"
+            f"{(today + timedelta(days=7)).isoformat()},"
+            f"{(today + timedelta(days=180)).isoformat()}"
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "future-summer-import")
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.state is SnapshotState.READY
+    assert snapshot.ready_for_apply
+    assert snapshot.blocking_issue_count == 0
+    assert snapshot.counts.ready_courses == 0
+    assert snapshot.counts.quarantined_courses == 0
+    assert snapshot.counts.deferred_courses == 1
+    assert course["selected"] is False
+    assert course["quarantine_codes"] == ()
 
 
 def test_enrollment_dates_filter_current_roster_and_use_exclusive_end(

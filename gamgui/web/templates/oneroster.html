@@ -49,17 +49,31 @@
 
   <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="oneroster-upload-heading">
     <h2 id="oneroster-upload-heading" class="font-serif text-xl text-brand-black">Upload a full snapshot</h2>
-    <p class="mt-1 text-sm text-brand-blueink/80">The package is validated locally. Uploading does not contact Google or run GAM. Maximum package size: 250 MB.</p>
-    <form class="mt-4 flex flex-wrap items-end gap-3"
-          enctype="multipart/form-data"
-          hx-post="/classroom/imports/upload"
-          hx-target="#oneroster-workspace"
-          hx-swap="innerHTML">
-      <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">OneRoster ZIP
-        <input class="{{ field }} mt-1" type="file" name="package" accept=".zip,application/zip" required />
-      </label>
-      <button type="submit" class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Upload and validate</button>
-    </form>
+    <p class="mt-1 text-sm text-brand-blueink/80">Choose the exported ZIP or its folder of CSV files. Validation stays local and never contacts Google or runs GAM. Maximum upload size: 250 MB.</p>
+    <div class="mt-4 grid min-w-0 gap-4 lg:grid-cols-2">
+      <form class="min-w-0 rounded-xl border border-brand-gray/40 bg-paper p-4"
+            enctype="multipart/form-data"
+            hx-post="/classroom/imports/upload"
+            hx-target="#oneroster-workspace"
+            hx-swap="innerHTML">
+        <label class="block text-sm font-semibold text-brand-black">OneRoster ZIP
+          <span class="mt-1 block text-xs font-normal text-brand-blueink/80">Use the ZIP exactly as exported by your SIS.</span>
+          <input class="{{ field }} mt-2" type="file" name="package" accept=".zip,application/zip" required />
+        </label>
+        <button type="submit" class="mt-3 inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Upload ZIP</button>
+      </form>
+      <form class="min-w-0 rounded-xl border border-brand-gray/40 bg-paper p-4"
+            enctype="multipart/form-data"
+            hx-post="/classroom/imports/upload-folder"
+            hx-target="#oneroster-workspace"
+            hx-swap="innerHTML">
+        <label class="block text-sm font-semibold text-brand-black">OneRoster folder
+          <span class="mt-1 block text-xs font-normal text-brand-blueink/80">Select the folder containing manifest.csv and the related OneRoster CSV files.</span>
+          <input class="{{ field }} mt-2" type="file" name="folder_files" accept=".csv,text/csv" webkitdirectory directory multiple required />
+        </label>
+        <button type="submit" class="mt-3 inline-flex rounded-lg border border-brand-blueink bg-brand-white px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-brand-white/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Choose folder</button>
+      </form>
+    </div>
   </section>
 
   <div id="oneroster-workspace" aria-live="polite">
