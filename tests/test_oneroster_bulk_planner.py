@@ -436,3 +436,32 @@ async def test_invalid_term_protects_present_alias_from_archive(tmp_path: Path):
     assert second.ready_for_apply
     assert plan.archive_actions == ()
     assert any(issue.code == "OR-REFERENCE-TERM" for issue in plan.issues)
+
+
+@pytest.mark.asyncio
+async def test_ended_term_alias_is_protected_from_archive(tmp_path: Path):
+    service, first_id = _ready_service(tmp_path)
+    service.mark_accepted(first_id)
+    files = valid_files()
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        "term-1,active,Ended Term,term,2000-01-01,2001-01-01",
+    )
+    files["academicSessions.csv"] += (
+        "term-current,active,Current Term,term,2000-01-01,2100-12-31,"
+        "year-1,2026-27\n"
+    )
+    files["classes.csv"] += (
+        "202,active,Geometry Section,P2,202,course-1,term-current,school-1,9\n"
+    )
+    files["enrollments.csv"] += (
+        "enrollment-teacher-202,active,202,school-1,teacher-1,teacher,true,,\n"
+        "enrollment-student-202,active,202,school-1,student-1,student,false,,\n"
+    )
+    second = service.upload(zip_bytes(files))
+    connector = BulkPlannerConnector([_managed_course()])
+
+    plan = await service.build_live_plan(connector, second.id)
+
+    assert plan.archive_actions == ()
+    assert any(action.subject == "Section_202" for action in plan.actions)

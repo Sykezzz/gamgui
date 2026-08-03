@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-PREVIEW_INDEX_VERSION = 2
+PREVIEW_INDEX_VERSION = 3
 FILTERED_TOTAL_CAP = 10_000
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -29,7 +29,15 @@ _SOURCES = {
     "courses": PreviewSource(
         "SELECT p.class_id AS _entity_key, p.* "
         "FROM course_plans p WHERE p.domain = ?",
-        ("name", "alias", "owner_email", "section", "class_id"),
+        (
+            "name",
+            "alias",
+            "owner_email",
+            "section",
+            "class_id",
+            "scope_state",
+            "school_year_id",
+        ),
         "selected DESC, ready DESC, name COLLATE NOCASE, class_id",
     ),
     "excluded": PreviewSource(

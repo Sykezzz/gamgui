@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 from gamgui.core.classroom.models import CourseRosterSnapshot
 from gamgui.core.gam.errors import GAMErrorKind
 
+from .ingest import district_roster_date
 from .models import (
     ImportAction,
     ImportIssue,
@@ -33,7 +34,7 @@ from .store import OneRosterStore
 from .thresholds import evaluate_thresholds
 
 
-PLANNER_SCHEMA_VERSION = 2
+PLANNER_SCHEMA_VERSION = 3
 DIRECTORY_CONCURRENCY = 12
 COURSE_CONCURRENCY = 8
 # The current planner uses compact in-memory participant/action models. Keep
@@ -103,6 +104,24 @@ class _ActionPayload:
     owner_ids: Mapping[str, str]
 
 
+def planner_configuration_hash(
+    *,
+    limited_import: bool,
+    course_name_template: str,
+    threshold_profile: Mapping[str, Any],
+    schedule_scope: Mapping[str, str],
+) -> str:
+    return canonical_hash(
+        {
+            "planner_schema": PLANNER_SCHEMA_VERSION,
+            "limited_import": bool(limited_import),
+            "course_name_template": course_name_template,
+            "threshold_profile": dict(threshold_profile),
+            "schedule_scope": dict(schedule_scope),
+        }
+    )
+
+
 class OneRosterPlanner:
     """Build an immutable, deterministic diff from a normalized snapshot and live state."""
 
@@ -126,7 +145,10 @@ class OneRosterPlanner:
         limited_import: bool = False,
         now: Optional[datetime] = None,
     ) -> LivePlanningResult:
-        snapshot = self.store.get_import(import_id)
+        snapshot = self.store.refresh_schedule_scope(
+            import_id,
+            today=district_roster_date(now),
+        )
         if not snapshot.ready_for_apply:
             raise OneRosterError(
                 "OR-IMPORT-BLOCKED",
@@ -211,13 +233,12 @@ class OneRosterPlanner:
         )
         issues.extend(action_payload.issues)
         issues.extend(archive_issues)
-        config_hash = canonical_hash(
-            {
-                "planner_schema": PLANNER_SCHEMA_VERSION,
-                "limited_import": effective_limited,
-                "course_name_template": snapshot.course_name_template,
-                "threshold_profile": profile.to_dict(),
-            }
+        schedule_scope = self.store.schedule_scope(import_id)
+        config_hash = planner_configuration_hash(
+            limited_import=effective_limited,
+            course_name_template=snapshot.course_name_template,
+            threshold_profile=profile.to_dict(),
+            schedule_scope=schedule_scope,
         )
         counts = Counter(action_payload.action_counts)
         counts["record_rejected"] = await asyncio.to_thread(
@@ -242,8 +263,8 @@ class OneRosterPlanner:
             limited_import=effective_limited,
             threshold_evaluation=threshold_evaluation,
             owner_ids=action_payload.owner_ids,
+            scope_hash=canonical_hash(schedule_scope),
         )
-
     async def _read_directory_snapshot(self) -> Optional[dict[str, Any]]:
         bulk = getattr(self.connector, "list_oneroster_directory", None)
         if not callable(bulk):

@@ -24,7 +24,11 @@ from gamgui.core.processes import current_process_identity, process_lease_is_dea
 
 from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
-from .ingest import normalize_course_name_template, rebuild_course_plans
+from .ingest import (
+    normalize_course_name_template,
+    read_schedule_scope,
+    rebuild_course_plans,
+)
 from .models import (
     AUTOMATIC_SESSION_SCOPE,
     ClassroomImportManifest,
@@ -131,13 +135,18 @@ class OneRosterStore:
         issue_count: int,
         blocking_issue_count: int,
     ) -> OneRosterSnapshot:
+        scope = read_schedule_scope(
+            self.normalized_path(import_id),
+            self.domain,
+        )
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 """
                 UPDATE imports
                 SET source_sha256 = ?, state = ?, package_mode = ?,
                     selected_session_id = ?, counts_json = ?, issue_count = ?,
-                    blocking_issue_count = ?
+                    blocking_issue_count = ?, scope_date = ?,
+                    school_year_id = ?, school_year_title = ?
                 WHERE domain = ? AND id = ?
                 """,
                 (
@@ -148,6 +157,9 @@ class OneRosterStore:
                     json.dumps(counts.to_dict(), sort_keys=True),
                     int(issue_count),
                     int(blocking_issue_count),
+                    scope["scope_date"],
+                    scope["school_year_id"],
+                    scope["school_year_title"],
                     self.domain,
                     import_id,
                 ),
@@ -190,11 +202,17 @@ class OneRosterStore:
                 issue_count=snapshot.issue_count,
                 blocking_issue_count=snapshot.blocking_issue_count,
                 course_name_template=snapshot.course_name_template,
+                scope_date=snapshot.scope_date,
+                school_year_id=snapshot.school_year_id,
+                school_year_title=snapshot.school_year_title,
             )
         if (
             snapshot.package_mode == "bulk"
             and snapshot.state not in {SnapshotState.PREPARING, SnapshotState.EXPIRED}
-            and snapshot.selected_session_id != AUTOMATIC_SESSION_SCOPE
+            and (
+                snapshot.selected_session_id != AUTOMATIC_SESSION_SCOPE
+                or not snapshot.scope_date
+            )
         ):
             return self._refresh_automatic_scope(snapshot)
         return snapshot
@@ -301,12 +319,14 @@ class OneRosterStore:
             if snapshot.package_mode == "bulk" and blocking == 0
             else SnapshotState.BLOCKED
         )
+        scope = read_schedule_scope(self.normalized_path(import_id), self.domain)
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
                 """
                 UPDATE imports
                 SET course_name_template = ?, state = ?, counts_json = ?,
-                    issue_count = ?, blocking_issue_count = ?
+                    issue_count = ?, blocking_issue_count = ?, scope_date = ?,
+                    school_year_id = ?, school_year_title = ?
                 WHERE domain = ? AND id = ?
                 """,
                 (
@@ -315,6 +335,9 @@ class OneRosterStore:
                     json.dumps(counts.to_dict(), sort_keys=True),
                     len(issues),
                     blocking,
+                    scope["scope_date"],
+                    scope["school_year_id"],
+                    scope["school_year_title"],
                     self.domain,
                     import_id,
                 ),
@@ -332,7 +355,7 @@ class OneRosterStore:
         cursor: Optional[str] = None,
         limit: int = MAX_PAGE_SIZE,
     ) -> PreviewPage:
-        snapshot = self.get_import(import_id)
+        snapshot = self.refresh_schedule_scope(import_id)
         self._require_material(snapshot)
         normalized = self.normalized_path(import_id)
         page_size = max(1, min(int(limit or MAX_PAGE_SIZE), MAX_PAGE_SIZE))
@@ -374,6 +397,11 @@ class OneRosterStore:
             limit=page_size,
             total_exact=total_exact,
         )
+
+    def schedule_scope(self, import_id: str) -> Mapping[str, str]:
+        snapshot = self.get_import(import_id)
+        self._require_material(snapshot)
+        return read_schedule_scope(self.normalized_path(import_id), self.domain)
 
     def write_export(
         self,
@@ -1641,7 +1669,10 @@ class OneRosterStore:
                     counts_json TEXT NOT NULL, issue_count INTEGER NOT NULL,
                     blocking_issue_count INTEGER NOT NULL, accepted_at REAL NOT NULL,
                     course_name_template TEXT NOT NULL DEFAULT
-                        '{course_title} \u2013 {class_code} ({school_year})'
+                        '{course_title} \u2013 {class_code} ({school_year})',
+                    scope_date TEXT NOT NULL DEFAULT '',
+                    school_year_id TEXT NOT NULL DEFAULT '',
+                    school_year_title TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS imports_domain_time
                     ON imports(domain, imported_at DESC);
@@ -1712,6 +1743,24 @@ class OneRosterStore:
                     "TEXT NOT NULL DEFAULT "
                     "'{course_title} \u2013 {class_code} ({school_year})'"
                 ),
+            )
+            _ensure_column(
+                conn,
+                "imports",
+                "scope_date",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                conn,
+                "imports",
+                "school_year_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                conn,
+                "imports",
+                "school_year_title",
+                "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
                 conn,
@@ -1842,6 +1891,9 @@ def _snapshot_from_row(row: sqlite3.Row) -> OneRosterSnapshot:
         course_name_template=str(
             row["course_name_template"] or DEFAULT_COURSE_NAME_TEMPLATE
         ),
+        scope_date=str(row["scope_date"] or ""),
+        school_year_id=str(row["school_year_id"] or ""),
+        school_year_title=str(row["school_year_title"] or ""),
     )
 
 

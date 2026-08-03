@@ -73,6 +73,9 @@ _CLASS_DERIVED_ISSUE_CODES = frozenset(
         "OR-REFERENCE-TERM",
         "OR-REFERENCE-COURSE",
         "OR-REFERENCE-SCHOOL-YEAR",
+        "OR-SCHOOL-YEAR-AMBIGUOUS",
+        "OR-SCHOOL-YEAR-HIERARCHY",
+        "OR-SCHOOL-YEAR-MISSING",
         "OR-SESSION-DATE",
         "OR-ALIAS-MISSING",
         "OR-ALIAS-COLLISION",
@@ -85,7 +88,18 @@ _CLASS_DERIVED_ISSUE_CODES = frozenset(
         "OR-GAM-VALUE-INVALID",
     }
 )
-_ENROLLMENT_DERIVED_ISSUE_CODES = frozenset({"OR-ENROLLMENT-DATE"})
+_ENROLLMENT_DERIVED_ISSUE_CODES = frozenset(
+    {"OR-ENROLLMENT-DATE", "OR-REFERENCE-ENROLLMENT"}
+)
+_USER_DERIVED_ISSUE_CODES = frozenset({"OR-USER-EMAIL-MISSING"})
+_SCOPE_DERIVED_ISSUE_CODES = frozenset(
+    {
+        "OR-SESSION-DATE",
+        "OR-SCHOOL-YEAR-AMBIGUOUS",
+        "OR-SCHOOL-YEAR-HIERARCHY",
+        "OR-SCHOOL-YEAR-MISSING",
+    }
+)
 
 REQUIRED_HEADERS: Mapping[str, frozenset[str]] = {
     "manifest.csv": frozenset(("propertyName", "value")),
@@ -327,16 +341,31 @@ def rebuild_course_plans(
                 ),
                 tuple(_ENROLLMENT_DERIVED_ISSUE_CODES),
             )
+            conn.execute(
+                "DELETE FROM issues WHERE entity_kind = 'academic_session' "
+                "AND code IN ({})".format(
+                    ", ".join("?" for _ in _SCOPE_DERIVED_ISSUE_CODES)
+                ),
+                tuple(_SCOPE_DERIVED_ISSUE_CODES),
+            )
+            conn.execute(
+                "DELETE FROM issues WHERE entity_kind = 'user' AND code IN ({})".format(
+                    ", ".join("?" for _ in _USER_DERIVED_ISSUE_CODES)
+                ),
+                tuple(_USER_DERIVED_ISSUE_CODES),
+            )
             issues = _IssueCollector(
                 DEFAULT_MAX_ISSUES,
                 tuple(_issues_from_db(conn)),
             )
+            scope_date = today or _current_roster_date()
+            _validate_references(conn, domain, issues, scope_date)
             _build_course_plans(
                 conn,
                 domain,
                 issues,
                 normalize_course_name_template(course_name_template),
-                today=today or _current_roster_date(),
+                today=scope_date,
             )
             _write_issues(conn, issues)
             rebuild_preview_index(conn, domain)
@@ -1232,8 +1261,8 @@ def _validate_references(
 ) -> None:
     for row in conn.execute(
         """
-        SELECT e.sourced_id, e.class_id, e.user_id, e.begin_date, e.end_date,
-               e.row_number,
+        SELECT e.sourced_id, e.class_id, e.user_id, e.role, e.begin_date,
+               e.end_date, e.row_number,
                c.sourced_id AS found_class, u.sourced_id AS found_user
         FROM enrollments e
         LEFT JOIN classes c ON c.domain = e.domain AND c.sourced_id = e.class_id
@@ -1246,6 +1275,7 @@ def _validate_references(
         (domain,),
     ):
         enrollment_in_scope, dates_valid = _enrollment_scope(
+            str(row["role"] or ""),
             str(row["begin_date"] or ""),
             str(row["end_date"] or ""),
             today,
@@ -1286,6 +1316,8 @@ def _validate_references(
 @dataclass(frozen=True)
 class _SessionWindow:
     sourced_id: str
+    title: str
+    session_type: str
     start: Optional[date]
     end: Optional[date]
     parent_id: str
@@ -1306,7 +1338,8 @@ def _session_windows(
     windows: dict[str, _SessionWindow] = {}
     for row in conn.execute(
         """
-        SELECT sourced_id, start_date, end_date, parent_id, school_year
+        SELECT sourced_id, title, session_type, start_date, end_date, parent_id,
+               school_year
         FROM academic_sessions
         WHERE domain = ? AND status != 'tobedeleted'
         """,
@@ -1321,6 +1354,8 @@ def _session_windows(
         source_id = str(row["sourced_id"])
         windows[source_id] = _SessionWindow(
             sourced_id=source_id,
+            title=str(row["title"] or "").strip(),
+            session_type=str(row["session_type"] or "").strip().casefold(),
             start=start,
             end=end,
             parent_id=str(row["parent_id"] or "").strip(),
@@ -1372,13 +1407,14 @@ def _refresh_enrollment_scope(
 ) -> None:
     for row in conn.execute(
         """
-        SELECT sourced_id, begin_date, end_date, row_number
+        SELECT sourced_id, role, begin_date, end_date, row_number
         FROM enrollments
         WHERE domain = ? AND status != 'tobedeleted'
         """,
         (domain,),
     ):
         in_scope, valid = _enrollment_scope(
+            str(row["role"] or ""),
             str(row["begin_date"] or ""),
             str(row["end_date"] or ""),
             today,
@@ -1404,6 +1440,7 @@ def _refresh_enrollment_scope(
 
 
 def _enrollment_scope(
+    role: str,
     begin_value: str,
     end_value: str,
     today: date,
@@ -1419,21 +1456,153 @@ def _enrollment_scope(
     return (
         bool(
             valid
-            and (begin is None or begin <= today)
             and (end is None or today < end)
+            and (
+                str(role or "").strip().casefold() == "teacher"
+                or begin is None
+                or begin <= today
+            )
         ),
         valid,
     )
 
 
 def _current_roster_date() -> date:
+    return district_roster_date()
+
+
+def district_roster_date(now: Optional[datetime] = None) -> date:
+    """Resolve the district calendar date used for all derived roster scope."""
+
     try:
         district_zone = ZoneInfo(DISTRICT_TIMEZONE)
     except ZoneInfoNotFoundError:
         # Some Windows Python distributions omit the IANA timezone database.
         # The signed macOS app has it; local calendar time is the safe fallback.
-        return date.today()
-    return datetime.now(district_zone).date()
+        return now.date() if now is not None else date.today()
+    if now is None:
+        return datetime.now(district_zone).date()
+    if now.tzinfo is None:
+        return now.date()
+    return now.astimezone(district_zone).date()
+
+
+def _school_year_ancestor(
+    session_id: str,
+    windows: Mapping[str, _SessionWindow],
+) -> tuple[str, bool]:
+    current = str(session_id or "").strip()
+    visited: set[str] = set()
+    while current:
+        if current in visited:
+            return "", False
+        visited.add(current)
+        window = windows.get(current)
+        if window is None:
+            return "", False
+        if window.session_type == "schoolyear":
+            return current, True
+        current = window.parent_id
+    return "", False
+
+
+def _select_school_year(
+    conn: sqlite3.Connection,
+    domain: str,
+    windows: Mapping[str, _SessionWindow],
+    today: date,
+    issues: list[ImportIssue],
+) -> Optional[_SessionWindow]:
+    school_years = tuple(
+        window
+        for window in windows.values()
+        if window.session_type == "schoolyear"
+    )
+    invalid = tuple(window for window in school_years if not window.valid)
+    for window in invalid:
+        issues.append(
+            _issue(
+                "OR-SESSION-DATE",
+                "School-year dates are invalid; automatic year selection is held.",
+                "academic_session",
+                window.sourced_id,
+            )
+        )
+
+    for window in school_years:
+        if window.parent_id:
+            issues.append(
+                _issue(
+                    "OR-SCHOOL-YEAR-HIERARCHY",
+                    "A schoolYear session cannot have a parent session.",
+                    "academic_session",
+                    window.sourced_id,
+                )
+            )
+
+    valid = tuple(window for window in school_years if window.valid)
+    current = tuple(window for window in valid if window.includes(today))
+    selected: Optional[_SessionWindow] = None
+    if len(current) == 1:
+        selected = current[0]
+    elif len(current) > 1:
+        issues.append(
+            _issue(
+                "OR-SCHOOL-YEAR-AMBIGUOUS",
+                "Multiple school years contain the roster date; automatic selection is held.",
+                "academic_session",
+            )
+        )
+    else:
+        upcoming = tuple(window for window in valid if window.start and window.start > today)
+        if upcoming:
+            nearest_start = min(
+                window.start for window in upcoming if window.start is not None
+            )
+            nearest = tuple(window for window in upcoming if window.start == nearest_start)
+            if len(nearest) == 1:
+                selected = nearest[0]
+            else:
+                issues.append(
+                    _issue(
+                        "OR-SCHOOL-YEAR-AMBIGUOUS",
+                        "Multiple upcoming school years begin on the same nearest date; "
+                        "automatic selection is held.",
+                        "academic_session",
+                    )
+                )
+        elif not invalid:
+            issues.append(
+                _issue(
+                    "OR-SCHOOL-YEAR-MISSING",
+                    "No current or upcoming school year can be selected safely.",
+                    "academic_session",
+                )
+            )
+
+    conn.execute(
+        """
+        INSERT INTO schedule_scope (
+            domain, scope_date, school_year_id, school_year_title,
+            school_year_start, school_year_end
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(domain) DO UPDATE SET
+            scope_date = excluded.scope_date,
+            school_year_id = excluded.school_year_id,
+            school_year_title = excluded.school_year_title,
+            school_year_start = excluded.school_year_start,
+            school_year_end = excluded.school_year_end
+        """,
+        (
+            domain,
+            today.isoformat(),
+            selected.sourced_id if selected is not None else "",
+            selected.title if selected is not None else "",
+            selected.start.isoformat() if selected is not None and selected.start else "",
+            selected.end.isoformat() if selected is not None and selected.end else "",
+        ),
+    )
+    return selected
 
 
 def _build_course_plans(
@@ -1445,13 +1614,15 @@ def _build_course_plans(
     today: date,
 ) -> None:
     _ensure_enrollment_scope_column(conn)
+    _ensure_course_scope_schema(conn)
     conn.execute("DELETE FROM course_plans WHERE domain = ?", (domain,))
     _refresh_enrollment_scope(conn, domain, today, issues)
     aliases: dict[str, list[str]] = defaultdict(list)
     class_rows = conn.execute(
         """
         SELECT c.*, x.title AS course_title, x.school_year_id,
-               y.school_year AS course_school_year
+               y.school_year AS course_school_year,
+               y.session_type AS course_school_year_type
         FROM classes c
         LEFT JOIN courses x ON x.domain = c.domain AND x.sourced_id = c.course_id
                            AND x.status != 'tobedeleted'
@@ -1466,6 +1637,16 @@ def _build_course_plans(
     for row in class_rows:
         aliases[section_alias(row["sourced_id"]).casefold()].append(row["sourced_id"])
     session_windows = _session_windows(conn, domain)
+    selected_school_year = _select_school_year(
+        conn,
+        domain,
+        session_windows,
+        today,
+        issues,
+    )
+    selected_school_year_id = (
+        selected_school_year.sourced_id if selected_school_year is not None else ""
+    )
     known_sessions = set(session_windows)
     inactive_sessions = {
         str(row[0])
@@ -1540,15 +1721,66 @@ def _build_course_plans(
         current_sessions = tuple(
             window for window in effective_sessions if window.includes(today)
         )
-        scope_is_uncertain = has_unknown_session or has_invalid_session
-        selected = bool(current_sessions) or scope_is_uncertain
+        course_school_year_id = str(row["school_year_id"] or "").strip()
+        course_year_exists = (
+            course_school_year_id in session_windows if course_school_year_id else False
+        )
+        course_year_is_valid = bool(
+            course_year_exists
+            and session_windows[course_school_year_id].session_type == "schoolyear"
+        )
+        term_school_year_ids: set[str] = set()
+        hierarchy_is_valid = True
+        for window in effective_sessions:
+            ancestor_id, valid_hierarchy = _school_year_ancestor(
+                window.sourced_id,
+                session_windows,
+            )
+            hierarchy_is_valid = hierarchy_is_valid and valid_hierarchy
+            if ancestor_id:
+                term_school_year_ids.add(ancestor_id)
+        if len(term_school_year_ids) > 1:
+            hierarchy_is_valid = False
+        if course_school_year_id and not course_year_is_valid:
+            codes.append("OR-REFERENCE-SCHOOL-YEAR")
+            hierarchy_is_valid = False
+        if (
+            course_year_is_valid
+            and term_school_year_ids
+            and term_school_year_ids != {course_school_year_id}
+        ):
+            hierarchy_is_valid = False
+        if effective_sessions and not hierarchy_is_valid:
+            codes.append("OR-SCHOOL-YEAR-HIERARCHY")
+        resolved_school_year_id = (
+            course_school_year_id
+            if course_year_is_valid
+            else next(iter(term_school_year_ids), "")
+        )
+        scope_is_uncertain = bool(
+            has_unknown_session
+            or has_invalid_session
+            or (effective_sessions and not hierarchy_is_valid)
+            or not selected_school_year_id
+        )
+        nonended_sessions = tuple(
+            window
+            for window in effective_sessions
+            if window.valid and window.end is not None and today < window.end
+        )
+        if scope_is_uncertain:
+            scope_state = "uncertain"
+        elif resolved_school_year_id != selected_school_year_id:
+            scope_state = "other-year"
+        elif current_sessions:
+            scope_state = "current"
+        elif nonended_sessions:
+            scope_state = "future-ready"
+        else:
+            scope_state = "ended"
+        selected = scope_state in {"current", "future-ready", "uncertain"}
         if row["course_title"] is None:
             codes.append("OR-REFERENCE-COURSE")
-        elif (
-            str(row["school_year_id"] or "").strip()
-            and row["course_school_year"] is None
-        ):
-            codes.append("OR-REFERENCE-SCHOOL-YEAR")
         if not alias:
             codes.append("OR-ALIAS-MISSING")
         elif len(aliases[alias.casefold()]) > 1:
@@ -1570,7 +1802,7 @@ def _build_course_plans(
         dated_school_year = next(
             (
                 window.school_year
-                for window in (*current_sessions, *effective_sessions)
+                for window in (*current_sessions, *nonended_sessions, *effective_sessions)
                 if window.school_year
             ),
             "",
@@ -1611,17 +1843,24 @@ def _build_course_plans(
             codes.append("OR-GAM-VALUE-INVALID")
 
         if not selected and not scope_is_uncertain:
-            # Historical and future classes are intentionally deferred. Their
-            # participant completeness is irrelevant until their dated term is active.
+            # Ended and other-year classes remain persisted so their aliases are
+            # protected, but participant completeness is irrelevant to this plan.
             codes = []
         codes = sorted(set(codes))
         ready = int(selected and not codes)
+        valid_starts = tuple(
+            window.start for window in effective_sessions if window.start is not None
+        )
+        valid_ends = tuple(
+            window.end for window in effective_sessions if window.end is not None
+        )
         conn.execute(
             """
             INSERT INTO course_plans (
                 domain, class_id, alias, name, section, room, owner_email,
-                selected, ready, quarantine_json, teacher_count, student_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                selected, ready, quarantine_json, teacher_count, student_count,
+                scope_state, scope_date, school_year_id, term_start, term_end
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 domain,
@@ -1636,6 +1875,11 @@ def _build_course_plans(
                 json.dumps(codes, separators=(",", ":")),
                 teacher_count,
                 student_count,
+                scope_state,
+                today.isoformat(),
+                resolved_school_year_id,
+                min(valid_starts).isoformat() if valid_starts else "",
+                max(valid_ends).isoformat() if valid_ends else "",
             ),
         )
         if selected:
@@ -1647,7 +1891,11 @@ def _build_course_plans(
                         "class",
                         class_id,
                         int(row["row_number"]),
-                        blocking=code == "OR-GAM-VALUE-INVALID",
+                        blocking=code
+                        in {
+                            "OR-GAM-VALUE-INVALID",
+                            "OR-SCHOOL-YEAR-HIERARCHY",
+                        },
                     )
                 )
 
@@ -1680,6 +1928,11 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
         academic_sessions=count("academic_sessions"),
         orgs=count("orgs"),
         ready_courses=count("course_plans", "ready = 1"),
+        current_courses=count("course_plans", "scope_state = 'current'"),
+        future_ready_courses=count(
+            "course_plans",
+            "scope_state = 'future-ready' AND ready = 1",
+        ),
         quarantined_courses=count("course_plans", "selected = 1 AND ready = 0"),
         deferred_courses=count("course_plans", "selected = 0"),
         teachers=int(participant_counts[0] or 0),
@@ -1697,6 +1950,60 @@ def _ensure_enrollment_scope_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE enrollments "
             "ADD COLUMN in_scope INTEGER NOT NULL DEFAULT 1"
         )
+
+
+def _ensure_course_scope_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(course_plans)").fetchall()
+    }
+    additions = {
+        "scope_state": "TEXT NOT NULL DEFAULT 'uncertain'",
+        "scope_date": "TEXT NOT NULL DEFAULT ''",
+        "school_year_id": "TEXT NOT NULL DEFAULT ''",
+        "term_start": "TEXT NOT NULL DEFAULT ''",
+        "term_end": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE course_plans ADD COLUMN {name} {definition}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_scope (
+            domain TEXT PRIMARY KEY,
+            scope_date TEXT NOT NULL,
+            school_year_id TEXT NOT NULL,
+            school_year_title TEXT NOT NULL,
+            school_year_start TEXT NOT NULL,
+            school_year_end TEXT NOT NULL
+        )
+        """
+    )
+
+
+def read_schedule_scope(path: Path, domain: str) -> dict[str, str]:
+    """Return persisted derived scope used by previews and plan fingerprints."""
+
+    with closing(_normalized_conn(path)) as conn:
+        with conn:
+            _ensure_course_scope_schema(conn)
+        row = conn.execute(
+            """
+            SELECT scope_date, school_year_id, school_year_title,
+                   school_year_start, school_year_end
+            FROM schedule_scope WHERE domain = ?
+            """,
+            (domain,),
+        ).fetchone()
+        if row is None:
+            return {
+                "scope_date": "",
+                "school_year_id": "",
+                "school_year_title": "",
+                "school_year_start": "",
+                "school_year_end": "",
+            }
+        return {key: str(row[key] or "") for key in row.keys()}
 
 
 def _create_normalized_db(path: Path) -> None:
@@ -1748,7 +2055,15 @@ def _create_normalized_db(path: Path) -> None:
                 name TEXT NOT NULL, section TEXT NOT NULL, room TEXT NOT NULL,
                 owner_email TEXT NOT NULL, selected INTEGER NOT NULL, ready INTEGER NOT NULL,
                 quarantine_json TEXT NOT NULL, teacher_count INTEGER NOT NULL,
-                student_count INTEGER NOT NULL, PRIMARY KEY(domain, class_id)
+                student_count INTEGER NOT NULL,
+                scope_state TEXT NOT NULL, scope_date TEXT NOT NULL,
+                school_year_id TEXT NOT NULL, term_start TEXT NOT NULL,
+                term_end TEXT NOT NULL, PRIMARY KEY(domain, class_id)
+            );
+            CREATE TABLE schedule_scope (
+                domain TEXT PRIMARY KEY, scope_date TEXT NOT NULL,
+                school_year_id TEXT NOT NULL, school_year_title TEXT NOT NULL,
+                school_year_start TEXT NOT NULL, school_year_end TEXT NOT NULL
             );
             CREATE TABLE issues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL,
@@ -1958,6 +2273,12 @@ def _quarantine_message(code: str) -> str:
     messages = {
         "OR-REFERENCE-COURSE": "Course reference is missing; class is quarantined.",
         "OR-REFERENCE-TERM": "Class term reference is missing; class is quarantined.",
+        "OR-REFERENCE-SCHOOL-YEAR": (
+            "Course school-year reference is missing or is not a schoolYear session."
+        ),
+        "OR-SCHOOL-YEAR-HIERARCHY": (
+            "Class terms and course school year do not resolve to one valid hierarchy."
+        ),
         "OR-SESSION-DATE": "Class term dates are invalid; class is quarantined.",
         "OR-ALIAS-MISSING": "Class has no stable Section_ alias.",
         "OR-ALIAS-COLLISION": "More than one class resolves to the same Section_ alias.",
