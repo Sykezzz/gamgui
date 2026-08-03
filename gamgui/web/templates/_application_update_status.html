@@ -1,0 +1,63 @@
+<section id="application-update-panel"
+         class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm"
+         aria-labelledby="application-update-heading"
+         {% if update.checking %}
+         hx-get="/components/update/status"
+         hx-trigger="every 1s"
+         hx-swap="outerHTML"
+         {% endif %}>
+  <div class="flex flex-wrap items-start justify-between gap-4">
+    <div class="max-w-3xl">
+      <p class="eyebrow text-brand-blueink">Application updates</p>
+      <h2 id="application-update-heading" class="mt-1 font-serif text-2xl text-brand-black">Keep GamGUI current</h2>
+      <p class="mt-2 text-sm text-brand-blueink/80">
+        Check the validated release channel now. If a matching update is available,
+        GamGUI prepares it locally and asks before restarting.
+      </p>
+    </div>
+    <div class="rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-right">
+      <p class="text-xs uppercase tracking-wider text-brand-blueink">Status</p>
+      <p class="mt-0.5 text-sm font-semibold text-brand-black" role="status" aria-live="polite">
+        {{ update.status_label }}
+      </p>
+    </div>
+  </div>
+
+  <div class="mt-4 rounded-xl border border-brand-gray/40 bg-paper px-4 py-3"
+       role="{% if update.status == 'error' %}alert{% else %}status{% endif %}"
+       aria-live="polite"
+       aria-atomic="true">
+    <p class="text-sm text-brand-blueink">{{ update.message }}</p>
+    {% if update.error_code %}
+    <p class="mt-1 text-xs text-brand-blueink">Error code: <code class="font-mono">{{ update.error_code }}</code></p>
+    {% endif %}
+  </div>
+
+  {% if update.installed_version or update.candidate_version or update.channel or update.last_checked_at %}
+  <dl class="mt-4 grid gap-3 text-xs text-brand-blueink sm:grid-cols-2">
+    {% if update.installed_version %}
+    <div><dt class="font-semibold text-brand-black">Installed version</dt><dd class="mt-0.5 tabular-nums">{{ update.installed_version }}</dd></div>
+    {% endif %}
+    {% if update.candidate_version %}
+    <div><dt class="font-semibold text-brand-black">Ready version</dt><dd class="mt-0.5 tabular-nums">{{ update.candidate_version }}</dd></div>
+    {% endif %}
+    {% if update.channel %}
+    <div><dt class="font-semibold text-brand-black">Update channel</dt><dd class="mt-0.5 font-mono">{{ update.channel }}</dd></div>
+    {% endif %}
+    {% if update.last_checked_at %}
+    <div><dt class="font-semibold text-brand-black">Last checked</dt><dd class="mt-0.5 tabular-nums">{{ update.last_checked_at }}</dd></div>
+    {% endif %}
+  </dl>
+  {% endif %}
+
+  <form class="mt-5"
+        hx-post="/components/update/check"
+        hx-target="#application-update-panel"
+        hx-swap="outerHTML">
+    <button type="submit"
+            class="inline-flex rounded-lg bg-brand-blueink px-3.5 py-2 text-sm font-medium text-brand-white transition-colors hover:bg-brand-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue disabled:cursor-not-allowed disabled:opacity-50"
+            {% if update.checking or not update.supported %}disabled aria-disabled="true"{% endif %}>
+      {% if update.checking %}Checking for updates…{% else %}Check for updates{% endif %}
+    </button>
+  </form>
+</section>

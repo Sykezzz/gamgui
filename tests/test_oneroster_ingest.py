@@ -466,6 +466,59 @@ def test_selects_nearest_upcoming_school_year_during_summer(
     assert course["ready"] is True
 
 
+def test_inactive_future_sessions_do_not_block_automatic_scope(
+    tmp_path: Path,
+) -> None:
+    today = date.today()
+    year_start = today + timedelta(days=20)
+    files = valid_files()
+    files["academicSessions.csv"] = csv_text(
+        (
+            "sourcedId",
+            "status",
+            "title",
+            "type",
+            "startDate",
+            "endDate",
+            "parentSourcedId",
+            "schoolYear",
+        ),
+        (
+            {
+                "sourcedId": "year-1",
+                "status": "inactive",
+                "title": "2026-27 School Year",
+                "type": "schoolYear",
+                "startDate": year_start.isoformat(),
+                "endDate": (year_start + timedelta(days=300)).isoformat(),
+                "parentSourcedId": "",
+                "schoolYear": "2026-27",
+            },
+            {
+                "sourcedId": "term-1",
+                "status": "inactive",
+                "title": "Fall Term",
+                "type": "term",
+                "startDate": (year_start + timedelta(days=10)).isoformat(),
+                "endDate": (year_start + timedelta(days=130)).isoformat(),
+                "parentSourcedId": "year-1",
+                "schoolYear": "2026-27",
+            },
+        ),
+    )
+    service = OneRosterService("example.org", tmp_path / "inactive-future-year")
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.state is SnapshotState.READY
+    assert snapshot.blocking_issue_count == 0
+    assert snapshot.school_year_id == "year-1"
+    assert service.preview(snapshot.id, "issues", query="OR-STATUS-INVALID").total == 0
+    assert course["scope_state"] == "future-ready"
+    assert course["ready"] is True
+
+
 def test_later_semester_is_ready_but_next_school_year_is_out_of_scope(
     tmp_path: Path,
 ) -> None:
