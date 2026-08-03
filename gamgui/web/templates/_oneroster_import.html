@@ -22,6 +22,17 @@
     </div>
   </dl>
 
+  {% if snapshot.state == "ready" and snapshot.counts.deferred_courses | default(0) > 0 %}
+  <div class="mt-4 rounded-lg border border-brand-blue/30 bg-paper px-4 py-3 text-sm text-brand-blueink" role="status">
+    {% if snapshot.counts.ready_courses | default(0) == 0 and snapshot.counts.quarantined_courses | default(0) == 0 %}
+    <p class="font-semibold text-brand-black">No classes are scheduled for today, and the import is still valid.</p>
+    <p class="mt-1">This is expected for a summer or future-term snapshot. {{ snapshot.counts.deferred_courses }} {{ "class is" if snapshot.counts.deferred_courses == 1 else "classes are" }} retained outside today’s date window and will be reconsidered automatically when a live plan is built on or after {{ "its" if snapshot.counts.deferred_courses == 1 else "their" }} session start dates.</p>
+    {% else %}
+    <p><span class="font-semibold text-brand-black">{{ snapshot.counts.deferred_courses }} classes are outside today’s date window.</span> They are retained and protected from removal or archive decisions until their session dates apply.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
   {% if snapshot.counts %}
   <div class="mt-4 overflow-x-auto">
     <table class="min-w-full text-left text-sm">
