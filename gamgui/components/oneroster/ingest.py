@@ -282,6 +282,7 @@ def ingest_archive(
                     conn,
                     archive,
                     members,
+                    manifest,
                     domain,
                     issues,
                     limits,
@@ -914,6 +915,7 @@ def _load_all_tables(
     conn: sqlite3.Connection,
     archive: zipfile.ZipFile,
     members: Mapping[str, zipfile.ZipInfo],
+    manifest: Mapping[str, str],
     domain: str,
     issues: list[ImportIssue],
     limits: SafetyLimits,
@@ -930,11 +932,18 @@ def _load_all_tables(
         info = members.get(name.casefold())
         if info is None:
             continue
+
+        file_mode = (
+    str(manifest.get(f"file.{name[:-4]}".casefold(), "") or "")
+    .strip()
+    .casefold()
+)
         _stream_table(
             conn,
             archive,
             info,
             name,
+            file_mode,
             domain,
             loader,
             issues,
@@ -947,6 +956,7 @@ def _stream_table(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
     canonical_name: str,
+    file_mode: str,
     domain: str,
     loader: object,
     issues: list[ImportIssue],
@@ -1013,14 +1023,20 @@ def _stream_table(
                     if key is not None
                 }
                 _require_bounded_fields(normalized, limits)
-                if not _valid_status(
+                normalized_status = _normalize_status(
                     normalized,
                     canonical_name[:-4],
                     number,
                     issues,
-                ):
+                    file_mode=file_mode,
+                )
+
+                if normalized_status is None:
                     continue
-                loader(conn, domain, number, normalized, issues)  # type: ignore[operator]
+
+                normalized["status"] = normalized_status
+                loader(conn, domain, number, normalized, issues)
+
     except _CSVLimitError:
         issues.append(
             _issue(
@@ -2212,33 +2228,37 @@ def _status(row: Mapping[str, str]) -> str:
     return str(row.get("status") or "").strip().casefold()
 
 
-def _valid_status(
+def _normalize_status(
     row: Mapping[str, str],
     entity_kind: str,
     row_number: int,
     issues: list[ImportIssue],
-) -> bool:
+    *,
+    file_mode: str,
+) -> Optional[str]:
+    """Normalize OneRoster status according to the file's manifest mode."""
+
     status = _status(row)
+
+    if file_mode == "bulk" and not status:
+        return "active"
+
     if status in {"active", "tobedeleted"}:
-        return True
-    if entity_kind == "academicSessions" and status == "inactive":
-        # Bulk exporters commonly retain this legacy session token. It is only
-        # accepted structurally; automatic date scope still determines readiness.
-        return True
+        return status
+
     issues.append(
         _issue(
             "OR-STATUS-INVALID",
             (
-                "Academic-session status must be active, inactive, or tobedeleted."
-                if entity_kind == "academicSessions"
-                else "OneRoster status must be active or tobedeleted."
+                "OneRoster bulk status must be blank; "
+                "delta status must be active or tobedeleted."
             ),
             entity_kind,
             str(row.get("sourcedId", "") or ""),
             row_number,
         )
     )
-    return False
+    return None
 
 
 def _truthy(value: str) -> bool:

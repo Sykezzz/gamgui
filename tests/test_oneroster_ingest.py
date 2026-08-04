@@ -466,12 +466,22 @@ def test_selects_nearest_upcoming_school_year_during_summer(
     assert course["ready"] is True
 
 
-def test_inactive_future_sessions_do_not_block_automatic_scope(
+def test_blank_bulk_statuses_do_not_block_future_automatic_scope(
     tmp_path: Path,
 ) -> None:
     today = date.today()
     year_start = today + timedelta(days=20)
     files = valid_files()
+
+    for name in (
+        "orgs.csv",
+        "users.csv",
+        "courses.csv",
+        "classes.csv",
+        "enrollments.csv",
+    ):
+        files[name] = files[name].replace(",active,", ",,")
+
     files["academicSessions.csv"] = csv_text(
         (
             "sourcedId",
@@ -486,7 +496,7 @@ def test_inactive_future_sessions_do_not_block_automatic_scope(
         (
             {
                 "sourcedId": "year-1",
-                "status": "inactive",
+                "status": "",
                 "title": "2026-27 School Year",
                 "type": "schoolYear",
                 "startDate": year_start.isoformat(),
@@ -496,7 +506,7 @@ def test_inactive_future_sessions_do_not_block_automatic_scope(
             },
             {
                 "sourcedId": "term-1",
-                "status": "inactive",
+                "status": "",
                 "title": "Fall Term",
                 "type": "term",
                 "startDate": (year_start + timedelta(days=10)).isoformat(),
@@ -506,7 +516,11 @@ def test_inactive_future_sessions_do_not_block_automatic_scope(
             },
         ),
     )
-    service = OneRosterService("example.org", tmp_path / "inactive-future-year")
+
+    service = OneRosterService(
+        "example.org",
+        tmp_path / "blank-bulk-future-year",
+    )
 
     snapshot = service.upload(zip_bytes(files))
     course = service.preview(snapshot.id, "courses").items[0]
@@ -514,9 +528,47 @@ def test_inactive_future_sessions_do_not_block_automatic_scope(
     assert snapshot.state is SnapshotState.READY
     assert snapshot.blocking_issue_count == 0
     assert snapshot.school_year_id == "year-1"
-    assert service.preview(snapshot.id, "issues", query="OR-STATUS-INVALID").total == 0
+    assert snapshot.counts.users == 2
+    assert snapshot.counts.classes == 1
+    assert snapshot.counts.enrollments == 2
+    assert (
+        service.preview(
+            snapshot.id,
+            "issues",
+            query="OR-STATUS-INVALID",
+        ).total
+        == 0
+    )
     assert course["scope_state"] == "future-ready"
     assert course["ready"] is True
+
+def test_blank_delta_status_is_rejected(tmp_path: Path) -> None:
+    files = valid_files()
+
+    files["manifest.csv"] = files["manifest.csv"].replace(
+        "file.academicSessions,bulk",
+        "file.academicSessions,delta",
+        1,
+    )
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        ",active,",
+        ",,",
+    )
+
+    service = OneRosterService(
+        "example.org",
+        tmp_path / "blank-delta-status",
+    )
+
+    snapshot = service.upload(zip_bytes(files))
+    issues = service.preview(
+        snapshot.id,
+        "issues",
+        query="OR-STATUS-INVALID",
+    )
+
+    assert snapshot.state is SnapshotState.BLOCKED
+    assert issues.total > 0
 
 
 def test_later_semester_is_ready_but_next_school_year_is_out_of_scope(
