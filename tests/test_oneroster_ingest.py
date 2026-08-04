@@ -571,7 +571,7 @@ def test_blank_delta_status_is_rejected(tmp_path: Path) -> None:
     assert issues.total > 0
 
 
-def test_later_semester_is_ready_but_next_school_year_is_out_of_scope(
+def test_later_semester_is_deferred_but_next_school_year_is_out_of_scope(
     tmp_path: Path,
 ) -> None:
     today = date.today()
@@ -605,12 +605,39 @@ def test_later_semester_is_ready_but_next_school_year_is_out_of_scope(
     }
 
     assert snapshot.ready_for_apply
-    assert courses["202"]["scope_state"] == "future-ready"
-    assert courses["202"]["ready"] is True
+    assert courses["202"]["scope_state"] == "future-deferred"
+    assert courses["202"]["selected"] is False
+    assert courses["202"]["ready"] is False
     assert courses["303"]["scope_state"] == "other-year"
     assert courses["303"]["selected"] is False
     assert courses["303"]["ready"] is False
 
+def test_future_term_becomes_ready_within_31_days(tmp_path: Path) -> None:
+    today = date.today()
+    term_start = today + timedelta(days=31)
+    files = valid_files()
+
+    files["academicSessions.csv"] = files["academicSessions.csv"].replace(
+        "term-1,active,Current Term,term,2000-01-01,2100-12-31",
+        (
+            "term-1,active,Upcoming Term,term,"
+            f"{term_start.isoformat()},"
+            f"{(term_start + timedelta(days=90)).isoformat()}"
+        ),
+    )
+
+    service = OneRosterService(
+        "example.org",
+        tmp_path / "future-term-window",
+    )
+
+    snapshot = service.upload(zip_bytes(files))
+    course = service.preview(snapshot.id, "courses").items[0]
+
+    assert snapshot.ready_for_apply
+    assert course["scope_state"] == "future-ready"
+    assert course["selected"] is True
+    assert course["ready"] is True
 
 def test_overlapping_current_school_years_hold_the_import(tmp_path: Path) -> None:
     files = valid_files()

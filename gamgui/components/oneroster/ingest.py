@@ -19,7 +19,7 @@ import zipfile
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1791,7 +1791,15 @@ def _build_course_plans(
         elif current_sessions:
             scope_state = "current"
         elif nonended_sessions:
-            scope_state = "future-ready"
+            next_start = min(
+                window.start
+                for window in nonended_sessions
+                if window.start is not None
+            )
+            if next_start <= today + timedelta(days=31):
+                scope_state = "future-ready"
+            else:
+                scope_state = "future-deferred"
         else:
             scope_state = "ended"
         selected = scope_state in {"current", "future-ready", "uncertain"}
