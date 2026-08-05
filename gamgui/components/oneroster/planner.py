@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
 from gamgui.core.classroom.models import CourseRosterSnapshot
-from gamgui.core.gam.errors import GAMErrorKind
+from gamgui.core.gam.errors import GAMError, GAMErrorKind
 
 from .ingest import district_roster_date
 from .models import (
@@ -290,6 +290,11 @@ class OneRosterPlanner:
         try:
             raw = await bulk(aliases)
             return _index_managed_courses(raw)
+        except GAMError:
+            # The exact-set bulk command is an optimization. Fall back to
+            # bounded per-alias reads, which distinguish absent new courses
+            # from genuine authentication and permission failures.
+            return None
         except OneRosterError:
             raise
         except Exception as exc:

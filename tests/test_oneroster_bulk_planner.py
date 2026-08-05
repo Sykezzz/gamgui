@@ -20,6 +20,7 @@ from gamgui.core.classroom.models import (
     CourseParticipant,
     CourseRosterSnapshot,
 )
+from gamgui.core.gam.errors import GAMError, GAMErrorKind
 from gamgui.core.gam.models import GAMUser
 from tests.test_oneroster_helpers import valid_files, zip_bytes
 
@@ -89,6 +90,28 @@ class BulkPlannerConnector:
         raise AssertionError("bulk planner must not perform per-course roster reads")
 
 
+class BulkLookupFailureConnector(BulkPlannerConnector):
+    def __init__(self, detail_error_kind: GAMErrorKind) -> None:
+        super().__init__([])
+        self.detail_error_kind = detail_error_kind
+
+    async def list_oneroster_managed_courses(self, aliases):
+        self.calls["courses"] += 1
+        raise GAMError(
+            kind=GAMErrorKind.NOT_FOUND,
+            exit_code=1,
+            stderr="Requested Classroom course alias was not found.",
+        )
+
+    async def get_course(self, *_args, **_kwargs):
+        self.calls["get_course"] += 1
+        raise GAMError(
+            kind=self.detail_error_kind,
+            exit_code=1,
+            stderr="Per-alias Classroom lookup failed.",
+        )
+
+
 def _ready_service(tmp_path: Path) -> tuple[OneRosterService, str]:
     service = OneRosterService("example.org", tmp_path / "component")
     snapshot = service.upload(zip_bytes(valid_files()))
@@ -130,6 +153,47 @@ async def test_planner_reuses_each_bulk_snapshot_and_never_reads_details(
             "rosters": 1,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_bulk_alias_not_found_falls_back_to_bounded_detail_reads(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = BulkLookupFailureConnector(GAMErrorKind.NOT_FOUND)
+
+    plan = await service.build_live_plan(
+        connector,
+        import_id,
+        limited_import=True,
+    )
+
+    assert service.scope_readiness().ready
+    assert any(action.kind == "course_create" for action in plan.actions)
+    assert connector.calls["directory"] == 1
+    assert connector.calls["courses"] == 1
+    assert connector.calls["get_course"] >= 1
+    assert connector.calls["rosters"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_alias_fallback_still_fails_closed_on_permission_error(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = BulkLookupFailureConnector(GAMErrorKind.PERMISSION_DENIED)
+
+    with pytest.raises(OneRosterError) as failure:
+        await service.build_live_plan(
+            connector,
+            import_id,
+            limited_import=True,
+        )
+
+    assert failure.value.code == "OR-CLASSROOM-READ"
+    assert not service.scope_readiness().ready
+    assert connector.calls["courses"] == 1
+    assert connector.calls["get_course"] >= 1
 
 
 @pytest.mark.asyncio
