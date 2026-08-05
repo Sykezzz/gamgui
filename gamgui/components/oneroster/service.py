@@ -301,12 +301,13 @@ class OneRosterService:
         """Explicitly read Directory/Classroom and produce a non-mutating live diff."""
         from .planner import OneRosterPlanner
 
-        self.require_scope_ready()
-        return await OneRosterPlanner(self.store, connector).plan(
+        planning = await OneRosterPlanner(self.store, connector).plan(
             import_id,
             limited_import=limited_import,
             now=now,
         )
+        self.mark_scope_ready()
+        return planning
 
     def persist_live_plan(
         self,

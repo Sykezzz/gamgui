@@ -93,7 +93,6 @@ def _ready_service(tmp_path: Path) -> tuple[OneRosterService, str]:
     service = OneRosterService("example.org", tmp_path / "component")
     snapshot = service.upload(zip_bytes(valid_files()))
     service.save_threshold_profile(ThresholdProfile(configured=True))
-    service.mark_scope_ready()
     return service, snapshot.id
 
 
@@ -122,7 +121,7 @@ async def test_planner_reuses_each_bulk_snapshot_and_never_reads_details(
     connector = BulkPlannerConnector([_managed_course()])
 
     plan = await service.build_live_plan(connector, import_id)
-
+    assert service.scope_readiness().ready
     assert plan.actions == ()
     assert connector.calls == Counter(
         {
@@ -254,6 +253,7 @@ async def test_planner_rejects_bulk_snapshot_without_requested_course_proof(
 
     with pytest.raises(OneRosterError) as failure:
         await service.build_live_plan(connector, import_id)
+    assert not service.scope_readiness().ready
 
     assert failure.value.code == "OR-CLASSROOM-ROSTER-READ"
     assert connector.calls["rosters"] == 1
