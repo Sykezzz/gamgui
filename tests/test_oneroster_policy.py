@@ -300,7 +300,7 @@ def test_gate_arms_in_chicago_refuses_early_open_and_closes_on_drift(
         "different",
         now=release + timedelta(seconds=1),
     )
-    assert drifted.state is GateState.CLOSED
+    assert drifted.state is GateState.HELD
     assert drifted.hold_code == "OR-GATE-DRIFT"
 
 

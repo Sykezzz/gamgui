@@ -48,6 +48,7 @@ class SnapshotState(str, Enum):
 
 class GateState(str, Enum):
     CLOSED = "CLOSED"
+    HELD = "HELD"
     ARMED = "ARMED"
     OPEN = "OPEN"
 
@@ -132,6 +133,7 @@ class OneRosterSnapshot:
     blocking_issue_count: int
     course_name_template: str
     scope_date: str = ""
+    initial_scope_date: str = ""
     school_year_id: str = ""
     school_year_title: str = ""
 
@@ -390,6 +392,8 @@ class ClassroomImportManifest:
     threshold_evidence: Mapping[str, Any] = field(default_factory=dict)
     exclusions: Tuple[ImportIssue, ...] = ()
     pilot_evidence: Mapping[str, Any] = field(default_factory=dict)
+    live_evidence: Mapping[str, Any] = field(default_factory=dict)
+    drift_report: Tuple[Mapping[str, Any], ...] = ()
 
     @property
     def complete_count(self) -> int:
@@ -449,6 +453,11 @@ class LivePlanningResult:
         repr=False,
     )
     scope_hash: str = ""
+    live_evidence: Mapping[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
     def actions_for(self, plan_kind: str) -> Tuple[ImportAction, ...]:
         kind = str(plan_kind or "").strip().casefold()
@@ -476,6 +485,63 @@ class ExecutionSummary:
     failed: int
     skipped: int
     awaiting_students: bool
+
+
+@dataclass(frozen=True)
+class ExecutionRun:
+    """Durable lifecycle record for one attempt to execute a manifest."""
+
+    id: str
+    manifest_id: str
+    status: str
+    phase: str
+    started_at: float
+    updated_at: float
+    last_heartbeat_at: float
+    current_batch_sequence: int = 0
+    stop_requested: bool = False
+    attempt_number: int = 1
+    last_error_code: str = ""
+
+
+@dataclass(frozen=True)
+class ExecutionBatch:
+    """Exact, immutable membership and state for one bounded GAM batch."""
+
+    id: str
+    run_id: str
+    manifest_id: str
+    sequence_number: int
+    phase: str
+    action_ids_hash: str
+    action_count: int
+    status: str
+    prepared_at: float
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    attempt_number: int = 1
+    error_code: str = ""
+    action_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionProgress:
+    """SQL-derived progress projection; manifest actions remain authoritative."""
+
+    run: Optional[ExecutionRun]
+    total: int
+    pending: int
+    applied: int
+    failed: int
+    skipped: int
+    percent: float
+    completed_batches: int
+    total_batches_estimate: int
+    elapsed_seconds: float
+    heartbeat_age_seconds: float
+    heartbeat_stale: bool
+    actions_per_minute: float
+    eta_seconds: Optional[float]
 
 
 @dataclass(frozen=True)

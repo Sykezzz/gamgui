@@ -25,6 +25,12 @@
         <span class="font-mono text-xs">({{ snapshot.school_year_id }})</span>
         {% endif %}
       </dd>
+      {% if snapshot.scope_window_end %}
+      <dd class="mt-1 text-xs font-normal text-brand-blueink">Includes current classes and the next 31 days, through {{ snapshot.scope_window_end }} (inclusive).</dd>
+      {% endif %}
+      {% if snapshot.scope_changed_since_upload %}
+      <dd class="mt-1 text-xs font-semibold text-amber-900" role="status">Scope date changed since upload (originally {{ snapshot.initial_scope_date }}); the local preview was rebuilt.</dd>
+      {% endif %}
     </div>
   </dl>
 

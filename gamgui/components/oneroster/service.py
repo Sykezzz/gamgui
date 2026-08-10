@@ -18,6 +18,7 @@ from .models import (
     GateState,
     ImportAction,
     ExecutionSummary,
+    ExecutionProgress,
     LivePlanningResult,
     MAX_PAGE_SIZE,
     ManifestPage,
@@ -246,6 +247,7 @@ class OneRosterService:
         plan_kind: str = "ordinary",
         exclusions: Sequence[Any] = (),
         pilot_evidence: str = "",
+        live_evidence: Optional[Mapping[str, Any]] = None,
     ) -> ClassroomImportManifest:
         profile = self.store.get_threshold_profile()
         limited_mode = bool(limited_import or profile.limited_import)
@@ -288,6 +290,7 @@ class OneRosterService:
                 prior_accepted_import_id=self.store.previous_accepted_import_id(import_id),
                 limited_import=limited_mode,
             ),
+            live_evidence=live_evidence,
         )
 
     async def build_live_plan(
@@ -382,6 +385,7 @@ class OneRosterService:
             threshold_evidence=threshold_evidence,
             exclusions=planning.issues,
             pilot_evidence=pilot_record,
+            live_evidence=planning.live_evidence,
         )
         archive = (
             self.store.create_manifest(
@@ -394,6 +398,7 @@ class OneRosterService:
                 threshold_evidence=threshold_evidence,
                 exclusions=planning.issues,
                 pilot_evidence=pilot_record,
+                live_evidence=planning.live_evidence,
             )
             if planning.archive_actions
             else None
@@ -409,6 +414,7 @@ class OneRosterService:
                 threshold_evidence=threshold_evidence,
                 exclusions=planning.issues,
                 pilot_evidence=pilot_record,
+                live_evidence=planning.live_evidence,
             )
             if planning.ownership_actions
             else None
@@ -461,6 +467,38 @@ class OneRosterService:
             now=now,
             manual=manual,
         )
+
+    async def reconcile_interrupted_manifest(
+        self,
+        connector: Any,
+        manifest_id: str,
+    ) -> ExecutionSummary:
+        from .executor import OneRosterExecutor
+
+        self.require_scope_ready()
+        return await OneRosterExecutor(
+            self.store,
+            connector,
+            activity_registry=self.activity_registry,
+        ).reconcile_interrupted(manifest_id)
+
+    async def retry_stabilization_read(
+        self,
+        connector: Any,
+        manifest_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> LivePlanningResult:
+        """Repeat bounded live reads without making a stale manifest runnable."""
+
+        from .executor import OneRosterExecutor
+
+        self.require_scope_ready()
+        return await OneRosterExecutor(
+            self.store,
+            connector,
+            activity_registry=self.activity_registry,
+        ).retry_stabilization_read(manifest_id, now=now)
 
     def hold_scheduled_gate_failure(
         self,
@@ -533,6 +571,12 @@ class OneRosterService:
             offset=offset,
             limit=limit,
         )
+
+    def get_execution_progress(self, manifest_id: str) -> ExecutionProgress:
+        return self.store.get_execution_progress(manifest_id)
+
+    def request_execution_pause(self, manifest_id: str):
+        return self.store.request_execution_pause(manifest_id)
 
     def mark_action_result(
         self,
