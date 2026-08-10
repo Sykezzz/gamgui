@@ -14,7 +14,11 @@ from ...core.classroom.manifests import (
     RosterManifestStore,
     default_roster_manifest_path,
 )
-from ...core.classroom.models import COURSE_STATES, parse_desired_roster
+from ...core.classroom.models import (
+    COURSE_STATES,
+    CourseParticipant,
+    parse_desired_roster,
+)
 from ...core.classroom.service import ClassroomService, ClassroomValidationError
 from ...core.gam.errors import GAMError
 from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
@@ -492,13 +496,44 @@ async def _roster_response(
         course, members = await service.roster(course_id, role)
     except Exception as exc:
         return _action(request, False, _friendly(exc))
+    unresolved_member_count = sum(
+        not bool(getattr(member, "identity_resolved", member.label))
+        for member in members
+    )
+    visible_members = [
+        member
+        for member in members
+        if bool(getattr(member, "identity_resolved", member.label))
+    ]
+    owner_from_course_details = False
+    if role.strip().casefold() == "teachers" and (course.owner_id or course.owner_email):
+        owner_present = any(
+            (course.owner_id and member.user_id == course.owner_id)
+            or (course.owner_email and member.email == course.owner_email)
+            for member in visible_members
+        )
+        if not owner_present:
+            visible_members.insert(
+                0,
+                CourseParticipant(
+                    course_id=course.id,
+                    email=course.owner_email,
+                    user_id=course.owner_id,
+                    role="teachers",
+                    full_name="Course owner",
+                    raw={"owner_from_course_details": True},
+                ),
+            )
+            owner_from_course_details = True
     return TEMPLATES.TemplateResponse(
         request,
         "_classroom_roster.html",
         {
             "course": course,
             "role": role.strip().lower(),
-            "members": members,
+            "members": visible_members,
+            "unresolved_member_count": unresolved_member_count,
+            "owner_from_course_details": owner_from_course_details,
             "notice": notice,
             "error": error,
         },

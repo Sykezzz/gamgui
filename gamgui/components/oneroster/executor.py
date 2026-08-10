@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import secrets
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
@@ -80,11 +80,23 @@ class OneRosterExecutor:
         *,
         activity_registry: Optional[ActivityRegistry] = None,
         batch_size: int = MAX_BATCH_COMMANDS,
+        stabilization_delays: Optional[Sequence[float]] = None,
     ) -> None:
         self.store = store
         self.connector = connector
         self.activity_registry = activity_registry
         self.batch_size = max(1, min(int(batch_size), MAX_BATCH_COMMANDS))
+        configured_delays = (
+            stabilization_delays
+            if stabilization_delays is not None
+            else getattr(connector, "oneroster_stabilization_delays", (3.0, 7.0))
+        )
+        normalized_delays = tuple(max(0.0, float(item)) for item in configured_delays)
+        self.stabilization_delays = (
+            normalized_delays[:2]
+            if len(normalized_delays) >= 2
+            else (3.0, 7.0)
+        )
         self._operation_owner = f"{os.getpid()}:{secrets.token_urlsafe(12)}"
         self._operation_identity = current_process_identity()
 
@@ -119,12 +131,26 @@ class OneRosterExecutor:
                     typed_import_id,
                 )
             prepared_student_release = manifest.status == "awaiting_students"
+            resuming_after_pause = manifest.status == "paused"
+            if prepared_student_release and not _gate_allows(
+                self.store.get_gate(), manifest
+            ):
+                raise OneRosterError(
+                    "OR-STUDENT-GATE-CLOSED",
+                    "Open the student enrollment gate for this exact manifest before execution.",
+                )
             manifest = self.store.claim_manifest(
                 manifest_id,
                 allow_awaiting_students=prepared_student_release,
+                allow_paused=resuming_after_pause,
                 owner_id=self._operation_owner,
                 owner_pid=os.getpid(),
                 owner_identity=self._operation_identity,
+            )
+            run = self.store.start_execution_run(
+                manifest.id,
+                phase="preflight",
+                owner_id=self._operation_owner,
             )
             try:
                 planning = await OneRosterPlanner(self.store, self.connector).plan(
@@ -136,6 +162,7 @@ class OneRosterExecutor:
                     manifest,
                     planning,
                     prepared_student_release=prepared_student_release,
+                    resuming_after_pause=resuming_after_pause,
                 )
                 gate = self.store.get_gate()
                 student_open = _gate_allows(gate, manifest)
@@ -143,11 +170,35 @@ class OneRosterExecutor:
                 blocked_students = (
                     pending_before["student"] > 0 and not student_open
                 )
+                self.store.heartbeat_execution_run(run.id, phase="apply")
                 applied, failed, skipped = await self._apply(
                     manifest.id,
                     owner_ids=planning.owner_ids,
                     include_students=student_open,
+                    run_id=run.id,
                 )
+                paused = self.store.execution_stop_requested(run.id)
+                if paused:
+                    current = self.store.finish_manifest(
+                        manifest.id,
+                        status="paused",
+                        error="OR-EXECUTION-PAUSED",
+                        load_actions=False,
+                        owner_id=self._operation_owner,
+                    )
+                    self.store.finish_execution_run(
+                        run.id,
+                        status="paused",
+                        error_code="OR-EXECUTION-PAUSED",
+                        phase="paused",
+                    )
+                    return ExecutionSummary(
+                        manifest=current,
+                        applied=applied,
+                        failed=failed,
+                        skipped=skipped,
+                        awaiting_students=False,
+                    )
                 current = self.store.get_manifest_header(manifest.id)
                 pending = self.store.pending_action_summary(manifest.id)
                 if (
@@ -156,12 +207,8 @@ class OneRosterExecutor:
                     and not failed
                     and not skipped
                 ):
-                    prepared_planning = await OneRosterPlanner(
-                        self.store,
-                        self.connector,
-                    ).plan(
-                        manifest.import_id,
-                        limited_import=manifest.plan_kind == "limited",
+                    prepared_planning = await self._stabilized_planning(
+                        manifest,
                         now=now,
                     )
                     await self._validate_preflight(
@@ -190,6 +237,12 @@ class OneRosterExecutor:
                     load_actions=False,
                     owner_id=self._operation_owner,
                 )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="completed" if status in {"completed", "awaiting_students"} else "failed",
+                    error_code=error,
+                    phase=status,
+                )
                 if current.status == "completed":
                     self.store.maybe_mark_import_accepted(current.id)
                 return ExecutionSummary(
@@ -202,18 +255,26 @@ class OneRosterExecutor:
             except asyncio.CancelledError:
                 self.store.finish_manifest(
                     manifest.id,
-                    status="interrupted",
-                    error="OR-EXECUTION-INTERRUPTED",
+                    status="recovery_required",
+                    error="OR-RECOVERY-REQUIRED",
                     load_actions=False,
                     owner_id=self._operation_owner,
                 )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="recovery_required",
+                    error_code="OR-RECOVERY-REQUIRED",
+                    phase="reconciliation",
+                )
                 raise
+
             except OneRosterError as exc:
                 status = "stale" if exc.code in {
                     "OR-MANIFEST-DRIFT",
                     "OR-SOURCE-DRIFT",
                     "OR-CONFIG-DRIFT",
                     "OR-THRESHOLD-HOLD",
+                    "OR-LIVE-NOT-STABLE",
                 } else "failed"
                 self.store.finish_manifest(
                     manifest.id,
@@ -222,16 +283,82 @@ class OneRosterExecutor:
                     load_actions=False,
                     owner_id=self._operation_owner,
                 )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="stale" if status == "stale" else "failed",
+                    error_code=exc.code,
+                    phase=status,
+                )
                 raise
             except BaseException:
                 self.store.finish_manifest(
                     manifest.id,
-                    status="interrupted",
-                    error="OR-EXECUTION-INTERRUPTED",
+                    status="recovery_required",
+                    error="OR-RECOVERY-REQUIRED",
                     load_actions=False,
                     owner_id=self._operation_owner,
                 )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="recovery_required",
+                    error_code="OR-RECOVERY-REQUIRED",
+                    phase="reconciliation",
+                )
                 raise
+
+    async def _stabilized_planning(
+        self,
+        manifest: ClassroomImportManifest,
+        *,
+        now: Optional[datetime],
+        require_claim: bool = True,
+    ) -> LivePlanningResult:
+        """Require two consecutive identical live observations after writes."""
+
+        planner = OneRosterPlanner(self.store, self.connector)
+
+        async def observe() -> LivePlanningResult:
+            if require_claim:
+                self._require_claim(manifest.id)
+            return await planner.plan(
+                manifest.import_id,
+                limited_import=manifest.plan_kind == "limited",
+                now=now,
+            )
+
+        first = await observe()
+        await asyncio.sleep(self.stabilization_delays[0])
+        second = await observe()
+        if _planning_observation_hash(first) == _planning_observation_hash(second):
+            return second
+        await asyncio.sleep(self.stabilization_delays[1])
+        third = await observe()
+        if _planning_observation_hash(second) != _planning_observation_hash(third):
+            raise OneRosterError(
+                "OR-LIVE-NOT-STABLE",
+                "Classroom reads did not stabilize after the preparation writes; retry later.",
+            )
+        return third
+
+    async def retry_stabilization_read(
+        self,
+        manifest_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> LivePlanningResult:
+        """Repeat only the bounded live observations for a stale unstable manifest."""
+
+        manifest = self.store.get_manifest_header(manifest_id)
+        if manifest.status != "stale" or manifest.error != "OR-LIVE-NOT-STABLE":
+            raise OneRosterError(
+                "OR-STABILIZATION-NOT-AVAILABLE",
+                "Stabilization retry is available only for a manifest stopped by unstable live reads.",
+            )
+        return await self._stabilized_planning(
+            manifest,
+            now=now,
+            require_claim=False,
+        )
 
     async def revalidate_scheduled_gate(
         self,
@@ -289,6 +416,100 @@ class OneRosterExecutor:
                     )
                 raise
 
+    async def reconcile_interrupted(
+        self,
+        manifest_id: str,
+    ) -> ExecutionSummary:
+        """Read back a possibly-sent batch before allowing any retry."""
+
+        lease = nullcontext()
+        if self.activity_registry is not None:
+            try:
+                lease = self.activity_registry.acquire("oneroster-recovery")
+            except ActivityBusyError as exc:
+                raise OneRosterError(
+                    "OR-ACTIVE-JOB",
+                    "Another updater, connector, or administrative job is active.",
+                ) from exc
+        with lease:
+            manifest = self.store.get_manifest_header(manifest_id)
+            if manifest.status != "recovery_required":
+                raise OneRosterError(
+                    "OR-RECOVERY-NOT-AVAILABLE",
+                    "This manifest does not have an interrupted durable batch.",
+                )
+            manifest = self.store.claim_manifest(
+                manifest_id,
+                allow_recovery=True,
+                owner_id=self._operation_owner,
+                owner_pid=os.getpid(),
+                owner_identity=self._operation_identity,
+            )
+            run = self.store.claim_execution_recovery(
+                manifest_id,
+                owner_id=self._operation_owner,
+            )
+            applied = 0
+            try:
+                for batch in self.store.get_reconciling_batches(manifest_id):
+                    self._require_claim(manifest_id)
+                    actions = self.store.get_manifest_actions_by_id(
+                        manifest_id, batch.action_ids
+                    )
+                    verified = await self._verify(actions)
+                    for action in actions:
+                        if not verified.get(action.id, False):
+                            continue
+                        if action.status == "pending":
+                            self.store.mark_action_result(
+                                manifest_id,
+                                action.id,
+                                status="applied",
+                                detail="Verified during interrupted-batch reconciliation.",
+                                load_manifest=False,
+                                owner_id=self._operation_owner,
+                            )
+                            applied += 1
+                    self.store.finish_execution_batch(
+                        batch.id,
+                        status="reconciled",
+                    )
+                current = self.store.finish_manifest(
+                    manifest_id,
+                    status="paused",
+                    error="OR-RECOVERY-RECONCILED",
+                    load_actions=False,
+                    owner_id=self._operation_owner,
+                )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="paused",
+                    error_code="OR-RECOVERY-RECONCILED",
+                    phase="paused",
+                )
+                return ExecutionSummary(
+                    manifest=current,
+                    applied=applied,
+                    failed=0,
+                    skipped=0,
+                    awaiting_students=False,
+                )
+            except BaseException:
+                self.store.finish_manifest(
+                    manifest_id,
+                    status="recovery_required",
+                    error="OR-RECOVERY-REQUIRED",
+                    load_actions=False,
+                    owner_id=self._operation_owner,
+                )
+                self.store.finish_execution_run(
+                    run.id,
+                    status="recovery_required",
+                    error_code="OR-RECOVERY-REQUIRED",
+                    phase="reconciliation",
+                )
+                raise
+
     async def _validate_preflight(
         self,
         manifest: ClassroomImportManifest,
@@ -296,6 +517,7 @@ class OneRosterExecutor:
         *,
         prepared_student_release: bool = False,
         establish_prepared_stage: bool = False,
+        resuming_after_pause: bool = False,
     ) -> None:
         """Run district-sized evidence scans away from the server event loop."""
 
@@ -305,6 +527,7 @@ class OneRosterExecutor:
             planning,
             prepared_student_release=prepared_student_release,
             establish_prepared_stage=establish_prepared_stage,
+            resuming_after_pause=resuming_after_pause,
         )
 
     def _validate_preflight_sync(
@@ -314,13 +537,22 @@ class OneRosterExecutor:
         *,
         prepared_student_release: bool = False,
         establish_prepared_stage: bool = False,
+        resuming_after_pause: bool = False,
     ) -> None:
         if planning.source_hash != manifest.source_hash:
+            self.store.record_manifest_drift(
+                manifest.id,
+                ({"category": "source changed", "field": "source_hash", "approved": manifest.source_hash, "current": planning.source_hash},),
+            )
             raise OneRosterError(
                 "OR-SOURCE-DRIFT",
                 "The retained OneRoster source no longer matches the approved manifest.",
             )
         if planning.config_hash != manifest.config_hash:
+            self.store.record_manifest_drift(
+                manifest.id,
+                ({"category": "configuration changed", "field": "config_hash", "approved": manifest.config_hash, "current": planning.config_hash},),
+            )
             raise OneRosterError(
                 "OR-CONFIG-DRIFT",
                 "District import configuration changed after this manifest was approved.",
@@ -336,12 +568,14 @@ class OneRosterExecutor:
                 not manifest.prepared_live_hash
                 or planning.live_hash != manifest.prepared_live_hash
             ):
+                self._record_live_drift(manifest, planning)
                 raise OneRosterError(
                     "OR-MANIFEST-DRIFT",
                     "Live Classroom state changed after teacher preparation; "
                     "replan and confirm the student release.",
                 )
-        elif planning.live_hash != manifest.live_hash:
+        elif not resuming_after_pause and planning.live_hash != manifest.live_hash:
+            self._record_live_drift(manifest, planning)
             raise OneRosterError(
                 "OR-MANIFEST-DRIFT",
                 "Live Classroom identity or roster state changed; replan and "
@@ -354,6 +588,15 @@ class OneRosterExecutor:
             expected_count != current_count
             or expected_hash != current_hash
         ):
+            self.store.record_manifest_drift(
+                manifest.id,
+                ({
+                    "category": "remaining-action sequence changed",
+                    "field": "pending_actions",
+                    "approved": f"{expected_count} actions / {expected_hash}",
+                    "current": f"{current_count} actions / {current_hash}",
+                },),
+            )
             raise OneRosterError(
                 "OR-MANIFEST-DRIFT",
                 "Live Classroom state changed; replan and confirm the remaining work.",
@@ -369,6 +612,10 @@ class OneRosterExecutor:
             if current_thresholds.get("profile_hash") != approved_thresholds.get(
                 "profile_hash"
             ):
+                self.store.record_manifest_drift(
+                    manifest.id,
+                    ({"category": "threshold profile changed", "field": "profile_hash", "approved": approved_thresholds.get("profile_hash", ""), "current": current_thresholds.get("profile_hash", "")},),
+                )
                 raise OneRosterError(
                     "OR-MANIFEST-DRIFT",
                     "District threshold policy changed; rebuild and confirm the district manifest.",
@@ -380,6 +627,7 @@ class OneRosterExecutor:
             # evaluated hold/blackout result below is authoritative.
             if (
                 not prepared_student_release
+                and not resuming_after_pause
                 and canonical_hash(current_thresholds)
                 != canonical_hash(approved_thresholds)
             ):
@@ -390,6 +638,10 @@ class OneRosterExecutor:
             if canonical_hash(_issue_evidence(planning.issues)) != canonical_hash(
                 _issue_evidence(manifest.exclusions)
             ):
+                self.store.record_manifest_drift(
+                    manifest.id,
+                    ({"category": "exclusions changed", "field": "exclusions", "approved": canonical_hash(_issue_evidence(manifest.exclusions)), "current": canonical_hash(_issue_evidence(planning.issues))},),
+                )
                 raise OneRosterError(
                     "OR-MANIFEST-DRIFT",
                     "Quarantines or exclusions changed; rebuild and confirm the district manifest.",
@@ -412,6 +664,26 @@ class OneRosterExecutor:
                 "District thresholds hold this live plan and no matching override exists.",
             )
 
+    def _record_live_drift(
+        self,
+        manifest: ClassroomImportManifest,
+        planning: LivePlanningResult,
+    ) -> None:
+        rows = _live_evidence_diff(
+            manifest.live_evidence,
+            planning.live_evidence,
+        )
+        if not rows:
+            rows = (
+                {
+                    "category": "live state changed",
+                    "field": "live_hash",
+                    "approved": manifest.prepared_live_hash or manifest.live_hash,
+                    "current": planning.live_hash,
+                },
+            )
+        self.store.record_manifest_drift(manifest.id, rows)
+
     async def _apply(
         self,
         manifest_id: str,
@@ -419,12 +691,14 @@ class OneRosterExecutor:
         owner_ids: Optional[Mapping[str, str]] = None,
         *,
         include_students: bool = True,
+        run_id: str = "",
     ) -> tuple[int, int, int]:
         if actions is not None:
             return await self._apply_explicit(
                 manifest_id,
                 actions,
                 owner_ids,
+                run_id=run_id,
             )
 
         allowed_kinds = tuple(
@@ -473,9 +747,13 @@ class OneRosterExecutor:
                         runnable,
                         owner_ids,
                         blocked_courses,
+                        run_id=run_id,
+                        phase=stage_kinds[0],
                     )
                     applied += chunk_applied
                     failed += chunk_failed
+                if run_id and self.store.execution_stop_requested(run_id):
+                    return applied, failed, skipped
         return applied, failed, skipped
 
     async def _apply_explicit(
@@ -483,6 +761,8 @@ class OneRosterExecutor:
         manifest_id: str,
         actions: Sequence[ImportAction],
         owner_ids: Optional[Mapping[str, str]] = None,
+        *,
+        run_id: str = "",
     ) -> tuple[int, int, int]:
         applied = failed = skipped = 0
         blocked_courses: set[str] = set()
@@ -510,6 +790,8 @@ class OneRosterExecutor:
                     chunk,
                     owner_ids,
                     blocked_courses,
+                    run_id=run_id,
+                    phase=chunk[0].kind,
                 )
                 applied += chunk_applied
                 failed += chunk_failed
@@ -521,10 +803,46 @@ class OneRosterExecutor:
         chunk: Sequence[ImportAction],
         owner_ids: Optional[Mapping[str, str]],
         blocked_courses: set[str],
+        *,
+        run_id: str = "",
+        phase: str = "apply",
     ) -> tuple[int, int]:
         self._require_claim(manifest_id)
+        guarded_chunk, guarded_applied, guarded_failed = await self._guard_course_creates(
+            manifest_id,
+            chunk,
+            owner_ids,
+            blocked_courses,
+        )
+        if not guarded_chunk:
+            return guarded_applied, guarded_failed
+        chunk = guarded_chunk
+        durable_batch = None
+        if run_id:
+            durable_batch = self.store.prepare_execution_batch(
+                run_id,
+                manifest_id,
+                chunk,
+                phase=phase,
+                owner_id=self._operation_owner,
+            )
+            durable_batch = self.store.mark_execution_batch_started(
+                durable_batch.id
+            )
         commands = [_command_for(action) for action in chunk]
         batch_failed = False
+        heartbeat_task: Optional[asyncio.Task[None]] = None
+        if run_id:
+            async def pulse() -> None:
+                while True:
+                    await asyncio.sleep(5.0)
+                    await asyncio.to_thread(
+                        self.store.heartbeat_execution_run,
+                        run_id,
+                        phase=phase,
+                    )
+
+            heartbeat_task = asyncio.create_task(pulse())
         try:
             await self.connector.run_classroom_batch(
                 commands,
@@ -532,8 +850,14 @@ class OneRosterExecutor:
             )
         except Exception:
             batch_failed = True
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
         verified = await self._verify(chunk, owner_ids)
-        applied = failed = 0
+        applied = guarded_applied
+        failed = guarded_failed
         for action in chunk:
             ok = bool(verified.get(action.id))
             if ok:
@@ -567,7 +891,100 @@ class OneRosterExecutor:
                     "course_activate",
                 }:
                     blocked_courses.add(action.subject.casefold())
+        if durable_batch is not None:
+            self.store.finish_execution_batch(
+                durable_batch.id,
+                status="failed" if failed else "completed",
+                error_code="OR-BATCH-VERIFY-FAILED" if failed else "",
+            )
         return applied, failed
+
+    async def _guard_course_creates(
+        self,
+        manifest_id: str,
+        chunk: Sequence[ImportAction],
+        owner_ids: Optional[Mapping[str, str]],
+        blocked_courses: set[str],
+    ) -> tuple[list[ImportAction], int, int]:
+        """Perform the final exact-alias check immediately before course creation."""
+
+        creates = [action for action in chunk if action.kind == "course_create"]
+        if not creates:
+            return list(chunk), 0, 0
+        aliases = tuple(action.subject for action in creates)
+        details: dict[str, Any] = {}
+        bulk = getattr(self.connector, "list_oneroster_managed_courses", None)
+        if callable(bulk):
+            try:
+                rows = await bulk(aliases)
+            except Exception as exc:
+                raise OneRosterError(
+                    "OR-CLASSROOM-READ",
+                    "Final exact-alias lookup failed before course creation.",
+                ) from exc
+            for detail in rows:
+                matches = [alias for alias in aliases if _has_alias(detail, alias)]
+                if len(matches) != 1 or matches[0].casefold() in details:
+                    raise OneRosterError(
+                        "OR-ALIAS-AMBIGUOUS",
+                        "Final exact-alias lookup returned an ambiguous managed course.",
+                    )
+                details[matches[0].casefold()] = detail
+        else:
+            for alias in aliases:
+                try:
+                    detail = await self.connector.get_course(
+                        _course_ref(alias),
+                        include_owner_email=True,
+                        include_aliases=True,
+                        best_effort_enrichment=False,
+                    )
+                except KeyError:
+                    continue
+                except Exception as exc:
+                    raise OneRosterError(
+                        "OR-CLASSROOM-READ",
+                        "Final exact-alias lookup failed before course creation.",
+                    ) from exc
+                if not _has_alias(detail, alias):
+                    raise OneRosterError(
+                        "OR-ALIAS-AMBIGUOUS",
+                        "Course lookup did not prove the exact managed alias.",
+                    )
+                details[alias.casefold()] = detail
+
+        runnable: list[ImportAction] = []
+        applied = failed = 0
+        for action in chunk:
+            if action.kind != "course_create":
+                runnable.append(action)
+                continue
+            detail = details.get(action.subject.casefold())
+            if detail is None:
+                runnable.append(action)
+                continue
+            if _verify_action(action, detail, None, owner_ids or {}):
+                self.store.mark_action_result(
+                    manifest_id,
+                    action.id,
+                    status="applied",
+                    detail="Exact alias already existed and matched immediately before create.",
+                    load_manifest=False,
+                    owner_id=self._operation_owner,
+                )
+                applied += 1
+            else:
+                self.store.mark_action_result(
+                    manifest_id,
+                    action.id,
+                    status="failed",
+                    detail="OR-ALIAS-CONFLICT",
+                    load_manifest=False,
+                    owner_id=self._operation_owner,
+                )
+                blocked_courses.add(action.subject.casefold())
+                failed += 1
+        return runnable, applied, failed
 
     def _require_claim(self, manifest_id: str) -> None:
         if not self.store.owns_claim(manifest_id, self._operation_owner):
@@ -677,6 +1094,12 @@ class OneRosterExecutor:
                         self.connector.list_course_participants(course_id, "students"),
                     )
                 except Exception:
+                    continue
+                if any(
+                    not bool(getattr(item, "identity_resolved", True))
+                    for item in (*teachers, *students)
+                ):
+                    # A course-only GAM row is not proof of a complete roster.
                     continue
                 rosters[alias] = (
                     {_participant_email(item) for item in teachers if _participant_email(item)},
@@ -942,3 +1365,72 @@ def _issue_evidence(values: Sequence[Any]) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def _planning_observation_hash(planning: LivePlanningResult) -> str:
+    """Hash every decision-bearing field from one post-write observation."""
+
+    return canonical_hash(
+        {
+            "source_hash": planning.source_hash,
+            "config_hash": planning.config_hash,
+            "live_hash": planning.live_hash,
+            "actions": [action.basis_dict() for action in planning.actions],
+            "archive_actions": [
+                action.basis_dict() for action in planning.archive_actions
+            ],
+            "ownership_actions": [
+                action.basis_dict() for action in planning.ownership_actions
+            ],
+            "issues": _issue_evidence(planning.issues),
+            "thresholds": _threshold_drift_evidence(
+                _threshold_evidence(planning.threshold_evaluation)
+            ),
+        }
+    )
+
+
+def _live_evidence_diff(
+    approved: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> tuple[dict[str, str], ...]:
+    categories = {
+        "id": "course identity changed",
+        "aliases": "course identity changed",
+        "exists": "course identity changed",
+        "name": "metadata changed",
+        "section": "metadata changed",
+        "room": "metadata changed",
+        "owner_email": "owner changed",
+        "teachers": "teacher roster changed",
+        "students": "student roster changed",
+        "state": "course state changed",
+        "unresolved_members": "roster identity changed",
+    }
+    rows: list[dict[str, str]] = []
+    aliases = sorted(
+        (set(approved) | set(current)) - {"__truncated__"},
+        key=str.casefold,
+    )
+    for alias in aliases:
+        before = approved.get(alias, {})
+        after = current.get(alias, {})
+        if not isinstance(before, Mapping):
+            before = {}
+        if not isinstance(after, Mapping):
+            after = {}
+        for field in sorted(set(before) | set(after)):
+            if field == "alias" or before.get(field) == after.get(field):
+                continue
+            rows.append(
+                {
+                    "category": categories.get(field, "live state changed"),
+                    "course": alias,
+                    "field": field,
+                    "approved": json.dumps(before.get(field, ""), ensure_ascii=False),
+                    "current": json.dumps(after.get(field, ""), ensure_ascii=False),
+                }
+            )
+            if len(rows) >= 100:
+                return tuple(rows)
+    return tuple(rows)

@@ -19,9 +19,9 @@
       {{ "Verified" if access.ready else "Verification required" }}
     </p>
     <p class="mt-1 max-w-3xl text-xs text-brand-blueink">
-      The proof is local, expires after 24 hours, and is cleared when Workspace
-      credentials are rebound. Verification is the only action in this panel that
-      reads Keychain credentials or runs GAM.
+      The diagnostic runs the same non-mutating Directory export, exact managed-alias
+      lookup, and covered roster read used by planning. It is cleared when Workspace
+      credentials are rebound.
     </p>
   </div>
   <span class="rounded-lg border px-3 py-1.5 text-xs font-semibold {{ 'border-emerald-300 bg-emerald-50 text-emerald-800' if access.ready else 'border-amber-300 bg-amber-50 text-amber-900' }}">
@@ -32,13 +32,23 @@
       hx-post="/classroom/imports/access/verify"
       hx-target="#oneroster-access"
       hx-swap="innerHTML">
-  <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Super-admin email
-    <input type="email" name="admin" required autocomplete="username"
+  <label class="min-w-64 flex-1 text-sm font-medium text-brand-black">Existing managed course alias
+    <input type="text" name="managed_alias" required autocomplete="off" pattern="Section_.+"
            class="mt-1 w-full rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm text-ink focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30"
-           placeholder="admin@yourdomain.com" />
+           placeholder="Section_12345" />
   </label>
   <button type="submit"
           class="inline-flex rounded-lg border border-brand-blue/60 px-3.5 py-2 text-sm font-medium text-brand-blueink transition-colors hover:bg-brand-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">
-    {{ "Verify again" if access.ready else "Verify live access" }}
+    {{ "Run diagnostics again" if access.ready else "Run connectivity diagnostics" }}
   </button>
 </form>
+{% if diagnostics %}
+<ul class="mt-4 grid gap-2 text-sm sm:grid-cols-3" aria-label="Connectivity diagnostic results">
+  {% for item in diagnostics %}
+  <li class="rounded-lg border {{ 'border-emerald-300 bg-emerald-50' if item.status == 'passed' else 'border-red-300 bg-red-50' }} p-3">
+    <p class="font-semibold text-brand-black">{{ item.capability }}</p>
+    <p class="mt-1 text-xs text-brand-blueink">{{ item.detail }}</p>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}

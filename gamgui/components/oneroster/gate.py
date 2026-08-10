@@ -75,7 +75,7 @@ def open_gate(
         or current_manifest_hash.strip() != current.manifest_hash
     ):
         return StudentEnrollmentGate(
-            state=GateState.CLOSED,
+            state=GateState.HELD,
             timezone=DISTRICT_TIMEZONE,
             updated_at=moment.timestamp(),
             hold_code="OR-GATE-DRIFT",
@@ -105,7 +105,7 @@ def hold_gate(
 ) -> StudentEnrollmentGate:
     moment = _aware(now)
     return StudentEnrollmentGate(
-        state=GateState.CLOSED,
+        state=GateState.HELD,
         timezone=DISTRICT_TIMEZONE,
         updated_at=moment.timestamp(),
         hold_code=code,

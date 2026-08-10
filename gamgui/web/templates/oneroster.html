@@ -21,6 +21,29 @@
   {% if not feature.ready %}
     {% include "_oneroster_unavailable.html" %}
   {% else %}
+  <nav class="rounded-2xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm" aria-label="OneRoster import steps">
+    <ol class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+      {% set steps = (
+        ("#oneroster-upload", "1", "Upload", history | length > 0, "Local"),
+        ("#oneroster-workspace", "2", "Validate source", history | length > 0, "Local"),
+        ("#oneroster-workspace", "3", "Review date scope", history | length > 0, "Local"),
+        ("#oneroster-access-panel", "4", "Compare live", access.ready, "Read-only live"),
+        ("#oneroster-workspace", "5", "Review actions", gate.manifest_id, "Local"),
+        ("#oneroster-workspace", "6", "Approve and prepare", gate.manifest_id, "Mutating"),
+        ("#student-gate", "7", "Release students", gate.state == "OPEN", "Mutating"),
+        ("#oneroster-workspace", "8", "Verify results", gate.state == "OPEN", "Read-only live"),
+        ("#oneroster-history", "9", "Complete", false, "Local")
+      ) %}
+      {% for href, number, label, complete, mode in steps %}
+      <li>
+        <a href="{{ href }}" class="flex items-center gap-3 rounded-lg border {{ 'border-emerald-300 bg-emerald-50' if complete else 'border-brand-gray/40 bg-paper/60' }} px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-blue">
+          <span class="grid size-7 shrink-0 place-items-center rounded-full {{ 'bg-emerald-700 text-white' if complete else 'bg-brand-blueink text-white' }} font-semibold tabular-nums">{{ "✓" if complete else number }}</span>
+          <span><span class="block font-medium text-brand-black">{{ label }}</span><span class="block text-xs text-brand-blueink">{{ mode }}</span></span>
+        </a>
+      </li>
+      {% endfor %}
+    </ol>
+  </nav>
   <div class="grid gap-4 sm:grid-cols-3">
     <div class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm">
       <p class="text-xs uppercase tracking-wider text-brand-blueink">Imports retained</p>
@@ -36,7 +59,7 @@
     </div>
   </div>
 
-  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="oneroster-access-heading">
+  <section id="oneroster-access-panel" class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="oneroster-access-heading">
     <h2 id="oneroster-access-heading" class="font-serif text-xl text-brand-black">Live access</h2>
     <p class="mt-1 text-sm text-brand-blueink/80">
       Uploads and local previews never read Workspace credentials. Verify access here
@@ -47,7 +70,7 @@
     </div>
   </section>
 
-  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="oneroster-upload-heading">
+  <section id="oneroster-upload" class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm" aria-labelledby="oneroster-upload-heading">
     <h2 id="oneroster-upload-heading" class="font-serif text-xl text-brand-black">Upload a full snapshot</h2>
     <p class="mt-1 text-sm text-brand-blueink/80">Choose the exported ZIP or its folder of CSV files. Validation stays local and never contacts Google or runs GAM. Maximum upload size: 250 MB.</p>
     <div class="mt-4 grid min-w-0 gap-4 lg:grid-cols-2">
@@ -98,7 +121,7 @@
       </div>
     </section>
 
-    <section class="min-w-0 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="student-gate-heading">
+    <section id="student-gate" class="min-w-0 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="student-gate-heading">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0 flex-1">
           <h2 id="student-gate-heading" class="font-serif text-xl text-brand-black">Student enrollment gate</h2>

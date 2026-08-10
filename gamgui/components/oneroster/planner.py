@@ -102,6 +102,7 @@ class _ActionPayload:
     live_hash: str
     action_counts: Mapping[str, int]
     owner_ids: Mapping[str, str]
+    live_evidence: Mapping[str, Any]
 
 
 def planner_configuration_hash(
@@ -264,6 +265,7 @@ class OneRosterPlanner:
             threshold_evaluation=threshold_evaluation,
             owner_ids=action_payload.owner_ids,
             scope_hash=canonical_hash(schedule_scope),
+            live_evidence=action_payload.live_evidence,
         )
     async def _read_directory_snapshot(self) -> Optional[dict[str, Any]]:
         bulk = getattr(self.connector, "list_oneroster_directory", None)
@@ -754,14 +756,41 @@ def _build_action_payload(
     live_hash = _stream_live_hash(courses, live_courses, archive_basis)
     owner_ids = _owner_id_evidence(courses, directory_snapshot)
 
+    frozen_actions = _freeze_actions(actions)
+    frozen_archive_actions = _freeze_actions(archive_actions)
+    frozen_ownership_actions = _freeze_actions(ownership_actions)
+    affected_aliases = {
+        action.subject
+        for action in (
+            *frozen_actions,
+            *frozen_archive_actions,
+            *frozen_ownership_actions,
+        )
+    }
+    archive_by_alias = {
+        str(item.get("alias", "")): dict(item)
+        for item in archive_basis
+        if str(item.get("alias", ""))
+    }
+    live_evidence = {}
+    for alias in sorted(affected_aliases, key=str.casefold):
+        live = live_courses.get(alias.casefold())
+        if live is not None:
+            live_evidence[alias] = _live_basis(alias, live)
+        elif alias in archive_by_alias:
+            live_evidence[alias] = archive_by_alias[alias]
+        else:
+            live_evidence[alias] = {"alias": alias, "exists": False}
+
     return _ActionPayload(
-        actions=_freeze_actions(actions),
-        archive_actions=_freeze_actions(archive_actions),
-        ownership_actions=_freeze_actions(ownership_actions),
+        actions=frozen_actions,
+        archive_actions=frozen_archive_actions,
+        ownership_actions=frozen_ownership_actions,
         issues=tuple(issues),
         live_hash=live_hash,
         action_counts=dict(counts),
         owner_ids=owner_ids,
+        live_evidence=live_evidence,
     )
 
 

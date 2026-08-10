@@ -198,3 +198,45 @@ body {
     transition-duration: 1ms !important;
   }
 }
+
+@media (max-width: 720px) {
+  .oneroster-action-table,
+  .oneroster-action-table tbody,
+  .oneroster-action-table tr,
+  .oneroster-action-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .oneroster-action-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .oneroster-action-table tr {
+    padding: 0.6rem 0;
+  }
+
+  .oneroster-action-table td {
+    display: grid;
+    grid-template-columns: minmax(5rem, 0.36fr) minmax(0, 1fr);
+    gap: 0.75rem;
+    padding-block: 0.35rem;
+  }
+
+  .oneroster-action-table td::before {
+    color: #52647b;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    content: attr(data-label);
+  }
+}

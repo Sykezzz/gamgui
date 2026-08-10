@@ -25,25 +25,19 @@
       <input type="hidden" name="target_state" value="CLOSED" />
       <button type="submit" class="rounded-lg border border-brand-gray/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Close gate</button>
     </form>
-    <form class="space-y-2 border-t border-brand-gray/30 pt-3" hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
-      <input type="hidden" name="target_state" value="ARMED" />
-      <p class="text-sm font-semibold text-brand-black">Arm a scheduled release</p>
-      <input name="manifest_id" required placeholder="Approved manifest ID" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
-      <input name="manifest_hash" required placeholder="Approved manifest hash" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 font-mono text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
-      <label class="block text-sm font-medium text-brand-black">Release time (America/Chicago)
-        <input type="datetime-local" name="release_at" required class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
-      </label>
-      <button type="submit" class="rounded-lg border border-brand-blue/60 px-3 py-1.5 text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Arm gate</button>
-    </form>
+    <p class="border-t border-brand-gray/30 pt-3 text-xs text-brand-blueink">Scheduled releases are armed from an awaiting-students manifest card so the application carries the exact immutable ID and hash.</p>
+    {% if gate.state == "ARMED" %}
     <form class="space-y-2 border-t border-brand-gray/30 pt-3" hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
       <input type="hidden" name="target_state" value="OPEN" />
-      <p class="text-sm font-semibold text-brand-black">Open immediately after server-side revalidation</p>
-      <p class="text-xs text-brand-blueink">The server re-reads source, thresholds, Directory, and Classroom for the exact armed manifest. Browser-supplied hashes are never accepted as current evidence.</p>
-      <input name="manifest_id" required value="{{ gate.manifest_id | default('') }}" placeholder="Armed manifest ID" class="w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:outline-none focus:ring-2 focus:ring-brand-blue/30" />
+      <p class="text-sm font-semibold text-brand-black">Start the approved student import</p>
+      <p class="text-xs text-brand-blueink">This single action revalidates source, thresholds, Directory, and Classroom for manifest <code class="font-mono">{{ gate.manifest_id }}</code>, opens the gate, and queues only its approved student work.</p>
+      {% if gate.manifest_id %}<p class="text-sm font-medium text-amber-950">It will queue {{ gate.student_action_count }} approved student change{{ "" if gate.student_action_count == 1 else "s" }}.</p>{% endif %}
+      <input type="hidden" name="manifest_id" value="{{ gate.manifest_id }}" />
       <label class="block text-sm font-medium text-brand-black">Type <span class="font-mono">OPEN</span>
         <input name="confirmation" required autocomplete="off" class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 text-sm focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-500/30" />
       </label>
-      <button type="submit" class="rounded-lg bg-amber-800 px-3 py-1.5 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Revalidate and open gate</button>
+      <button type="submit" class="rounded-lg bg-amber-800 px-3 py-1.5 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Revalidate, open gate, and run {{ gate.student_action_count }} student change{{ "" if gate.student_action_count == 1 else "s" }}</button>
     </form>
+    {% endif %}
   </div>
 </details>

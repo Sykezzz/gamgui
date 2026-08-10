@@ -15,13 +15,12 @@ import re
 import tempfile
 import zipfile
 from collections import Counter, deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncIterator, Iterable
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
-from ...core.setup import ONEROSTER_DWD_SCOPES, SetupService
 from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
 from .components import component_context
@@ -65,9 +64,11 @@ _PREFERRED_PREVIEW_COLUMNS = {
         "class_id",
         "alias",
         "name",
-        "owner_email",
         "scope_state",
-        "school_year_id",
+        "term_start",
+        "days_until_start",
+        "creation_cutoff",
+        "changed_since_upload",
         "selected",
         "ready",
     ),
@@ -84,6 +85,8 @@ _MANIFEST_TERMINAL_STATES = {
     "partial",
     "failed",
     "interrupted",
+    "paused",
+    "recovery_required",
     "stale",
 }
 _THRESHOLD_ACTIONS = (
@@ -341,6 +344,17 @@ def _snapshot_record(value: Any) -> dict[str, Any]:
     result["custom_course_name_template"] = (
         template if result["course_name_choice"] == "custom" else ""
     )
+    scope_date = str(result.get("scope_date", "") or "")
+    initial_scope_date = str(result.get("initial_scope_date", "") or "")
+    try:
+        result["scope_window_end"] = (
+            date.fromisoformat(scope_date) + timedelta(days=31)
+        ).isoformat()
+    except ValueError:
+        result["scope_window_end"] = ""
+    result["scope_changed_since_upload"] = bool(
+        scope_date and initial_scope_date and scope_date != initial_scope_date
+    )
     return result
 
 
@@ -592,6 +606,10 @@ def _manifest_record(
         complete_count=complete_count,
         pending_count=pending_count,
         action_counts=action_counts,
+        student_action_count=(
+            action_counts.get("student_add", 0)
+            + action_counts.get("student_remove", 0)
+        ),
         threshold_evidence=_record(result.get("threshold_evidence", {})),
         pilot_evidence=_record(result.get("pilot_evidence", {})),
         exclusions=[
@@ -604,7 +622,54 @@ def _manifest_record(
             for item in (result.get("exclusions", ()) or ())[:50]
         ],
         exclusion_total=len(result.get("exclusions", ()) or ()),
+        drift_report=[
+            {
+                key: str(_record(item).get(key, "") or "")
+                for key in ("category", "course", "field", "approved", "current")
+            }
+            for item in (result.get("drift_report", ()) or ())
+        ][:100],
     )
+    error_code = str(result.get("error", "") or "")
+    status = str(result.get("status", "") or "")
+    if error_code:
+        if error_code in {"OR-STUDENT-GATE-CLOSED", "OR-GATE-DRIFT"}:
+            error_phase = "Student release gate"
+        elif error_code in {"OR-RECOVERY-REQUIRED", "OR-EXECUTION-PAUSED"}:
+            error_phase = "Batch recovery"
+        elif error_code in {
+            "OR-MANIFEST-DRIFT",
+            "OR-SOURCE-DRIFT",
+            "OR-CONFIG-DRIFT",
+            "OR-SCOPE-DRIFT",
+            "OR-THRESHOLD-HOLD",
+            "OR-LIVE-NOT-STABLE",
+        }:
+            error_phase = "Safety revalidation"
+        else:
+            error_phase = "Manifest execution"
+        mutation_status = (
+            "Mutation may have happened; review the persisted action results before continuing."
+            if status in {"partial", "paused", "recovery_required", "running"}
+            or any(action.get("status") == "applied" for action in actions)
+            else "No mutation is recorded for this stopped attempt."
+        )
+        if status == "stale":
+            safe_next_action = "Keep this approval read-only and build a fresh plan from the retained import."
+        elif status == "recovery_required":
+            safe_next_action = "Reconcile the interrupted batch from live state before any retry."
+        elif status == "paused":
+            safe_next_action = "Review progress, then resume only after fresh safety revalidation."
+        elif status == "awaiting_students":
+            safe_next_action = "Arm and revalidate the student gate for this exact manifest."
+        else:
+            safe_next_action = "Review the action results and rebuild the plan before retrying changed work."
+        result.update(
+            error_phase=error_phase,
+            mutation_status=mutation_status,
+            safe_next_action=safe_next_action,
+        )
+    result.pop("live_evidence", None)
     return result
 
 
@@ -833,6 +898,8 @@ def _manifest_response(
     notice: str = "",
     offset: int = 0,
     polling: bool = False,
+    progress: Any = None,
+    gate: Any = None,
 ) -> HTMLResponse:
     return TEMPLATES.TemplateResponse(
         request,
@@ -843,8 +910,24 @@ def _manifest_response(
             "task_error": task_error[1] if task_error else "",
             "notice": notice,
             "polling": polling,
+            "progress": _record(progress) if progress is not None else {},
+            "gate": _record(gate) if gate is not None else {},
         },
     )
+
+
+async def _manifest_progress(service: Any, manifest_id: str) -> Any:
+    method = getattr(service, "get_execution_progress", None)
+    if not callable(method):
+        return None
+
+
+async def _manifest_gate(service: Any) -> Any:
+    return await _local_gate(service)
+    try:
+        return await asyncio.to_thread(method, manifest_id)
+    except (KeyError, TypeError):
+        return None
 
 
 async def _run_manifest(
@@ -1026,6 +1109,17 @@ async def _local_gate(service: Any) -> dict[str, Any]:
     result["state"] = _enum_value(result.get("state", "CLOSED"))
     result.setdefault("state", "CLOSED")
     result.setdefault("timezone", "America/Chicago")
+    result.setdefault("student_action_count", 0)
+    manifest_id = str(result.get("manifest_id", "") or "")
+    loader = getattr(service, "get_manifest_page", None)
+    if manifest_id and callable(loader):
+        try:
+            page = await asyncio.to_thread(loader, manifest_id, offset=0, limit=1)
+            result["student_action_count"] = _manifest_record(page).get(
+                "student_action_count", 0
+            )
+        except (KeyError, TypeError):
+            pass
     return result
 
 
@@ -1152,9 +1246,10 @@ async def oneroster_page(request: Request) -> HTMLResponse:
 @router.post("/access/verify", response_class=HTMLResponse)
 async def verify_live_access(
     request: Request,
-    admin: Annotated[str, Form()],
+    managed_alias: Annotated[str, Form()] = "",
+    admin: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
-    """Explicitly verify the exact Directory/Classroom/Drive DWD scope set."""
+    """Exercise the read capabilities the OneRoster planner actually needs."""
 
     feature = await _feature(request)
     if not feature["ready"]:
@@ -1164,18 +1259,25 @@ async def verify_live_access(
             error_code=feature["code"],
         )
     state = request.app.state.gamgui
-    domain = str(getattr(state, "audit_domain", "") or "").strip()
-    normalized_admin = admin.strip()
-    if not domain or not normalized_admin:
+    alias = managed_alias.strip()
+    if (
+        not alias.startswith("Section_")
+        or len(alias) > 512
+        or any(character in alias for character in "\r\n\x00")
+    ):
         return TEMPLATES.TemplateResponse(
             request,
             "_oneroster_access.html",
             {
                 "access": await _local_scope_readiness(feature["service"]),
-                "error": "Enter the super-admin email used for GAM verification.",
+                "error": "Enter one existing managed alias beginning with Section_.",
                 "error_code": "CMP-AUTH-REQUIRED",
+                "diagnostics": (),
             },
         )
+    connector = _connector(request)
+    if connector is None:
+        return _connector_required(request)
     lease = try_acquire_admin_activity(state, "oneroster-scope-verify")
     if lease is None:
         return TEMPLATES.TemplateResponse(
@@ -1185,42 +1287,86 @@ async def verify_live_access(
                 "access": await _local_scope_readiness(feature["service"]),
                 "error": ADMIN_ACTIVITY_BUSY_MESSAGE,
                 "error_code": "CMP-ACTIVE-JOB",
+                "diagnostics": (),
             },
         )
+    diagnostics: list[dict[str, str]] = []
     try:
-        result = await SetupService(state.vault, state.runner).verify_scopes(
-            domain, normalized_admin, ONEROSTER_DWD_SCOPES
+        directory = getattr(connector, "list_oneroster_directory", None)
+        courses = getattr(connector, "list_oneroster_managed_courses", None)
+        rosters = getattr(connector, "list_course_participants_many", None)
+        if not callable(directory) or not callable(courses) or not callable(rosters):
+            raise RuntimeError("Required OneRoster connector reads are unavailable.")
+        directory_rows = await directory()
+        diagnostics.append(
+            {
+                "capability": "Directory export",
+                "status": "passed",
+                "detail": f"{len(directory_rows)} identities returned.",
+            }
         )
-        if result.ok:
-            access_value = await _call(
-                feature["service"],
-                ("mark_scope_ready",),
-                (((), {}),),
+        course_rows = tuple(await courses((alias,)))
+        exact = []
+        for course in course_rows:
+            raw_aliases = getattr(course, "aliases", ()) or _record(course).get(
+                "aliases", ()
             )
-            access = _record(access_value)
-            notice = "Exact OneRoster live-access scopes verified for 24 hours."
-            error = ""
-            error_code = ""
-        else:
-            invalidator = getattr(
-                feature["service"], "invalidate_scope_readiness", None
-            )
-            if callable(invalidator):
-                await asyncio.to_thread(invalidator)
-            access = await _local_scope_readiness(feature["service"])
-            notice = ""
-            error = (
-                "Live-access verification did not pass. Add only the missing "
-                "delegation scopes, then verify again."
-            )
-            error_code = "CMP-AUTH-REQUIRED"
+            if any(
+                str(item).strip().casefold()
+                in {alias.casefold(), f"d:{alias}".casefold()}
+                for item in raw_aliases
+            ):
+                exact.append(course)
+        if len(exact) != 1:
+            raise RuntimeError("Exact managed-alias lookup did not return one course.")
+        course_id = str(
+            getattr(exact[0], "id", "") or _record(exact[0]).get("id", "")
+        ).strip()
+        if not course_id:
+            raise RuntimeError("Exact managed-alias lookup omitted the course ID.")
+        diagnostics.append(
+            {
+                "capability": "Exact alias lookup",
+                "status": "passed",
+                "detail": "One exact managed course returned.",
+            }
+        )
+        roster = await rosters((course_id,), "all")
+        covers = getattr(roster, "covers", None)
+        if callable(covers) and not covers((course_id,)):
+            raise RuntimeError("Roster export omitted the requested course.")
+        diagnostics.append(
+            {
+                "capability": "Course roster read",
+                "status": "passed",
+                "detail": f"{len(roster)} memberships returned with course coverage.",
+            }
+        )
+        access_value = await _call(
+            feature["service"],
+            ("mark_scope_ready",),
+            (((), {}),),
+        )
+        access = _record(access_value)
+        notice = "OneRoster read capabilities passed for this connection."
+        error = ""
+        error_code = ""
     except Exception as exc:  # noqa: BLE001 - converted to stable operator error
+        diagnostics.append(
+            {
+                "capability": "Diagnostic stopped",
+                "status": "failed",
+                "detail": "A required read did not return complete evidence.",
+            }
+        )
+        invalidator = getattr(feature["service"], "invalidate_scope_readiness", None)
+        if callable(invalidator):
+            await asyncio.to_thread(invalidator)
         access = await _local_scope_readiness(feature["service"])
         code, message = _safe_error(exc, "CMP-AUTH-REQUIRED")
         notice = ""
         error = message
         error_code = code
-        result = None
     finally:
         lease.release()
     return TEMPLATES.TemplateResponse(
@@ -1231,11 +1377,8 @@ async def verify_live_access(
             "notice": notice,
             "error": error,
             "error_code": error_code,
-            "missing_scopes": (
-                tuple(getattr(result, "missing_feature_scopes", ()) or ())
-                if result is not None
-                else ()
-            ),
+            "missing_scopes": (),
+            "diagnostics": diagnostics,
         },
     )
 
@@ -1689,6 +1832,32 @@ async def preview_snapshot(
         return _status(request, error=message, error_code=code)
     page = _record(value)
     rows = _records(page.get("items", page.get("rows", [])))[:page_size]
+    if kind == "courses" and rows:
+        snapshot = await _import_record(feature["service"], import_id)
+        initial_scope = str(snapshot.get("initial_scope_date", "") or "")
+        for row in rows:
+            evaluated = str(row.get("scope_date", "") or "")
+            starts = str(row.get("term_start", "") or "")
+            try:
+                evaluated_date = date.fromisoformat(evaluated)
+                start_date = date.fromisoformat(starts)
+                row["days_until_start"] = (start_date - evaluated_date).days
+                row["creation_cutoff"] = (
+                    evaluated_date + timedelta(days=31)
+                ).isoformat()
+                if initial_scope:
+                    initial_date = date.fromisoformat(initial_scope)
+                    was_eligible = start_date <= initial_date + timedelta(days=31)
+                    is_eligible = start_date <= evaluated_date + timedelta(days=31)
+                    row["changed_since_upload"] = (
+                        "Became eligible"
+                        if not was_eligible and is_eligible
+                        else "No"
+                    )
+            except ValueError:
+                row.setdefault("days_until_start", "")
+                row.setdefault("creation_cutoff", "")
+                row.setdefault("changed_since_upload", "")
     columns = page.get("columns")
     if not isinstance(columns, (list, tuple)):
         available = list(rows[0].keys()) if rows else []
@@ -1700,8 +1869,8 @@ async def preview_snapshot(
         columns = [
             *preferred,
             *(column for column in available if column not in preferred),
-        ][:8]
-    columns = [str(column) for column in columns][:8]
+        ][:10]
+    columns = [str(column) for column in columns][:10]
     context = {
             "import_id": import_id,
             "kind": kind,
@@ -2351,6 +2520,8 @@ async def manifest_detail(
         task_error=errors.get(manifest_id),
         offset=offset,
         polling=bool(task is not None and not task.done()),
+        progress=await _manifest_progress(feature["service"], manifest_id),
+        gate=await _manifest_gate(feature["service"]),
     )
 
 
@@ -2390,8 +2561,10 @@ async def execute_manifest(
                 "OR-CONFIRMATION-MISMATCH",
                 "Type the exact import ID shown on this immutable manifest.",
             ),
+            progress=await _manifest_progress(feature["service"], manifest_id),
+            gate=await _manifest_gate(feature["service"]),
         )
-    if manifest_view["status"] not in {"planned", "awaiting_students"}:
+    if manifest_view["status"] not in {"planned", "awaiting_students", "paused"}:
         return _manifest_response(
             request,
             manifest,
@@ -2399,6 +2572,8 @@ async def execute_manifest(
                 "OR-MANIFEST-NOT-RUNNABLE",
                 "This manifest is not awaiting an operator-confirmed execution.",
             ),
+            progress=await _manifest_progress(feature["service"], manifest_id),
+            gate=await _manifest_gate(feature["service"]),
         )
 
     state = request.app.state.gamgui
@@ -2417,6 +2592,8 @@ async def execute_manifest(
         manifest,
         notice="Execution was queued. Live state will be revalidated before GAM runs.",
         polling=True,
+        progress=await _manifest_progress(feature["service"], manifest_id),
+        gate=await _manifest_gate(feature["service"]),
     )
 
 
@@ -2460,6 +2637,191 @@ async def manifest_status(
         task_error=errors.get(manifest_id),
         offset=offset,
         polling=polling,
+        progress=await _manifest_progress(feature["service"], manifest_id),
+        gate=await _manifest_gate(feature["service"]),
+    )
+
+
+@router.post("/manifest/{manifest_id}/pause", response_class=HTMLResponse)
+async def pause_manifest(
+    request: Request,
+    manifest_id: str,
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(manifest_id):
+        return _status(
+            request,
+            error="That manifest identifier is invalid.",
+            error_code="OR-MANIFEST-NOT-FOUND",
+        )
+    service = feature["service"]
+    try:
+        pause = getattr(service, "request_execution_pause")
+        await asyncio.to_thread(pause, manifest_id)
+        manifest = await _load_manifest_page(service, manifest_id)
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-EXECUTION-NOT-RUNNING")
+        manifest = await _load_manifest_page(service, manifest_id)
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(code, message),
+            polling=True,
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+    return _manifest_response(
+        request,
+        manifest,
+        notice="Pause requested. The current batch will finish and verify before stopping.",
+        polling=True,
+        progress=await _manifest_progress(service, manifest_id),
+        gate=await _manifest_gate(service),
+    )
+
+
+@router.post("/manifest/{manifest_id}/recover", response_class=HTMLResponse)
+async def recover_manifest(
+    request: Request,
+    manifest_id: str,
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(manifest_id):
+        return _status(
+            request,
+            error="That manifest identifier is invalid.",
+            error_code="OR-MANIFEST-NOT-FOUND",
+        )
+    connector = _connector(request)
+    if connector is None:
+        return _connector_required(request)
+    service = feature["service"]
+    try:
+        await _call(
+            service,
+            ("reconcile_interrupted_manifest",),
+            (
+                ((connector, manifest_id), {}),
+                ((), {"connector": connector, "manifest_id": manifest_id}),
+            ),
+        )
+        manifest = await _load_manifest_page(service, manifest_id)
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-RECOVERY-REQUIRED")
+        manifest = await _load_manifest_page(service, manifest_id)
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(code, message),
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+    return _manifest_response(
+        request,
+        manifest,
+        notice=(
+            "Interrupted batch outcomes were reconciled from live state. "
+            "Review and confirm the verified remaining work before resuming."
+        ),
+        progress=await _manifest_progress(service, manifest_id),
+        gate=await _manifest_gate(service),
+    )
+
+
+@router.post("/manifest/{manifest_id}/retry-stabilization", response_class=HTMLResponse)
+async def retry_manifest_stabilization(
+    request: Request,
+    manifest_id: str,
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(request, error=feature["message"], error_code=feature["code"])
+    if not _valid_import_id(manifest_id):
+        return _status(
+            request,
+            error="That manifest identifier is invalid.",
+            error_code="OR-MANIFEST-NOT-FOUND",
+        )
+    connector = _connector(request)
+    if connector is None:
+        return _connector_required(request)
+    service = feature["service"]
+    try:
+        await _call(
+            service,
+            ("retry_stabilization_read",),
+            (
+                ((connector, manifest_id), {}),
+                ((), {"connector": connector, "manifest_id": manifest_id}),
+            ),
+        )
+        manifest = await _load_manifest_page(service, manifest_id)
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-LIVE-NOT-STABLE")
+        manifest = await _load_manifest_page(service, manifest_id)
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(code, message),
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+    return _manifest_response(
+        request,
+        manifest,
+        notice=(
+            "Live reads are now stable. This stale approval remains read-only; "
+            "build and approve a fresh plan before mutation."
+        ),
+        progress=await _manifest_progress(service, manifest_id),
+        gate=await _manifest_gate(service),
+    )
+
+
+@router.get("/manifest/{manifest_id}/drift-report")
+async def export_manifest_drift_report(
+    request: Request,
+    manifest_id: str,
+) -> Response:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return Response(feature["message"], status_code=503, media_type="text/plain")
+    if not _valid_import_id(manifest_id):
+        return Response("Manifest not found.", status_code=404, media_type="text/plain")
+    try:
+        manifest = _manifest_record(
+            await _load_manifest_page(feature["service"], manifest_id)
+        )
+    except Exception:
+        return Response("Manifest not found.", status_code=404, media_type="text/plain")
+    payload = {
+        "manifest_id": manifest.get("id", manifest_id),
+        "import_id": manifest.get("import_id", ""),
+        "manifest_hash": manifest.get("manifest_hash", ""),
+        "status": manifest.get("status", ""),
+        "error_code": manifest.get("error", ""),
+        "drift": manifest.get("drift_report", []),
+    }
+    return Response(
+        json.dumps(payload, indent=2, sort_keys=True),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="oneroster-drift-{manifest_id}.json"'
+            )
+        },
     )
 
 
@@ -2531,6 +2893,12 @@ async def change_student_gate(
         return _status(
             request,
             error="Type OPEN exactly to release approved student changes.",
+            error_code="OR-GATE-CONFIRMATION",
+        )
+    if target == "ARMED" and confirmation != "ARM":
+        return _status(
+            request,
+            error="Type ARM exactly to bind the scheduled release.",
             error_code="OR-GATE-CONFIRMATION",
         )
     connector = _connector(request)
@@ -2628,7 +2996,9 @@ async def change_student_gate(
             manifest_id.strip(),
             "",
         )
-    gate = _record(value) or payload
+    gate = await _local_gate(feature["service"])
+    if not gate:
+        gate = _record(value) or payload
     gate["state"] = str(_enum_value(gate.get("state", target)) or target)
     return TEMPLATES.TemplateResponse(
         request,

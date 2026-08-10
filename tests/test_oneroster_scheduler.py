@@ -113,7 +113,7 @@ async def test_expired_scope_persists_visible_hold_and_stops_scheduler_retry(
 
     assert changed is False
     held = OneRosterService("example.org", tmp_path / "component").get_gate()
-    assert held.state is GateState.CLOSED
+    assert held.state is GateState.HELD
     assert held.hold_code == "CMP-AUTH-REQUIRED"
     assert "expired" in held.hold_detail
     assert held.manifest_id == "manifest-scope"
@@ -160,7 +160,7 @@ async def test_unknown_scheduled_failure_is_redacted_and_persisted(tmp_path):
 
     assert changed is False
     held = service.get_gate()
-    assert held.state is GateState.CLOSED
+    assert held.state is GateState.HELD
     assert held.hold_code == "OR-GATE-REVALIDATION-FAILED"
     assert "private tenant failure detail" not in held.hold_detail
     assert held.manifest_id == "manifest-runtime"
