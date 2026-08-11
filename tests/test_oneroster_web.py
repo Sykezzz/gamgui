@@ -303,6 +303,10 @@ class FakeOneRosterService:
         self.calls.append(("get_manifest", manifest_id))
         return self.manifests[manifest_id]
 
+    async def retry_stabilization_read(self, connector, manifest_id):
+        self.calls.append(("retry_stabilization_read", connector, manifest_id))
+        return SimpleNamespace(live_hash="stable-live")
+
     async def execute_manifest(
         self,
         connector,
@@ -1010,6 +1014,61 @@ def test_manifest_actions_are_bounded_to_fifty_with_local_paging():
     assert len(second.content) < 100_000
 
 
+def test_stale_manifest_is_read_only_with_drift_actions_and_bounded_export():
+    client, service = _client()
+    planning = client.post(
+        "/classroom/imports/import/import-1/plan",
+        data={"mode": "normal", "pilot_evidence": "Pilot evidence reviewed."},
+    )
+    assert planning.status_code == 200
+    manifest_id = "1" * 32
+    manifest = service.manifests[manifest_id]
+    manifest.status = "stale"
+    manifest.error = "OR-LIVE-NOT-STABLE"
+    manifest.drift_report = (
+        {
+            "category": "metadata",
+            "course": "Section_101",
+            "field": "name",
+            "approved": "Algebra",
+            "current": "Algebra I",
+        },
+    )
+
+    response = client.get(f"/classroom/imports/manifest/{manifest_id}")
+
+    assert response.status_code == 200
+    assert "Retry stabilization read" in response.text
+    assert "View affected courses" in response.text
+    assert "Export drift report" in response.text
+    assert "Operation phase" in response.text
+    assert "Safety revalidation" in response.text
+    assert "Confirm and execute" not in response.text
+
+    retried = client.post(
+        f"/classroom/imports/manifest/{manifest_id}/retry-stabilization"
+    )
+    assert retried.status_code == 200
+    assert "Live reads are now stable" in retried.text
+    assert any(call[0] == "retry_stabilization_read" for call in service.calls)
+
+    exported = client.get(
+        f"/classroom/imports/manifest/{manifest_id}/drift-report"
+    )
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("application/json")
+    assert "attachment;" in exported.headers["content-disposition"]
+    assert exported.json()["drift"] == [
+        {
+            "category": "metadata",
+            "course": "Section_101",
+            "field": "name",
+            "approved": "Algebra",
+            "current": "Algebra I",
+        }
+    ]
+
+
 def test_thresholds_validate_numbers_and_save_profile():
     client, service = _client()
     actions = (
@@ -1087,6 +1146,7 @@ def test_student_gate_requires_manifest_and_typed_open_confirmation():
             "manifest_id": "manifest-1",
             "manifest_hash": manifest_hash,
             "release_at": datetime.now(timezone.utc).isoformat(),
+            "confirmation": "ARM",
         },
     )
     assert "now ARMED" in armed.text

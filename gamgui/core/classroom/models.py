@@ -189,6 +189,12 @@ class CourseParticipant:
     def label(self) -> str:
         return self.full_name or self.email or self.user_id
 
+    @property
+    def identity_resolved(self) -> bool:
+        """Whether this row identifies a person rather than only a course."""
+
+        return bool(self.email or self.user_id or self.full_name)
+
 
 @dataclass(frozen=True)
 class CourseRosterSnapshot(Sequence[CourseParticipant]):

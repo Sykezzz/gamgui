@@ -35,6 +35,8 @@ from tests.test_oneroster_helpers import valid_files, zip_bytes
 
 
 class FakeClassroom:
+    oneroster_stabilization_delays = (0.0, 0.0)
+
     def __init__(self) -> None:
         self.users = {
             "teacher@example.org": GAMUser(
@@ -262,6 +264,261 @@ def _claim_for_executor(
     )
 
 
+def test_execution_batches_persist_exact_membership_and_progress(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction("a-1", "student_add", "Section_101", "one@example.org"),
+            ImportAction("a-2", "student_add", "Section_101", "two@example.org"),
+        ),
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+        now=100.0,
+    )
+
+    batch = service.store.prepare_execution_batch(
+        run.id,
+        manifest.id,
+        manifest.actions,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+        now=101.0,
+    )
+    started = service.store.mark_execution_batch_started(batch.id, now=102.0)
+
+    assert started.status == "running"
+    assert started.action_ids == ("a-1", "a-2")
+    with sqlite3.connect(service.store.state_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT action_id, ordinal FROM execution_batch_actions
+            WHERE batch_id = ? ORDER BY ordinal
+            """,
+            (batch.id,),
+        ).fetchall()
+    assert rows == [("a-1", 0), ("a-2", 1)]
+    progress = service.store.get_execution_progress(manifest.id, now=112.0)
+    assert progress.run is not None
+    assert progress.run.current_batch_sequence == 1
+    assert progress.pending == 2
+    assert progress.percent == 0
+    assert progress.heartbeat_age_seconds == 10
+
+
+@pytest.mark.asyncio
+async def test_dead_durable_batch_requires_reconciliation_instead_of_blind_retry(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction("a-1", "student_add", "Section_101", "one@example.org"),
+        ),
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    service.store.confirm_manifest(manifest.id, manifest.import_id)
+    service.store.claim_manifest(
+        manifest.id,
+        owner_id=executor._operation_owner,
+        owner_pid=999_999_999,
+        owner_identity="definitely-not-this-process",
+    )
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    batch = service.store.prepare_execution_batch(
+        run.id,
+        manifest.id,
+        manifest.actions,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    service.store.mark_execution_batch_started(batch.id)
+
+    reopened = OneRosterService("example.org", tmp_path / "component")
+
+    recovered = reopened.get_manifest_header(manifest.id)
+    progress = reopened.get_execution_progress(manifest.id)
+    assert recovered.status == "recovery_required"
+    assert recovered.error == "OR-RECOVERY-REQUIRED"
+    assert progress.run is not None
+    assert progress.run.status == "recovery_required"
+    with sqlite3.connect(reopened.store.state_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM execution_batches WHERE id = ?",
+            (batch.id,),
+        ).fetchone()[0]
+    assert status == "reconciling"
+
+    connector = FakeClassroom()
+    detail = connector.add_course("Section_101", owner="teacher@example.org")
+    connector.students[detail.id].add("one@example.org")
+    summary = await reopened.reconcile_interrupted_manifest(
+        connector,
+        manifest.id,
+    )
+
+    assert summary.applied == 1
+    assert summary.manifest.status == "paused"
+    assert reopened.get_manifest(manifest.id).actions[0].status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_closed_student_gate_rejects_before_live_planning(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction(
+                "a-1",
+                "student_add",
+                "Section_101",
+                "student@example.org",
+            ),
+        ),
+    )
+    service.store.confirm_manifest(manifest.id, import_id)
+    service.finish_manifest(manifest.id, status="awaiting_students")
+
+    with pytest.raises(OneRosterError) as blocked:
+        await service.execute_manifest(connector, manifest.id)
+
+    assert blocked.value.code == "OR-STUDENT-GATE-CLOSED"
+    assert connector.directory_reads == []
+    assert connector.batches == []
+    assert service.get_manifest_header(manifest.id).status == "awaiting_students"
+
+
+@pytest.mark.asyncio
+async def test_pause_request_stops_only_after_current_batch_is_verified(tmp_path: Path):
+    class BlockingClassroom(FakeClassroom):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run_classroom_batch(self, commands, *, max_commands=50):
+            self.entered.set()
+            await self.release.wait()
+            await super().run_classroom_batch(commands, max_commands=max_commands)
+
+    service, import_id = _ready_service(tmp_path)
+    actions = tuple(
+        ImportAction(
+            id=f"create-{index}",
+            kind="course_create",
+            subject=f"Section_{index}",
+            target="teacher@example.org",
+            after=json.dumps(
+                {
+                    "alias": f"Section_{index}",
+                    "name": f"Course {index}",
+                    "owner_email": "teacher@example.org",
+                    "room": "",
+                    "section": "",
+                },
+                sort_keys=True,
+            ),
+        )
+        for index in range(75)
+    )
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=actions,
+        limited_import=True,
+    )
+    connector = BlockingClassroom()
+    executor = OneRosterExecutor(service.store, connector)
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="course_create",
+        owner_id=executor._operation_owner,
+    )
+
+    task = asyncio.create_task(
+        executor._apply(
+            manifest.id,
+            owner_ids={"teacher@example.org": "teacher-id"},
+            run_id=run.id,
+        )
+    )
+    await connector.entered.wait()
+    service.request_execution_pause(manifest.id)
+    connector.release.set()
+    applied, failed, skipped = await task
+
+    assert (applied, failed, skipped) == (50, 0, 0)
+    assert len(connector.batches) == 1
+    assert service.store.pending_action_summary(manifest.id)["total"] == 25
+
+
+@pytest.mark.asyncio
+async def test_final_alias_guard_recognizes_matching_course_without_duplicate_create(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = BulkExecutionClassroom()
+    connector.add_course(
+        "Section_101",
+        owner="teacher@example.org",
+        state="ACTIVE",
+    )
+    action = ImportAction(
+        id="create-1",
+        kind="course_create",
+        subject="Section_101",
+        target="teacher@example.org",
+        after=json.dumps(
+            {
+                "alias": "Section_101",
+                "name": "Algebra I – P1 (2026-27)",
+                "owner_email": "teacher@example.org",
+                "room": "101",
+                "section": "P1",
+            },
+            sort_keys=True,
+        ),
+    )
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(action,),
+        limited_import=True,
+    )
+    executor = OneRosterExecutor(service.store, connector)
+    _claim_for_executor(service, manifest, executor)
+
+    applied, failed, skipped = await executor._apply(
+        manifest.id,
+        (action,),
+        {"teacher@example.org": "teacher-id"},
+    )
+
+    assert (applied, failed, skipped) == (1, 0, 0)
+    assert connector.batches == []
+    assert service.get_manifest(manifest.id).actions[0].status == "applied"
+
+
 @pytest.mark.asyncio
 async def test_executor_refuses_gam_when_exact_manifest_claim_is_missing(
     tmp_path: Path,
@@ -474,10 +731,10 @@ async def test_execution_reuses_preflight_owner_ids_without_second_directory_exp
     )
 
     assert prepared.awaiting_students
-    # One export builds the preview, one validates before apply, and one binds
-    # student release to the post-teacher-preparation live state. Batch
-    # application/verification itself still reuses each preflight's owner IDs.
-    assert connector.directory_exports == 3
+    # One export builds the preview, one validates before apply, and two
+    # consecutive matching observations stabilize post-preparation live state.
+    # Batch application/verification itself still reuses preflight owner IDs.
+    assert connector.directory_exports == 4
 
 
 @pytest.mark.asyncio
@@ -824,8 +1081,15 @@ async def test_alias_rebind_after_teacher_prep_holds_student_release(
 
     assert stale.value.code == "OR-MANIFEST-DRIFT"
     gate = service.get_gate()
-    assert gate.state is GateState.CLOSED
+    assert gate.state is GateState.HELD
     assert gate.hold_code == "OR-GATE-DRIFT"
+    report = service.get_manifest_header(prepared.manifest.id).drift_report
+    assert any(
+        row["course"] == "Section_101"
+        and row["field"] == "id"
+        and row["category"] == "course identity changed"
+        for row in report
+    )
     assert connector.batches
 
 
@@ -1359,6 +1623,67 @@ async def test_connector_bulk_rosters_assign_role_without_trusting_output(tmp_pa
         ("teacher@example.org", "teachers"),
         ("student@example.org", "students"),
     }
+
+
+@pytest.mark.asyncio
+async def test_single_course_roster_decodes_nested_formatjson_rows(tmp_path: Path):
+    class Runner:
+        timeout = 120.0
+
+        async def run_authenticated(self, _domain, _argv, **_kwargs):
+            return json.dumps(
+                [
+                    {
+                        "courseId": "123",
+                        "JSON-teachers": json.dumps(
+                            [
+                                {
+                                    "profile": {
+                                        "id": "teacher-id",
+                                        "emailAddress": "teacher@example.org",
+                                    }
+                                }
+                            ]
+                        ),
+                        "JSON-students": "[]",
+                    }
+                ]
+            )
+
+    connector = GAMConnector(
+        Runner(),  # type: ignore[arg-type]
+        "example.org",
+        AuditLog(tmp_path / "audit.jsonl"),
+    )
+
+    participants = await connector.list_course_participants("123", "teachers")
+
+    assert [(item.email, item.user_id, item.role) for item in participants] == [
+        ("teacher@example.org", "teacher-id", "teachers")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_course_roster_preserves_course_only_row_as_unresolved_evidence(
+    tmp_path: Path,
+):
+    class Runner:
+        timeout = 120.0
+
+        async def run_authenticated(self, _domain, _argv, **_kwargs):
+            return '[{"courseId":"123","name":"Algebra"}]'
+
+    connector = GAMConnector(
+        Runner(),  # type: ignore[arg-type]
+        "example.org",
+        AuditLog(tmp_path / "audit.jsonl"),
+    )
+
+    participants = await connector.list_course_participants("123", "teachers")
+
+    assert len(participants) == 1
+    assert participants[0].label == ""
+    assert not participants[0].identity_resolved
 
 
 @pytest.mark.asyncio

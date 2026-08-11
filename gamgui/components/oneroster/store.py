@@ -34,6 +34,9 @@ from .models import (
     ClassroomImportManifest,
     DEFAULT_COURSE_NAME_TEMPLATE,
     DashboardStatus,
+    ExecutionBatch,
+    ExecutionProgress,
+    ExecutionRun,
     GateState,
     ImportAction,
     ImportIssue,
@@ -146,6 +149,10 @@ class OneRosterStore:
                 SET source_sha256 = ?, state = ?, package_mode = ?,
                     selected_session_id = ?, counts_json = ?, issue_count = ?,
                     blocking_issue_count = ?, scope_date = ?,
+                    initial_scope_date = CASE
+                        WHEN initial_scope_date = '' THEN ?
+                        ELSE initial_scope_date
+                    END,
                     school_year_id = ?, school_year_title = ?
                 WHERE domain = ? AND id = ?
                 """,
@@ -157,6 +164,7 @@ class OneRosterStore:
                     json.dumps(counts.to_dict(), sort_keys=True),
                     int(issue_count),
                     int(blocking_issue_count),
+                    scope["scope_date"],
                     scope["scope_date"],
                     scope["school_year_id"],
                     scope["school_year_title"],
@@ -203,6 +211,7 @@ class OneRosterStore:
                 blocking_issue_count=snapshot.blocking_issue_count,
                 course_name_template=snapshot.course_name_template,
                 scope_date=snapshot.scope_date,
+                initial_scope_date=snapshot.initial_scope_date,
                 school_year_id=snapshot.school_year_id,
                 school_year_title=snapshot.school_year_title,
             )
@@ -774,6 +783,7 @@ class OneRosterStore:
         threshold_evidence: Optional[Mapping[str, Any]] = None,
         exclusions: Sequence[Any] = (),
         pilot_evidence: Optional[Mapping[str, Any]] = None,
+        live_evidence: Optional[Mapping[str, Any]] = None,
     ) -> ClassroomImportManifest:
         snapshot = self.get_import(import_id)
         if not snapshot.ready_for_apply:
@@ -788,6 +798,7 @@ class OneRosterStore:
         threshold_record = _bounded_json_mapping(threshold_evidence or {})
         exclusion_records = tuple(_issue_record(item) for item in exclusions)
         pilot_record = _bounded_json_mapping(pilot_evidence or {})
+        live_record = _bounded_live_evidence(live_evidence or {})
         manifest_id = secrets.token_hex(16)
         actions_hash, action_count = action_sequence_hash(selected_actions)
         basis = {
@@ -801,6 +812,7 @@ class OneRosterStore:
             "threshold_evidence": threshold_record,
             "exclusions": exclusion_records,
             "pilot_evidence": pilot_record,
+            "live_evidence": live_record,
             "plan_kind": normalized_kind,
             "actions_hash": actions_hash,
             "action_count": action_count,
@@ -815,8 +827,9 @@ class OneRosterStore:
                         id, domain, import_id, source_hash, config_hash, live_hash,
                         manifest_hash, threshold_evaluation_hash, status, created_at, error,
                         plan_kind, confirmed_at, threshold_evidence_json,
-                        exclusions_json, pilot_evidence_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, '', ?, 0, ?, ?, ?)
+                        exclusions_json, pilot_evidence_json, live_evidence_json,
+                        drift_report_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, '', ?, 0, ?, ?, ?, ?, '[]')
                     """,
                     (
                         manifest_id,
@@ -832,6 +845,7 @@ class OneRosterStore:
                         json.dumps(threshold_record, sort_keys=True, separators=(",", ":")),
                         json.dumps(exclusion_records, sort_keys=True, separators=(",", ":")),
                         json.dumps(pilot_record, sort_keys=True, separators=(",", ":")),
+                        json.dumps(live_record, sort_keys=True, separators=(",", ":")),
                     ),
                 )
                 conn.executemany(
@@ -858,6 +872,40 @@ class OneRosterStore:
             raise ValueError("Manifest action IDs must be unique.") from exc
         header = self.get_manifest_header(manifest_id)
         return replace(header, actions=tuple(selected_actions))
+
+    def record_manifest_drift(
+        self,
+        manifest_id: str,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> ClassroomImportManifest:
+        """Persist a bounded, privacy-safe field report for stale approval UI."""
+
+        bounded = []
+        for raw in rows[:100]:
+            bounded.append(
+                {
+                    "category": str(raw.get("category", "live state changed"))[:64],
+                    "course": str(raw.get("course", ""))[:512],
+                    "field": str(raw.get("field", ""))[:128],
+                    "approved": str(raw.get("approved", ""))[:2000],
+                    "current": str(raw.get("current", ""))[:2000],
+                }
+            )
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE manifests SET drift_report_json = ?
+                WHERE domain = ? AND id = ?
+                """,
+                (
+                    json.dumps(bounded, sort_keys=True, separators=(",", ":")),
+                    self.domain,
+                    manifest_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise KeyError("OneRoster import manifest not found.")
+        return self.get_manifest_header(manifest_id)
 
     def confirm_manifest(
         self,
@@ -896,6 +944,8 @@ class OneRosterStore:
         manifest_id: str,
         *,
         allow_awaiting_students: bool = False,
+        allow_paused: bool = False,
+        allow_recovery: bool = False,
         owner_id: str = "",
         owner_pid: Optional[int] = None,
         owner_identity: Optional[str] = None,
@@ -907,7 +957,14 @@ class OneRosterStore:
             if owner_identity is None
             else owner_identity
         )
-        allowed = ("planned", "awaiting_students") if allow_awaiting_students else ("planned",)
+        allowed_values = ["planned"]
+        if allow_awaiting_students:
+            allowed_values.append("awaiting_students")
+        if allow_paused:
+            allowed_values.append("paused")
+        if allow_recovery:
+            allowed_values.append("recovery_required")
+        allowed = tuple(allowed_values)
         placeholders = ",".join("?" for _ in allowed)
         with closing(self._conn()) as conn, conn:
             result = conn.execute(
@@ -957,13 +1014,586 @@ class OneRosterStore:
             ).fetchone()
         return row is not None
 
+    def start_execution_run(
+        self,
+        manifest_id: str,
+        *,
+        phase: str,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        """Create a durable attempt after the caller has claimed the manifest."""
+
+        _validate_id(manifest_id)
+        owner = owner_id.strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        run_id = secrets.token_hex(16)
+        with closing(self._conn()) as conn, conn:
+            manifest = conn.execute(
+                """
+                SELECT 1 FROM manifests
+                WHERE domain = ? AND id = ? AND status = 'running'
+                  AND run_owner = ?
+                """,
+                (self.domain, manifest_id, owner),
+            ).fetchone()
+            if manifest is None:
+                raise PermissionError(
+                    "The OneRoster manifest lease is owned by another executor."
+                )
+            active = conn.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE domain = ? AND manifest_id = ?
+                  AND status IN ('running', 'pause_requested', 'recovery_required')
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            if active is not None:
+                if str(active["status"]) == "recovery_required":
+                    raise OneRosterError(
+                        "OR-RECOVERY-REQUIRED",
+                        "The previous execution must be reconciled before it can resume.",
+                    )
+                return _execution_run_from_row(active)
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0) + 1 AS attempt
+                FROM execution_runs WHERE domain = ? AND manifest_id = ?
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            attempt = int(row["attempt"] or 1)
+            conn.execute(
+                """
+                INSERT INTO execution_runs (
+                    id, manifest_id, domain, status, phase, started_at,
+                    updated_at, last_heartbeat_at, current_batch_sequence,
+                    stop_requested, attempt_number, last_error_code
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 0, 0, ?, '')
+                """,
+                (
+                    run_id,
+                    manifest_id,
+                    self.domain,
+                    str(phase or "preflight"),
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    attempt,
+                ),
+            )
+            created = conn.execute(
+                "SELECT * FROM execution_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        assert created is not None
+        return _execution_run_from_row(created)
+
+    def heartbeat_execution_run(
+        self,
+        run_id: str,
+        *,
+        phase: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_runs
+                SET phase = COALESCE(?, phase), updated_at = ?, last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                  AND status IN ('running', 'pause_requested')
+                """,
+                (phase, timestamp, timestamp, run_id, self.domain),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-EXECUTION-RUN-INACTIVE",
+                    "The execution run is no longer active.",
+                )
+            row = conn.execute(
+                "SELECT * FROM execution_runs WHERE id = ? AND domain = ?",
+                (run_id, self.domain),
+            ).fetchone()
+        assert row is not None
+        return _execution_run_from_row(row)
+
+    def claim_execution_recovery(
+        self,
+        manifest_id: str,
+        *,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        """Attach a new manifest lease to the prior run that needs reconciliation."""
+
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            manifest = conn.execute(
+                """
+                SELECT 1 FROM manifests WHERE domain = ? AND id = ?
+                  AND status = 'running' AND run_owner = ?
+                """,
+                (self.domain, manifest_id, owner_id),
+            ).fetchone()
+            if manifest is None:
+                raise PermissionError("The recovery worker does not own this manifest.")
+            result = conn.execute(
+                """
+                UPDATE execution_runs
+                SET status = 'running', phase = 'reconciliation',
+                    stop_requested = 0, updated_at = ?, last_heartbeat_at = ?
+                WHERE domain = ? AND manifest_id = ?
+                  AND status = 'recovery_required'
+                """,
+                (timestamp, timestamp, self.domain, manifest_id),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-RECOVERY-NOT-AVAILABLE",
+                    "No interrupted durable batch is awaiting reconciliation.",
+                )
+            row = conn.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE domain = ? AND manifest_id = ? AND status = 'running'
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+        assert row is not None
+        return _execution_run_from_row(row)
+
+    def get_reconciling_batches(
+        self,
+        manifest_id: str,
+    ) -> tuple[ExecutionBatch, ...]:
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT b.* FROM execution_batches AS b
+                JOIN execution_runs AS r ON r.id = b.run_id
+                WHERE r.domain = ? AND b.manifest_id = ?
+                  AND b.status = 'reconciling'
+                ORDER BY b.sequence_number
+                """,
+                (self.domain, manifest_id),
+            ).fetchall()
+            result = []
+            for row in rows:
+                action_rows = conn.execute(
+                    """
+                    SELECT action_id FROM execution_batch_actions
+                    WHERE batch_id = ? ORDER BY ordinal
+                    """,
+                    (row["id"],),
+                ).fetchall()
+                result.append(
+                    _execution_batch_from_row(
+                        row,
+                        tuple(str(item["action_id"]) for item in action_rows),
+                    )
+                )
+        return tuple(result)
+
+    def get_manifest_actions_by_id(
+        self,
+        manifest_id: str,
+        action_ids: Sequence[str],
+    ) -> tuple[ImportAction, ...]:
+        selected = tuple(dict.fromkeys(str(item) for item in action_ids if str(item)))
+        if not selected:
+            return ()
+        placeholders = ",".join("?" for _ in selected)
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM manifest_actions
+                WHERE manifest_id = ? AND action_id IN ({placeholders})
+                """,
+                (manifest_id, *selected),
+            ).fetchall()
+        by_id = {str(row["action_id"]): _action_from_row(row) for row in rows}
+        if set(by_id) != set(selected):
+            raise OneRosterError(
+                "OR-RECOVERY-EVIDENCE-MISSING",
+                "Durable batch membership no longer matches manifest actions.",
+            )
+        return tuple(by_id[action_id] for action_id in selected)
+
+    def prepare_execution_batch(
+        self,
+        run_id: str,
+        manifest_id: str,
+        actions: Sequence[ImportAction],
+        *,
+        phase: str,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Persist exact batch membership before any GAM command is attempted."""
+
+        if not actions or len(actions) > 50:
+            raise ValueError("An execution batch must contain between 1 and 50 actions.")
+        action_ids = tuple(action.id for action in actions)
+        if len(action_ids) != len(set(action_ids)):
+            raise ValueError("Execution batch action IDs must be unique.")
+        timestamp = float(now if now is not None else time.time())
+        batch_id = secrets.token_hex(16)
+        digest = canonical_hash(action_ids)
+        with closing(self._conn()) as conn, conn:
+            run = conn.execute(
+                """
+                SELECT r.*, m.run_owner, m.status AS manifest_status
+                FROM execution_runs AS r
+                JOIN manifests AS m ON m.id = r.manifest_id
+                WHERE r.id = ? AND r.domain = ? AND r.manifest_id = ?
+                """,
+                (run_id, self.domain, manifest_id),
+            ).fetchone()
+            if (
+                run is None
+                or str(run["status"]) not in {"running", "pause_requested"}
+                or str(run["manifest_status"]) != "running"
+                or str(run["run_owner"]) != owner_id
+            ):
+                raise PermissionError("The execution run does not own this manifest.")
+            placeholders = ",".join("?" for _ in action_ids)
+            rows = conn.execute(
+                f"""
+                SELECT action_id FROM manifest_actions
+                WHERE manifest_id = ? AND status = 'pending'
+                  AND action_id IN ({placeholders})
+                """,
+                (manifest_id, *action_ids),
+            ).fetchall()
+            if {str(row["action_id"]) for row in rows} != set(action_ids):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "The selected batch no longer matches pending manifest actions.",
+                )
+            sequence_row = conn.execute(
+                """
+                SELECT COALESCE(MAX(sequence_number), 0) + 1 AS sequence
+                FROM execution_batches WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            sequence = int(sequence_row["sequence"] or 1)
+            conn.execute(
+                """
+                INSERT INTO execution_batches (
+                    id, run_id, manifest_id, sequence_number, phase,
+                    action_ids_hash, action_count, status, prepared_at,
+                    started_at, completed_at, attempt_number, error_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, 0, 0, 1, '')
+                """,
+                (
+                    batch_id,
+                    run_id,
+                    manifest_id,
+                    sequence,
+                    str(phase or "apply"),
+                    digest,
+                    len(action_ids),
+                    timestamp,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO execution_batch_actions (batch_id, action_id, ordinal)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (batch_id, action_id, ordinal)
+                    for ordinal, action_id in enumerate(action_ids)
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE execution_runs
+                SET phase = ?, current_batch_sequence = ?, updated_at = ?,
+                    last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                """,
+                (phase, sequence, timestamp, timestamp, run_id, self.domain),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row, action_ids)
+
+    def mark_execution_batch_started(
+        self,
+        batch_id: str,
+        *,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = 'running', started_at = ?
+                WHERE id = ? AND status = 'prepared'
+                  AND run_id IN (SELECT id FROM execution_runs WHERE domain = ?)
+                """,
+                (timestamp, batch_id, self.domain),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-BATCH-NOT-PREPARED",
+                    "The durable execution batch is not ready to start.",
+                )
+            conn.execute(
+                """
+                UPDATE execution_runs SET updated_at = ?, last_heartbeat_at = ?
+                WHERE id = (SELECT run_id FROM execution_batches WHERE id = ?)
+                """,
+                (timestamp, timestamp, batch_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            action_rows = conn.execute(
+                """
+                SELECT action_id FROM execution_batch_actions
+                WHERE batch_id = ? ORDER BY ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+        assert row is not None
+        return _execution_batch_from_row(
+            row, tuple(str(item["action_id"]) for item in action_rows)
+        )
+
+    def finish_execution_batch(
+        self,
+        batch_id: str,
+        *,
+        status: str,
+        error_code: str = "",
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        if status not in {"completed", "failed", "reconciled"}:
+            raise ValueError("Invalid execution batch terminal status.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = ?, completed_at = ?, error_code = ?
+                WHERE id = ? AND status IN ('running', 'reconciling')
+                  AND run_id IN (SELECT id FROM execution_runs WHERE domain = ?)
+                """,
+                (status, timestamp, error_code, batch_id, self.domain),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-BATCH-NOT-ACTIVE",
+                    "The durable execution batch is no longer active.",
+                )
+            conn.execute(
+                """
+                UPDATE execution_runs SET updated_at = ?, last_heartbeat_at = ?
+                WHERE id = (SELECT run_id FROM execution_batches WHERE id = ?)
+                """,
+                (timestamp, timestamp, batch_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            action_rows = conn.execute(
+                """
+                SELECT action_id FROM execution_batch_actions
+                WHERE batch_id = ? ORDER BY ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+        assert row is not None
+        return _execution_batch_from_row(
+            row, tuple(str(item["action_id"]) for item in action_rows)
+        )
+
+    def request_execution_pause(
+        self,
+        manifest_id: str,
+        *,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        """Request a safe stop; the executor observes it only between batches."""
+
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_runs
+                SET stop_requested = 1, status = 'pause_requested', updated_at = ?
+                WHERE domain = ? AND manifest_id = ? AND status = 'running'
+                """,
+                (timestamp, self.domain, manifest_id),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-EXECUTION-NOT-RUNNING",
+                    "There is no running execution to pause.",
+                )
+            row = conn.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE domain = ? AND manifest_id = ? AND status = 'pause_requested'
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+        assert row is not None
+        return _execution_run_from_row(row)
+
+    def execution_stop_requested(self, run_id: str) -> bool:
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                """
+                SELECT stop_requested FROM execution_runs
+                WHERE id = ? AND domain = ?
+                """,
+                (run_id, self.domain),
+            ).fetchone()
+        if row is None:
+            raise KeyError("OneRoster execution run not found.")
+        return bool(row["stop_requested"])
+
+    def finish_execution_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        error_code: str = "",
+        phase: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        if status not in {
+            "completed", "failed", "paused", "recovery_required", "stale"
+        }:
+            raise ValueError("Invalid execution run terminal status.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_runs
+                SET status = ?, phase = COALESCE(?, phase), updated_at = ?,
+                    last_heartbeat_at = ?, last_error_code = ?
+                WHERE id = ? AND domain = ?
+                  AND status IN ('running', 'pause_requested', 'recovery_required')
+                """,
+                (status, phase, timestamp, timestamp, error_code, run_id, self.domain),
+            )
+            if result.rowcount != 1:
+                raise OneRosterError(
+                    "OR-EXECUTION-RUN-INACTIVE",
+                    "The execution run is no longer active.",
+                )
+            row = conn.execute(
+                "SELECT * FROM execution_runs WHERE id = ? AND domain = ?",
+                (run_id, self.domain),
+            ).fetchone()
+        assert row is not None
+        return _execution_run_from_row(row)
+
+    def get_execution_progress(
+        self,
+        manifest_id: str,
+        *,
+        now: Optional[float] = None,
+        batch_size: int = 50,
+    ) -> ExecutionProgress:
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn:
+            manifest = conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone()
+            if manifest is None:
+                raise KeyError("OneRoster import manifest not found.")
+            counts = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                    COALESCE(SUM(status = 'pending'), 0) AS pending,
+                    COALESCE(SUM(status = 'applied'), 0) AS applied,
+                    COALESCE(SUM(status = 'failed'), 0) AS failed,
+                    COALESCE(SUM(status = 'skipped'), 0) AS skipped
+                FROM manifest_actions WHERE manifest_id = ?
+                """,
+                (manifest_id,),
+            ).fetchone()
+            run_row = conn.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE domain = ? AND manifest_id = ?
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            completed_batches = 0
+            if run_row is not None:
+                batch_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(status IN ('completed','reconciled')), 0) AS count
+                    FROM execution_batches WHERE run_id = ?
+                    """,
+                    (run_row["id"],),
+                ).fetchone()
+                completed_batches = int(batch_row["count"] or 0)
+        assert counts is not None
+        total = int(counts["total"] or 0)
+        pending = int(counts["pending"] or 0)
+        applied = int(counts["applied"] or 0)
+        failed = int(counts["failed"] or 0)
+        skipped = int(counts["skipped"] or 0)
+        complete = applied + failed + skipped
+        run = _execution_run_from_row(run_row) if run_row is not None else None
+        elapsed = max(0.0, timestamp - run.started_at) if run else 0.0
+        rate = (complete * 60.0 / elapsed) if complete and elapsed > 0 else 0.0
+        eta = (pending * 60.0 / rate) if pending and rate > 0 else None
+        effective_batch_size = max(1, min(int(batch_size or 50), 50))
+        estimated_batches = (total + effective_batch_size - 1) // effective_batch_size
+        return ExecutionProgress(
+            run=run,
+            total=total,
+            pending=pending,
+            applied=applied,
+            failed=failed,
+            skipped=skipped,
+            percent=(complete * 100.0 / total) if total else 100.0,
+            completed_batches=completed_batches,
+            total_batches_estimate=estimated_batches,
+            elapsed_seconds=elapsed,
+            heartbeat_age_seconds=(
+                max(0.0, timestamp - run.last_heartbeat_at) if run else 0.0
+            ),
+            heartbeat_stale=bool(
+                run
+                and run.status in {"running", "pause_requested"}
+                and timestamp - run.last_heartbeat_at > 30.0
+            ),
+            actions_per_minute=rate,
+            eta_seconds=eta,
+        )
+
     def mark_running_interrupted(self) -> int:
         """Backward-compatible alias for definite-death lease recovery."""
 
         return self.recover_interrupted()
 
     def recover_interrupted(self) -> int:
-        """Interrupt only manifests whose exact process lease is definitely dead."""
+        """Move definitely-dead leases to reconciliation without guessing outcomes."""
 
         recovered = 0
         with closing(self._conn()) as conn, conn:
@@ -980,16 +1610,59 @@ class OneRosterStore:
                 identity = str(manifest["run_identity"] or "")
                 if not process_lease_is_dead(pid, identity):
                     continue
+                run = conn.execute(
+                    """
+                    SELECT id FROM execution_runs
+                    WHERE domain = ? AND manifest_id = ?
+                      AND status IN ('running', 'pause_requested')
+                    ORDER BY started_at DESC LIMIT 1
+                    """,
+                    (self.domain, manifest["id"]),
+                ).fetchone()
+                if run is not None:
+                    timestamp = time.time()
+                    conn.execute(
+                        """
+                        UPDATE execution_runs
+                        SET status = 'recovery_required', phase = 'reconciliation',
+                            updated_at = ?, last_error_code = 'OR-RECOVERY-REQUIRED'
+                        WHERE id = ?
+                        """,
+                        (timestamp, run["id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE execution_batches SET status = 'reconciling',
+                            error_code = 'OR-EXECUTION-INTERRUPTED'
+                        WHERE run_id = ? AND status = 'running'
+                        """,
+                        (run["id"],),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE execution_batches SET status = 'abandoned',
+                            error_code = 'OR-BATCH-NOT-STARTED'
+                        WHERE run_id = ? AND status = 'prepared'
+                        """,
+                        (run["id"],),
+                    )
+                    recovered_status = "recovery_required"
+                    recovered_error = "OR-RECOVERY-REQUIRED"
+                else:
+                    # Legacy executions have no durable batch boundary to reconcile.
+                    recovered_status = "interrupted"
+                    recovered_error = "OR-EXECUTION-INTERRUPTED"
                 result = conn.execute(
                     """
                     UPDATE manifests
-                    SET status = 'interrupted',
-                        error = 'OR-EXECUTION-INTERRUPTED',
+                    SET status = ?, error = ?,
                         run_owner = '', run_pid = 0, run_identity = ''
                     WHERE domain = ? AND id = ? AND status = 'running'
                       AND run_owner = ? AND run_pid = ? AND run_identity = ?
                     """,
                     (
+                        recovered_status,
+                        recovered_error,
                         self.domain,
                         manifest["id"],
                         str(manifest["run_owner"] or ""),
@@ -1308,6 +1981,8 @@ class OneRosterStore:
             "partial",
             "failed",
             "interrupted",
+            "paused",
+            "recovery_required",
             "stale",
             "awaiting_students",
         }:
@@ -1671,6 +2346,7 @@ class OneRosterStore:
                     course_name_template TEXT NOT NULL DEFAULT
                         '{course_title} \u2013 {class_code} ({school_year})',
                     scope_date TEXT NOT NULL DEFAULT '',
+                    initial_scope_date TEXT NOT NULL DEFAULT '',
                     school_year_id TEXT NOT NULL DEFAULT '',
                     school_year_title TEXT NOT NULL DEFAULT ''
                 );
@@ -1702,6 +2378,8 @@ class OneRosterStore:
                     threshold_evidence_json TEXT NOT NULL DEFAULT '{}',
                     exclusions_json TEXT NOT NULL DEFAULT '[]',
                     pilot_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    live_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    drift_report_json TEXT NOT NULL DEFAULT '[]',
                     prepared_live_hash TEXT NOT NULL DEFAULT '',
                     run_owner TEXT NOT NULL DEFAULT '',
                     run_pid INTEGER NOT NULL DEFAULT 0,
@@ -1716,6 +2394,54 @@ class OneRosterStore:
                 );
                 CREATE INDEX IF NOT EXISTS manifest_actions_pending_kind
                     ON manifest_actions(manifest_id, status, kind);
+                CREATE TABLE IF NOT EXISTS execution_runs (
+                    id TEXT PRIMARY KEY,
+                    manifest_id TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_heartbeat_at REAL NOT NULL,
+                    current_batch_sequence INTEGER NOT NULL DEFAULT 0,
+                    stop_requested INTEGER NOT NULL DEFAULT 0,
+                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(manifest_id) REFERENCES manifests(id) ON DELETE CASCADE
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_active_manifest
+                    ON execution_runs(manifest_id)
+                    WHERE status IN ('running', 'pause_requested', 'recovery_required');
+                CREATE INDEX IF NOT EXISTS execution_runs_manifest_time
+                    ON execution_runs(manifest_id, started_at DESC);
+                CREATE TABLE IF NOT EXISTS execution_batches (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    manifest_id TEXT NOT NULL,
+                    sequence_number INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    action_ids_hash TEXT NOT NULL,
+                    action_count INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    prepared_at REAL NOT NULL,
+                    started_at REAL NOT NULL DEFAULT 0,
+                    completed_at REAL NOT NULL DEFAULT 0,
+                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    UNIQUE(run_id, sequence_number),
+                    FOREIGN KEY(run_id) REFERENCES execution_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY(manifest_id) REFERENCES manifests(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS execution_batch_actions (
+                    batch_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY(batch_id, action_id),
+                    UNIQUE(batch_id, ordinal),
+                    FOREIGN KEY(batch_id) REFERENCES execution_batches(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS execution_batches_run_status
+                    ON execution_batches(run_id, status, sequence_number);
                 CREATE TABLE IF NOT EXISTS student_gate (
                     domain TEXT PRIMARY KEY, state TEXT NOT NULL, timezone TEXT NOT NULL,
                     manifest_id TEXT NOT NULL, manifest_hash TEXT NOT NULL,
@@ -1748,6 +2474,12 @@ class OneRosterStore:
                 conn,
                 "imports",
                 "scope_date",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                conn,
+                "imports",
+                "initial_scope_date",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
@@ -1791,6 +2523,18 @@ class OneRosterStore:
                 "manifests",
                 "pilot_evidence_json",
                 "TEXT NOT NULL DEFAULT '{}'",
+            )
+            _ensure_column(
+                conn,
+                "manifests",
+                "live_evidence_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            _ensure_column(
+                conn,
+                "manifests",
+                "drift_report_json",
+                "TEXT NOT NULL DEFAULT '[]'",
             )
             _ensure_column(
                 conn,
@@ -1840,6 +2584,44 @@ def _snapshot_conn(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def _execution_run_from_row(row: sqlite3.Row) -> ExecutionRun:
+    return ExecutionRun(
+        id=str(row["id"]),
+        manifest_id=str(row["manifest_id"]),
+        status=str(row["status"]),
+        phase=str(row["phase"]),
+        started_at=float(row["started_at"]),
+        updated_at=float(row["updated_at"]),
+        last_heartbeat_at=float(row["last_heartbeat_at"]),
+        current_batch_sequence=int(row["current_batch_sequence"] or 0),
+        stop_requested=bool(row["stop_requested"]),
+        attempt_number=int(row["attempt_number"] or 1),
+        last_error_code=str(row["last_error_code"] or ""),
+    )
+
+
+def _execution_batch_from_row(
+    row: sqlite3.Row,
+    action_ids: Sequence[str] = (),
+) -> ExecutionBatch:
+    return ExecutionBatch(
+        id=str(row["id"]),
+        run_id=str(row["run_id"]),
+        manifest_id=str(row["manifest_id"]),
+        sequence_number=int(row["sequence_number"]),
+        phase=str(row["phase"]),
+        action_ids_hash=str(row["action_ids_hash"]),
+        action_count=int(row["action_count"]),
+        status=str(row["status"]),
+        prepared_at=float(row["prepared_at"]),
+        started_at=float(row["started_at"] or 0),
+        completed_at=float(row["completed_at"] or 0),
+        attempt_number=int(row["attempt_number"] or 1),
+        error_code=str(row["error_code"] or ""),
+        action_ids=tuple(action_ids),
+    )
 
 
 def _snapshot_write_conn(path: Path) -> sqlite3.Connection:
@@ -1892,6 +2674,7 @@ def _snapshot_from_row(row: sqlite3.Row) -> OneRosterSnapshot:
             row["course_name_template"] or DEFAULT_COURSE_NAME_TEMPLATE
         ),
         scope_date=str(row["scope_date"] or ""),
+        initial_scope_date=str(row["initial_scope_date"] or ""),
         school_year_id=str(row["school_year_id"] or ""),
         school_year_title=str(row["school_year_title"] or ""),
     )
@@ -2004,6 +2787,11 @@ def _manifest_from_rows(
             for item in _json_sequence(row["exclusions_json"])
         ),
         pilot_evidence=_json_mapping(row["pilot_evidence_json"]),
+        live_evidence=_json_mapping(row["live_evidence_json"]),
+        drift_report=tuple(
+            item for item in _json_sequence(row["drift_report_json"])
+            if isinstance(item, Mapping)
+        ),
     )
 
 
@@ -2105,6 +2893,21 @@ def _bounded_json_mapping(
         raise ValueError("Manifest evidence exceeds its protected storage limit.")
     result = json.loads(encoded.decode("utf-8"))
     return dict(result) if isinstance(result, dict) else {}
+
+
+def _bounded_live_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain deterministic evidence for at most 500 affected managed courses."""
+
+    selected = {
+        str(alias)[:512]: record
+        for alias, record in sorted(value.items(), key=lambda item: str(item[0]).casefold())[:500]
+    }
+    if len(value) > len(selected):
+        selected["__truncated__"] = {
+            "total_affected_courses": len(value),
+            "retained_courses": len(selected),
+        }
+    return _bounded_json_mapping(selected, maximum_bytes=4 * 1024 * 1024)
 
 
 def _issue_record(value: Any) -> dict[str, Any]:

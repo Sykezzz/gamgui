@@ -976,10 +976,48 @@ class GAMConnector(Connector):
         stdout = await self.runner.run_authenticated(
             self.domain, GAMCommands.print_course_participants(course_id, role)
         )
-        return [
-            CourseParticipant.from_json(record, role=role)
-            for record in parse_records(stdout)
-        ]
+        participants: List[CourseParticipant] = []
+        for record in parse_records(stdout):
+            nested = "JSON-teachers" in record or "JSON-students" in record
+            if nested:
+                normalized_role = str(role or "").strip().casefold()
+                selected_roles = (
+                    ("teachers", "students")
+                    if normalized_role == "all"
+                    else (normalized_role,)
+                )
+                for selected_role in selected_roles:
+                    for member in _participant_array(
+                        record, f"JSON-{selected_role}"
+                    ):
+                        participants.append(
+                            CourseParticipant.from_json(
+                                {**member, "courseId": course_id},
+                                role=selected_role,
+                            )
+                        )
+                continue
+            parsed = CourseParticipant.from_json(
+                {**record, "courseId": record.get("courseId") or course_id},
+                role=role,
+            )
+            if (
+                not parsed.email
+                and not parsed.user_id
+                and not isinstance(record.get("profile"), dict)
+            ):
+                # GAM may emit the course itself as the only row. Its `name`
+                # is the course title, not a participant display name.
+                parsed = CourseParticipant(
+                    course_id=parsed.course_id or course_id,
+                    email="",
+                    user_id="",
+                    role=parsed.role,
+                    full_name="",
+                    raw=dict(record),
+                )
+            participants.append(parsed)
+        return participants
 
     async def list_course_participants_many(
         self,

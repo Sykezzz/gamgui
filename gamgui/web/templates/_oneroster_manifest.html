@@ -1,3 +1,5 @@
+{% set progress_view = progress if progress is defined else {} %}
+{% set gate_view = gate if gate is defined else {} %}
 <article id="oneroster-manifest-{{ manifest.id }}"
          class="rounded-xl border border-brand-gray/40 bg-paper/50 p-4"
          {% if polling %}
@@ -20,10 +22,15 @@
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div>
       <p class="eyebrow text-brand-blueink">{{ manifest.plan_kind | replace("_", " ") | title }} approval</p>
-      <h5 id="oneroster-manifest-heading-{{ manifest.id }}" class="mt-1 font-semibold text-brand-black">
-        Manifest <code class="font-mono text-xs">{{ manifest.id }}</code>
-      </h5>
-      <p class="mt-1 text-xs text-brand-blueink">Import ID <code class="font-mono">{{ manifest.import_id }}</code></p>
+      <h5 id="oneroster-manifest-heading-{{ manifest.id }}" class="mt-1 font-semibold text-brand-black">Immutable manifest</h5>
+      <div class="copy-wrap mt-2 flex flex-wrap items-center gap-2 text-xs text-brand-blueink">
+        <span>Manifest ID</span><code class="select-all break-all font-mono text-brand-black">{{ manifest.id }}</code>
+        <button type="button" onclick="copyEl(this)" class="rounded border border-brand-gray/60 px-2 py-1 font-medium focus-visible:ring-2 focus-visible:ring-brand-blue">Copy Manifest ID</button>
+      </div>
+      <div class="copy-wrap mt-2 flex flex-wrap items-center gap-2 text-xs text-brand-blueink">
+        <span>Import ID</span><code class="select-all break-all font-mono text-brand-black">{{ manifest.import_id }}</code>
+        <button type="button" onclick="copyEl(this)" class="rounded border border-brand-gray/60 px-2 py-1 font-medium focus-visible:ring-2 focus-visible:ring-brand-blue">Copy Import ID</button>
+      </div>
     </div>
     <span class="rounded-lg border border-brand-gray/50 bg-brand-white px-3 py-1.5 text-sm font-semibold text-brand-black" role="status">{{ manifest.status | replace("_", " ") | title }}</span>
   </div>
@@ -32,8 +39,37 @@
     <div><dt class="text-brand-blueink">Actions</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.action_total }}</dd></div>
     <div><dt class="text-brand-blueink">Complete</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.complete_count }}</dd></div>
     <div><dt class="text-brand-blueink">Pending</dt><dd class="font-semibold tabular-nums text-brand-black">{{ manifest.pending_count }}</dd></div>
-    <div><dt class="text-brand-blueink">Manifest hash</dt><dd class="truncate font-mono text-xs text-brand-black" title="{{ manifest.manifest_hash }}">{{ manifest.manifest_hash }}</dd></div>
+    <div><dt class="text-brand-blueink">Student gate</dt><dd class="font-semibold text-brand-black">{{ gate_view.state | default("CLOSED", true) }}{% if gate_view.manifest_id %}<span class="mt-0.5 block break-all font-mono text-xs font-normal text-brand-blueink">for {{ gate_view.manifest_id }}</span>{% endif %}</dd></div>
+    <div class="copy-wrap sm:col-span-2 lg:col-span-1">
+      <dt class="text-brand-blueink">Manifest hash</dt>
+      <dd class="mt-1 flex items-start gap-2">
+        <code class="min-w-0 break-all font-mono text-xs text-brand-black">{{ manifest.manifest_hash }}</code>
+        <button type="button" onclick="copyEl(this)" class="shrink-0 rounded border border-brand-gray/60 px-2 py-1 text-xs font-medium text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Copy Manifest Hash</button>
+      </dd>
+    </div>
   </dl>
+
+  {% if progress_view.run %}
+  <section class="mt-4 rounded-lg border border-brand-gray/40 bg-brand-white p-3" aria-labelledby="execution-progress-{{ manifest.id }}">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h6 id="execution-progress-{{ manifest.id }}" class="text-sm font-semibold text-brand-black">Execution progress</h6>
+      <span class="text-xs font-medium text-brand-blueink">{{ progress_view.run.phase | replace("_", " ") | title }}</span>
+    </div>
+    <progress class="mt-3 h-3 w-full accent-brand-blue" max="100" value="{{ progress_view.percent }}">{{ progress_view.percent | round }}%</progress>
+    <p class="mt-2 text-sm tabular-nums text-brand-blueink">
+      {{ progress_view.applied }} applied · {{ progress_view.failed }} failed · {{ progress_view.skipped }} skipped · {{ progress_view.pending }} pending
+    </p>
+    <dl class="mt-2 grid gap-2 text-xs text-brand-blueink sm:grid-cols-3">
+      <div><dt>Current batch</dt><dd class="font-semibold tabular-nums text-brand-black">{{ progress_view.run.current_batch_sequence }} / about {{ progress_view.total_batches_estimate }}</dd></div>
+      <div><dt>Rate</dt><dd class="font-semibold tabular-nums text-brand-black">{{ progress_view.actions_per_minute | round(1) }} actions/min</dd></div>
+      <div><dt>Elapsed</dt><dd class="font-semibold tabular-nums text-brand-black">{{ (progress_view.elapsed_seconds / 60) | round(1) }} min</dd></div>
+      <div><dt>Last heartbeat</dt><dd class="font-semibold tabular-nums text-brand-black">{{ progress_view.heartbeat_age_seconds | round }}s ago</dd></div>
+      {% if progress_view.completed_batches >= 2 and progress_view.eta_seconds is not none %}<div><dt>Estimated remaining</dt><dd class="font-semibold tabular-nums text-brand-black">{{ (progress_view.eta_seconds / 60) | round }} min</dd></div>{% endif %}
+    </dl>
+    {% if progress_view.run.status == "pause_requested" %}<p class="mt-2 text-xs font-medium text-amber-900" role="status">Pause requested; the active batch is being verified.</p>{% endif %}
+    {% if progress_view.heartbeat_stale %}<p class="mt-2 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs font-semibold text-red-900" role="alert">Execution heartbeat is stale. Do not start another run; reload and use recovery if the process lease has ended.</p>{% endif %}
+  </section>
+  {% endif %}
 
   <details class="mt-3 rounded-lg border border-brand-gray/30 bg-brand-white p-3">
     <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Approval evidence</summary>
@@ -53,11 +89,37 @@
   </details>
 
   {% if manifest.error %}
-  <p class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="alert">Result code: <code class="font-mono">{{ manifest.error }}</code></p>
+  <div class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="alert">
+    <p>Result code: <code class="font-mono">{{ manifest.error }}</code></p>
+    <dl class="mt-2 grid gap-2 text-xs sm:grid-cols-3">
+      <div><dt class="font-semibold">Operation phase</dt><dd>{{ manifest.error_phase }}</dd></div>
+      <div><dt class="font-semibold">Mutation status</dt><dd>{{ manifest.mutation_status }}</dd></div>
+      <div><dt class="font-semibold">Safe next action</dt><dd>{{ manifest.safe_next_action }}</dd></div>
+    </dl>
+  </div>
+  {% endif %}
+  {% if manifest.drift_report %}
+  <section class="mt-3 rounded-lg border border-red-300 bg-red-50 p-3" aria-labelledby="drift-heading-{{ manifest.id }}">
+    <h6 id="drift-heading-{{ manifest.id }}" class="text-sm font-semibold text-red-950">Manifest drift detected</h6>
+    <div class="mt-2 flex flex-wrap gap-2">
+      <a href="#drift-heading-{{ manifest.id }}" class="rounded border border-red-500 bg-white px-2 py-1 text-xs font-medium text-red-950 focus-visible:ring-2 focus-visible:ring-red-500">View affected courses</a>
+      <a href="/classroom/imports/manifest/{{ manifest.id }}/drift-report" class="rounded border border-red-500 bg-white px-2 py-1 text-xs font-medium text-red-950 focus-visible:ring-2 focus-visible:ring-red-500">Export drift report</a>
+    </div>
+    <div class="mt-2 overflow-x-auto">
+      <table class="min-w-full text-left text-xs">
+        <thead><tr><th class="px-2 py-1" scope="col">Category</th><th class="px-2 py-1" scope="col">Course</th><th class="px-2 py-1" scope="col">Field</th><th class="px-2 py-1" scope="col">Approved</th><th class="px-2 py-1" scope="col">Current</th></tr></thead>
+        <tbody>
+          {% for row in manifest.drift_report %}
+          <tr class="border-t border-red-200"><td class="px-2 py-1">{{ row.category }}</td><td class="break-all px-2 py-1 font-mono">{{ row.course }}</td><td class="px-2 py-1">{{ row.field }}</td><td class="max-w-64 break-all px-2 py-1 font-mono">{{ row.approved }}</td><td class="max-w-64 break-all px-2 py-1 font-mono">{{ row.current }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
   {% endif %}
 
   <div class="mt-4 overflow-x-auto rounded-lg border border-brand-gray/30 bg-brand-white">
-    <table class="min-w-full text-left text-sm">
+    <table class="oneroster-action-table min-w-full text-left text-sm">
       <caption class="sr-only">{{ manifest.plan_kind | title }} manifest actions</caption>
       <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">
         <tr><th class="px-3 py-2" scope="col">Action</th><th class="px-3 py-2" scope="col">Subject</th><th class="px-3 py-2" scope="col">Target</th><th class="px-3 py-2" scope="col">Before</th><th class="px-3 py-2" scope="col">After</th><th class="px-3 py-2" scope="col">Status</th><th class="px-3 py-2" scope="col">Result detail</th></tr>
@@ -65,13 +127,13 @@
       <tbody class="divide-y divide-brand-gray/20">
         {% for action in manifest.actions %}
         <tr>
-          <td class="px-3 py-2 text-brand-black">{{ action.kind | replace("_", " ") | title }}</td>
-          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.subject }}</td>
-          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.target }}</td>
-          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.before }}</td>
-          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.after }}</td>
-          <td class="px-3 py-2 text-brand-blueink">{{ action.status | title }}</td>
-          <td class="break-all px-3 py-2 text-brand-blueink">{{ action.detail }}</td>
+          <td data-label="Action" class="px-3 py-2 text-brand-black">{{ action.kind | replace("_", " ") | title }}</td>
+          <td data-label="Subject" class="break-all px-3 py-2 text-brand-blueink">{{ action.subject }}</td>
+          <td data-label="Target" class="break-all px-3 py-2 text-brand-blueink">{{ action.target }}</td>
+          <td data-label="Before" class="break-all px-3 py-2 text-brand-blueink">{{ action.before }}</td>
+          <td data-label="After" class="break-all px-3 py-2 text-brand-blueink">{{ action.after }}</td>
+          <td data-label="Status" class="px-3 py-2 text-brand-blueink">{{ action.status | title }}</td>
+          <td data-label="Result" class="break-all px-3 py-2 text-brand-blueink">{{ action.detail }}</td>
         </tr>
         {% else %}
         <tr><td colspan="7" class="px-3 py-5 text-center text-brand-blueink">This manifest contains no actions.</td></tr>
@@ -101,22 +163,74 @@
     {% endif %}
   </div>
 
-  {% if manifest.status in ("planned", "awaiting_students") %}
+  {% set student_gate_open = gate_view.state == "OPEN" and gate_view.manifest_id == manifest.id and gate_view.manifest_hash == manifest.manifest_hash %}
+  {% if manifest.status in ("planned", "paused") or (manifest.status == "awaiting_students" and student_gate_open) %}
   <form class="mt-4 rounded-lg border border-amber-300 bg-brand-white p-3"
         hx-post="/classroom/imports/manifest/{{ manifest.id }}/execute"
         hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML">
     <p class="text-sm font-semibold text-brand-black">
       {% if manifest.plan_kind == "archive" %}Approve managed-course archives
       {% elif manifest.plan_kind == "ownership" %}Approve course ownership transfers
-      {% elif manifest.status == "awaiting_students" %}Run approved student membership changes
+      {% elif manifest.status == "awaiting_students" %}Revalidate and start student import
+      {% elif manifest.status == "paused" %}Resume verified remaining work
       {% else %}Approve course and roster work{% endif %}
     </p>
-    <p class="mt-1 text-xs text-brand-blueink">Live state and all hashes are revalidated before GAM runs. Interrupted or changed work must be replanned.</p>
+    <p class="mt-1 text-xs text-brand-blueink">Live state and all hashes are revalidated before GAM runs. Changed work is stopped for review.</p>
     <label class="mt-3 block text-sm font-medium text-brand-black">Type import ID <span class="font-mono">{{ manifest.import_id }}</span>
       <input name="typed_import_id" required autocomplete="off"
              class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 font-mono text-sm focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-500/30" />
     </label>
-    <button type="submit" class="mt-3 rounded-lg bg-amber-800 px-3 py-2 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">Confirm and execute</button>
+    <button type="submit" class="mt-3 rounded-lg bg-amber-800 px-3 py-2 text-sm font-medium text-brand-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500">{% if manifest.status == "paused" %}Confirm and resume{% else %}Confirm and execute{% endif %}</button>
   </form>
+  {% elif manifest.status == "awaiting_students" %}
+  <div class="mt-4 rounded-lg border border-brand-blue/50 bg-brand-white p-3">
+    <p class="text-sm font-semibold text-brand-black">Student changes are locked</p>
+    <p class="mt-1 text-xs text-brand-blueink">Arm and revalidate the student gate for this exact manifest before the student import can start.</p>
+    <a href="/classroom/imports#student-gate" class="mt-3 inline-flex rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Review student gate</a>
+    <form class="mt-4 space-y-3 border-t border-brand-gray/30 pt-3" hx-post="/classroom/imports/gate" hx-target="#oneroster-gate" hx-swap="innerHTML">
+      <input type="hidden" name="target_state" value="ARMED" />
+      <input type="hidden" name="manifest_id" value="{{ manifest.id }}" />
+      <input type="hidden" name="manifest_hash" value="{{ manifest.manifest_hash }}" />
+      <p class="text-xs text-brand-blueink">Arm this exact manifest with {{ manifest.student_action_count }} approved student change{{ "" if manifest.student_action_count == 1 else "s" }}. IDs and hashes are carried by the application.</p>
+      <label class="block text-sm font-medium text-brand-black">Scheduled release time (America/Chicago)
+        <input type="datetime-local" name="release_at" required class="mt-1 w-full rounded-lg border border-brand-gray/60 px-3 py-2 text-sm focus:border-brand-blue focus:ring-2 focus:ring-brand-blue/30" />
+      </label>
+      <label class="block text-sm font-medium text-brand-black">Type <span class="font-mono">ARM</span>
+        <input name="confirmation" required autocomplete="off" class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 text-sm focus:border-amber-600 focus:ring-2 focus:ring-amber-500/30" />
+      </label>
+      <button type="submit" class="rounded-lg border border-brand-blue px-3 py-2 text-sm font-medium text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Arm this manifest</button>
+    </form>
+  </div>
+  {% elif manifest.status == "running" %}
+  <form class="mt-4" hx-post="/classroom/imports/manifest/{{ manifest.id }}/pause" hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML">
+    <button type="submit" class="rounded-lg border border-amber-700 px-3 py-2 text-sm font-medium text-amber-900 focus-visible:ring-2 focus-visible:ring-amber-500">Stop safely after current batch</button>
+  </form>
+  {% elif manifest.status == "recovery_required" %}
+  <div class="mt-4 rounded-lg border border-red-300 bg-red-50 p-3" role="alert">
+    <p class="text-sm font-semibold text-red-950">Recovery reconciliation required</p>
+    <p class="mt-1 text-xs text-red-900">The last process ended during a durable batch. No commands will be resent until live state is reconciled.</p>
+    <form class="mt-3" hx-post="/classroom/imports/manifest/{{ manifest.id }}/recover" hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML">
+      <button type="submit" class="rounded-lg border border-red-700 bg-white px-3 py-2 text-sm font-medium text-red-900 focus-visible:ring-2 focus-visible:ring-red-500">Reconcile interrupted batch</button>
+    </form>
+  </div>
+  {% elif manifest.status == "stale" %}
+  <div class="mt-4 rounded-lg border border-amber-400 bg-amber-50 p-3">
+    <p class="text-sm font-semibold text-amber-950">Approval stale — rebuild required</p>
+    <p class="mt-1 text-xs text-amber-900">This manifest remains read-only for audit. Build a fresh plan from retained import <code class="font-mono">{{ manifest.import_id }}</code>; exact aliases and live reads will remove work already applied.</p>
+    {% if manifest.error == "OR-LIVE-NOT-STABLE" %}
+    <form class="mt-3" hx-post="/classroom/imports/manifest/{{ manifest.id }}/retry-stabilization" hx-target="#oneroster-manifest-{{ manifest.id }}" hx-swap="outerHTML">
+      <button type="submit" class="rounded-lg border border-amber-800 bg-white px-3 py-2 text-sm font-medium text-amber-950 focus-visible:ring-2 focus-visible:ring-amber-600">Retry stabilization read</button>
+    </form>
+    {% endif %}
+    <form class="mt-3 space-y-3" hx-post="/classroom/imports/import/{{ manifest.import_id }}/plan" hx-target="#oneroster-workspace" hx-swap="innerHTML">
+      <label class="block text-sm font-medium text-brand-black">Rebuild evidence note
+        <textarea name="pilot_evidence" required minlength="8" maxlength="1000" rows="2" class="mt-1 w-full rounded-lg border border-amber-400 px-3 py-2 text-sm" placeholder="Reviewed stale approval and current live state."></textarea>
+      </label>
+      <div class="flex flex-wrap gap-2">
+        <button type="submit" name="mode" value="limited" class="rounded-lg border border-amber-800 bg-white px-3 py-2 text-sm font-medium text-amber-950 focus-visible:ring-2 focus-visible:ring-amber-600">Build fresh additions-only plan</button>
+        {% if manifest.plan_kind != "limited" %}<button type="submit" name="mode" value="normal" class="rounded-lg bg-amber-800 px-3 py-2 text-sm font-medium text-white focus-visible:ring-2 focus-visible:ring-amber-500">Build fresh full plan</button>{% endif %}
+      </div>
+    </form>
+  </div>
   {% endif %}
 </article>

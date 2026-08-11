@@ -10,6 +10,14 @@
 
   {% if notice %}<div class="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800" role="status">{{ notice }}</div>{% endif %}
   {% if error %}<div class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="alert">{{ error }}</div>{% endif %}
+  {% if unresolved_member_count %}
+  <div class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="alert">
+    GAM returned {{ unresolved_member_count }} course-level row{{ "" if unresolved_member_count == 1 else "s" }} without a participant identity. {{ "It was" if unresolved_member_count == 1 else "They were" }} not shown as roster members.
+  </div>
+  {% endif %}
+  {% if owner_from_course_details %}
+  <p class="text-xs text-brand-blueink">The owner row below comes from course details; it is not independent roster-read proof.</p>
+  {% endif %}
 
   {% if members %}
   <ul class="max-h-64 divide-y divide-brand-gray/20 overflow-y-auto rounded-lg border border-brand-gray/30 bg-brand-white">
@@ -23,7 +31,7 @@
       {% set owner_email_match = course.owner_email and member.email and member.email == course.owner_email %}
       {% set is_owner = role == "teachers" and (owner_id_match or owner_email_match) %}
       {% if is_owner %}
-      <span class="shrink-0 rounded-full bg-brand-blue/10 px-2 py-0.5 text-xs font-medium text-brand-blueink">Owner</span>
+      <span class="shrink-0 rounded-full bg-brand-blue/10 px-2 py-0.5 text-xs font-medium text-brand-blueink">{% if member.raw.owner_from_course_details %}Owner · course details{% else %}Owner{% endif %}</span>
       {% elif course.roster_editable and member.email %}
       <form hx-post="/classroom/course/{{ course.id | urlencode }}/roster/remove" hx-target="#classroom-roster" hx-swap="innerHTML"
             hx-confirm="Remove {{ member.email }} from this {{ role[:-1] }} roster?">
