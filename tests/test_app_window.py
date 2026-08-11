@@ -7,8 +7,10 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 
 from gamgui.app import (
+    _BackgroundServer,
     _active_admin_jobs,
     _arguments,
     _confirm_automatic_update,
@@ -41,6 +43,16 @@ SCREENS = [
     (3840, 2160),   # large 4K external
     (2560, 1440),   # 27" external
 ]
+
+
+def test_background_server_configures_without_console_streams(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+
+    background = _BackgroundServer(FastAPI(), "127.0.0.1", 0)
+
+    assert background.server.config.log_config is None
+    assert not background.server.config.access_log
 
 
 @pytest.mark.parametrize("sw,sh", SCREENS)

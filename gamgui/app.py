@@ -71,6 +71,8 @@ class _BackgroundServer:
             host=host,
             port=port,
             log_level="warning",
+            log_config=None,
+            access_log=False,
             timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS,
         )
         self.server = uvicorn.Server(config)
