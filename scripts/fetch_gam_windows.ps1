@@ -40,7 +40,12 @@ try {
         throw "The verified archive did not contain gam.exe."
     }
     Copy-Item -Path (Join-Path $payload.FullName "*") -Destination $stage -Recurse -Force
-    Set-Content -LiteralPath (Join-Path $stage "VERSION") -Value $Tag -Encoding ascii
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $stage "VERSION"),
+        "$Tag`n",
+        $utf8NoBom
+    )
     Set-Content -LiteralPath (Join-Path $stage "SHA256") -Value "$actual  $assetName" -Encoding ascii
     $catalog = Join-Path $destination "command_catalog.json"
     if (Test-Path -LiteralPath $catalog) {
