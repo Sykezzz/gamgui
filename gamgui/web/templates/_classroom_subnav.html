@@ -1,20 +1,35 @@
-<nav class="mb-6 overflow-x-auto border-b border-brand-gray/40 pb-1"
+<nav class="classroom-subnav mb-6 w-full min-w-0 max-w-full border-b border-brand-gray/40 pb-1"
      aria-label="Classroom sections">
-  <div class="flex min-w-max items-center gap-1 whitespace-nowrap">
+  <div class="flex w-full flex-wrap items-center gap-1">
     <a href="/classroom"
+       {% if classroom_section == "dashboard" %}aria-current="page"{% endif %}
+       class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "dashboard" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
+      Dashboard
+    </a>
+    <a href="/classroom/imports"
+       {% if classroom_section == "imports" %}aria-current="page"{% endif %}
+       class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "imports" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
+      Guided import
+    </a>
+    <a href="/classroom/courses/manage"
        {% if classroom_section == "courses" %}aria-current="page"{% endif %}
        class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "courses" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
-      Course administration
+      Courses
     </a>
     <a href="/classroom/access"
        {% if classroom_section == "access" %}aria-current="page"{% endif %}
        class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "access" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
       Teacher access
     </a>
-    <a href="/classroom/imports"
-       {% if classroom_section == "imports" %}aria-current="page"{% endif %}
-       class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "imports" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
-      OneRoster imports
+    <a href="/classroom/monitoring"
+       {% if classroom_section == "monitoring" %}aria-current="page"{% endif %}
+       class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "monitoring" %}border-brand-blueink text-brand-black{% else %}border-transparent text-brand-blueink hover:border-brand-gray hover:text-brand-black{% endif %}">
+      Monitoring
+    </a>
+    <a href="/classroom/recovery"
+       {% if classroom_section == "recovery" %}aria-current="page"{% endif %}
+       class="shrink-0 border-b-2 px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue focus-visible:ring-offset-2 {% if classroom_section == "recovery" %}border-red-700 text-red-900{% else %}border-transparent text-brand-blueink hover:border-red-300 hover:text-red-900{% endif %}">
+      Recovery
     </a>
   </div>
 </nav>

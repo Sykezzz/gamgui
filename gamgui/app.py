@@ -732,7 +732,13 @@ def _run_self_test(json_output: bool = False) -> int:
     if os.environ.get(APP_DATA_ENV):
         prepare_database_schemas(app_data_dir())
     result = bundle_self_test()
-    if json_output or not result["ok"]:
+    output_path = os.environ.get("GAMGUI_SELF_TEST_OUTPUT", "").strip()
+    if output_path:
+        Path(output_path).write_text(
+            json.dumps(result, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if (json_output or not result["ok"]) and sys.stdout is not None:
         print(json.dumps(result, sort_keys=True))
     return 0 if result["ok"] else 1
 

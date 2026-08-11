@@ -1747,6 +1747,48 @@ class OneRosterStore:
             raise KeyError("OneRoster import manifest not found.")
         return _manifest_from_rows(row, ())
 
+    def latest_manifest_header(
+        self,
+        import_id: Optional[str] = None,
+    ) -> Optional[ClassroomImportManifest]:
+        """Return the most actionable recent manifest without loading actions.
+
+        A single comparison can seal ordinary, archive, and ownership manifests at
+        the same instant. Prefer the item needing attention over a merely newer
+        sibling so a reopened guided journey resumes at the truthful current step.
+        """
+
+        if import_id is not None:
+            _validate_id(import_id)
+        sql = "SELECT * FROM manifests WHERE domain = ?"
+        params: list[object] = [self.domain]
+        if import_id is not None:
+            sql += " AND import_id = ?"
+            params.append(import_id)
+        sql += """
+            ORDER BY
+              CASE
+                WHEN status = 'recovery_required' THEN 0
+                WHEN status IN ('running', 'pause_requested', 'paused') THEN 1
+                WHEN status IN ('failed', 'interrupted', 'stale', 'partial') THEN 2
+                WHEN status IN ('planned', 'awaiting_students') THEN 3
+                WHEN status = 'completed' THEN 4
+                ELSE 5
+              END,
+              CASE plan_kind
+                WHEN 'ordinary' THEN 0
+                WHEN 'archive' THEN 1
+                WHEN 'ownership' THEN 2
+                ELSE 3
+              END,
+              created_at DESC,
+              id DESC
+            LIMIT 1
+        """
+        with closing(self._conn()) as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return _manifest_from_rows(row, ()) if row is not None else None
+
     def pending_action_kinds(self, manifest_id: str) -> tuple[str, ...]:
         """Return distinct pending action kinds without loading action records."""
 

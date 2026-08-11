@@ -146,12 +146,13 @@ def locate_gam_binary() -> Path:
     if override:
         return Path(override)
 
+    executable_name = "gam.exe" if sys.platform == "win32" else "gam"
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:  # frozen .app
-        return Path(meipass) / "resources" / "gam7" / "gam"
+        return Path(meipass) / "resources" / "gam7" / executable_name
 
     # Source tree: gamgui/core/gam/runner.py -> gamgui/resources/gam7/gam
-    return Path(__file__).resolve().parents[2] / "resources" / "gam7" / "gam"
+    return Path(__file__).resolve().parents[2] / "resources" / "gam7" / executable_name
 
 
 class GAMRunner:

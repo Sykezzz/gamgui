@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Classroom Monitoring — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set classroom_section = "monitoring" %}
+{% include "_classroom_subnav.html" %}
+<div class="space-y-6">
+  <header>
+    <p class="eyebrow text-brand-blueink">Classroom monitoring</p>
+    <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Watch the work without guessing</h1>
+    <p class="mt-2 max-w-3xl text-sm text-brand-blueink">This page reads saved progress. It does not start, repeat, or change an import.</p>
+  </header>
+  {% if not connected or not workspace.available %}
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
+    <h2 class="font-serif text-xl text-brand-black">Monitoring is not ready yet</h2>
+    <p class="mt-2 text-sm text-brand-blueink">Connect a domain and enable OneRoster Classroom first.</p>
+  </section>
+  {% elif not workspace.manifest %}
+  <section class="rounded-2xl border border-dashed border-brand-gray/60 bg-brand-white p-8 text-center">
+    <h2 class="font-serif text-xl text-brand-black">No checked plan to watch</h2>
+    <p class="mt-2 text-sm text-brand-blueink">Start with Guided import. Monitoring appears after GamGUI has built a saved plan.</p>
+    <a href="/classroom/imports" class="mt-4 inline-flex rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open guided import</a>
+  </section>
+  {% else %}
+  {% set run = workspace.progress.run | default({}, true) %}
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="monitoring-status-heading">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div><p class="eyebrow text-brand-blueink">Current record</p><h2 id="monitoring-status-heading" class="mt-1 font-serif text-2xl text-brand-black">{{ workspace.risk_label }}</h2></div>
+      <span class="rounded-lg border border-brand-gray/50 bg-paper px-3 py-1.5 text-sm font-semibold text-brand-black">{{ workspace.manifest.status | replace("_", " ") | title }}</span>
+    </div>
+    <progress class="mt-5 h-3 w-full accent-brand-blue" max="100" value="{{ workspace.progress.percent | default(0) }}">{{ workspace.progress.percent | default(0) }}%</progress>
+    <p class="mt-2 text-sm tabular-nums text-brand-blueink">{{ workspace.progress.applied | default(0) }} applied · {{ workspace.progress.failed | default(0) }} failed · {{ workspace.progress.skipped | default(0) }} skipped · {{ workspace.progress.pending | default(0) }} waiting</p>
+    <dl class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Checked batches</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.completed_batches | default(0) }} of about {{ workspace.progress.total_batches_estimate | default(0) }}</dd></div>
+      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Current batch</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ run.current_batch_sequence | default(0) }}</dd></div>
+      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Elapsed</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ ((workspace.progress.elapsed_seconds | default(0)) / 60) | round(1) }} min</dd></div>
+      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Last check-in</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.heartbeat_age_seconds | default(0) | round }} sec ago</dd></div>
+    </dl>
+    {% if workspace.progress.heartbeat_stale %}<p class="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900" role="alert">The worker stopped checking in. Do not start another run. Open Recovery and reconcile the saved batch.</p>{% endif %}
+    <div class="mt-5 flex flex-wrap gap-3">
+      <a href="/classroom/imports/manifest/{{ workspace.manifest.id }}" class="rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open full activity</a>
+      {% if workspace.manifest.status in ("running", "pause_requested", "recovery_required") %}<a href="/classroom/recovery" class="rounded-lg border border-brand-gray/60 px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Open Recovery</a>{% endif %}
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

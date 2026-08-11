@@ -313,6 +313,40 @@ def test_execution_batches_persist_exact_membership_and_progress(tmp_path: Path)
     assert progress.heartbeat_age_seconds == 10
 
 
+def test_latest_manifest_header_prefers_the_actionable_journey_step(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    ordinary = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(ImportAction("a-1", "course_create", "Section_101", ""),),
+        plan_kind="ordinary",
+    )
+    service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction(
+                "owner-1",
+                "owner_transfer",
+                "Section_101",
+                "teacher@example.org",
+            ),
+        ),
+        plan_kind="ownership",
+    )
+
+    assert service.latest_manifest_header(import_id).id == ordinary.id
+    service.store.confirm_manifest(ordinary.id, ordinary.import_id)
+    service.store.claim_manifest(ordinary.id, owner_id="test-owner")
+
+    latest = service.latest_manifest_header(import_id)
+    assert latest is not None
+    assert latest.id == ordinary.id
+    assert latest.status == "running"
+
+
 @pytest.mark.asyncio
 async def test_dead_durable_batch_requires_reconciliation_instead_of_blind_retry(
     tmp_path: Path,

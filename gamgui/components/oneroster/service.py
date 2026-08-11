@@ -559,6 +559,14 @@ class OneRosterService:
 
         return self.store.get_manifest_header(manifest_id)
 
+    def latest_manifest_header(
+        self,
+        import_id: Optional[str] = None,
+    ) -> Optional[ClassroomImportManifest]:
+        """Read the newest durable manifest for dashboard workflow projection."""
+
+        return self.store.latest_manifest_header(import_id)
+
     def get_manifest_page(
         self,
         manifest_id: str,

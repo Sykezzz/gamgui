@@ -1937,8 +1937,8 @@ def _snapshot_counts(conn: sqlite3.Connection, domain: str) -> SnapshotCounts:
     participant_counts = conn.execute(
         """
         SELECT
-          SUM(CASE WHEN role = 'teacher' THEN 1 ELSE 0 END),
-          SUM(CASE WHEN role = 'student' THEN 1 ELSE 0 END)
+          COUNT(DISTINCT CASE WHEN role = 'teacher' THEN user_id END),
+          COUNT(DISTINCT CASE WHEN role = 'student' THEN user_id END)
         FROM enrollments
         WHERE domain = ? AND status != 'tobedeleted' AND in_scope = 1
         """,

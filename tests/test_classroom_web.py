@@ -49,10 +49,14 @@ def test_classroom_page_uses_bounded_index_without_live_gam(web_client):
     response = client.get("/classroom")
     assert response.status_code == 200
     assert "Course administration" in response.text
-    assert response.text.count(">Manage") == 50
-    assert "Next 50 courses" in response.text
+    assert "Your district at a glance" in response.text
+    assert response.text.count(">Manage") == 1
+    courses = client.get("/classroom/courses/manage")
+    assert courses.status_code == 200
+    assert courses.text.count(">Manage") == 50
+    assert "Next 50 courses" in courses.text
     assert not any(call[0] == "list_courses" for call in connector.calls)
-    assert len(response.content) < 100_000
+    assert len(courses.content) < 100_000
 
 
 def test_course_search_is_indexed_and_state_filtered(web_client):

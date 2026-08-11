@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Classroom Dashboard — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set classroom_section = "dashboard" %}
+{% include "_classroom_subnav.html" %}
+{% if not connected %}
+<section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
+  <p class="eyebrow text-brand-blueink">Classroom dashboard</p>
+  <h1 class="mt-2 font-serif text-2xl text-brand-black">Connect your school domain first</h1>
+  <p class="mt-2 max-w-2xl text-sm text-brand-blueink">This lets GamGUI show your classes and prepare safe roster work. Nothing changes just by connecting.</p>
+  <a href="/setup" class="mt-4 inline-flex rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Connect a domain</a>
+</section>
+{% else %}
+<div class="space-y-6">
+  <header class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <p class="eyebrow text-brand-blueink">Classroom dashboard</p>
+      <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Your district at a glance</h1>
+      <p class="mt-2 max-w-3xl text-sm text-brand-blueink">See what is healthy, what needs help, and the one safest thing to do next.</p>
+    </div>
+    <details class="rounded-xl border border-brand-gray/50 bg-brand-white p-3 shadow-sm">
+      <summary class="cursor-pointer text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">New here? Show me around</summary>
+      <ol class="mt-3 max-w-sm list-decimal space-y-2 pl-5 text-sm text-brand-blueink">
+        <li>The big numbers describe the newest saved roster.</li>
+        <li>The safety card tells you if a person needs to help.</li>
+        <li>The next-action card gives you one clear place to continue.</li>
+        <li>Recovery is separate and only for unusual situations.</li>
+      </ol>
+    </details>
+  </header>
+
+  {% set counts = workspace.snapshot.counts | default({}, true) %}
+  <section aria-labelledby="district-snapshot-heading">
+    <div class="flex flex-wrap items-end justify-between gap-2">
+      <div><p class="eyebrow text-brand-blueink">District snapshot</p><h2 id="district-snapshot-heading" class="mt-1 font-serif text-xl text-brand-black">Who and what is in the newest roster</h2></div>
+      <p class="text-xs text-brand-blueink">Saved locally · no live changes</p>
+    </div>
+    <dl class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      {% for label, value, help in (
+        ("Students", counts.students | default(0), "Different students"),
+        ("Teachers", counts.teachers | default(0), "Different teachers"),
+        ("Enrollment links", counts.enrollments | default(0), "Student and teacher seats"),
+        ("Managed classes", counts.ready_courses | default(counts.classes | default(0)), "Classes in this import"),
+        ("Indexed courses", index.count | default(0), "Courses you can search")
+      ) %}
+      <div class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm">
+        <dt class="text-xs font-semibold uppercase tracking-wider text-brand-blueink">{{ label }}</dt>
+        <dd class="mt-1 font-serif text-3xl tabular-nums text-brand-black">{{ value }}</dd>
+        <dd class="mt-1 text-xs text-brand-blueink">{{ help }}</dd>
+      </div>
+      {% endfor %}
+    </dl>
+  </section>
+
+  <div class="grid items-start gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,.8fr)]">
+    <section class="rounded-2xl border {% if workspace.risk_tone == 'danger' %}border-red-300 bg-red-50{% elif workspace.risk_tone == 'warn' %}border-amber-300 bg-amber-50{% elif workspace.risk_tone == 'good' %}border-emerald-300 bg-emerald-50{% else %}border-brand-gray/40 bg-brand-white{% endif %} p-5 shadow-sm" aria-labelledby="current-safety-heading">
+      <p class="eyebrow {% if workspace.risk_tone == 'danger' %}text-red-800{% elif workspace.risk_tone == 'warn' %}text-amber-900{% else %}text-brand-blueink{% endif %}">Current safety check</p>
+      <h2 id="current-safety-heading" class="mt-2 font-serif text-2xl text-brand-black">{{ workspace.risk_label }}</h2>
+      <div class="mt-4 grid gap-3 sm:grid-cols-3">
+        <div class="rounded-lg bg-white/80 p-3"><p class="text-xs text-brand-blueink">Source problems</p><p class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.snapshot.blocking_issue_count | default(0) }}</p></div>
+        <div class="rounded-lg bg-white/80 p-3"><p class="text-xs text-brand-blueink">Student safety gate</p><p class="mt-1 font-semibold text-brand-black">{{ workspace.gate.state | default("CLOSED") | replace("_", " ") | title }}</p></div>
+        <div class="rounded-lg bg-white/80 p-3"><p class="text-xs text-brand-blueink">Import phase</p><p class="mt-1 font-semibold text-brand-black">{{ workspace.phase | replace("_", " ") | title }}</p></div>
+      </div>
+    </section>
+
+    <section class="rounded-2xl border border-brand-blue/50 bg-brand-blueink p-5 text-white shadow-sm" aria-labelledby="next-safe-action-heading">
+      <p class="eyebrow text-white/80">Start here</p>
+      <h2 id="next-safe-action-heading" class="mt-2 font-serif text-2xl">{{ workspace.next_title }}</h2>
+      <p class="mt-2 text-sm text-white/90">{{ workspace.next_detail }}</p>
+      <a href="{{ workspace.next_href }}" class="mt-5 inline-flex rounded-lg bg-white px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-white">{{ workspace.next_label }}</a>
+    </section>
+  </div>
+
+  <section aria-labelledby="classroom-workspaces-heading">
+    <p class="eyebrow text-brand-blueink">Other workspaces</p>
+    <h2 id="classroom-workspaces-heading" class="mt-1 font-serif text-xl text-brand-black">Go straight to a specific job</h2>
+    <div class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {% for href, title, copy in (
+        ("/classroom/courses/manage", "Course administration", "Find a class and manage its details or roster."),
+        ("/classroom/access", "Teacher access", "Control who can create and manage classes."),
+        ("/classroom/monitoring", "Monitoring", "Watch the current import and read recent results."),
+        ("/classroom/recovery", "Recovery", "Pause safely or review an interrupted batch.")
+      ) %}
+      <a href="{{ href }}" class="block rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm transition-colors hover:border-brand-blue focus-visible:ring-2 focus-visible:ring-brand-blue">
+        <span class="font-semibold text-brand-black">{{ title }}</span><span class="mt-1 block text-sm text-brand-blueink">{{ copy }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endif %}
+{% endblock %}

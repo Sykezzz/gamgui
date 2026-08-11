@@ -12,7 +12,13 @@ from keyring.errors import PasswordSetError
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
 from gamgui.core.gam.errors import GAMError, GAMErrorKind, TokenPersistenceError
-from gamgui.core.gam.runner import GAMRunner, secure_remove_private_file
+from gamgui.core.gam.runner import GAMRunner, locate_gam_binary, secure_remove_private_file
+
+
+def test_windows_bundle_resolves_gam_exe(monkeypatch, tmp_path):
+    monkeypatch.setattr("gamgui.core.gam.runner.sys.platform", "win32")
+    monkeypatch.setattr("gamgui.core.gam.runner.sys._MEIPASS", str(tmp_path), raising=False)
+    assert locate_gam_binary() == tmp_path / "resources" / "gam7" / "gam.exe"
 
 
 async def test_version(runner):

@@ -199,6 +199,10 @@ body {
   }
 }
 
+.classroom-subnav {
+  contain: inline-size;
+}
+
 @media (max-width: 720px) {
   .oneroster-action-table,
   .oneroster-action-table tbody,

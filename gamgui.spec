@@ -123,7 +123,10 @@ binaries += _wv_binaries
 hiddenimports += _wv_hidden
 
 # Bundle the vendored GAM7 binary (resolved at runtime via sys._MEIPASS/resources/gam7/gam).
-if os.path.isdir("gamgui/resources/gam7") and os.path.exists("gamgui/resources/gam7/gam"):
+gam_executable = "gam.exe" if os.name == "nt" else "gam"
+if os.path.isdir("gamgui/resources/gam7") and os.path.exists(
+    os.path.join("gamgui/resources/gam7", gam_executable)
+):
     datas.append(("gamgui/resources/gam7", "resources/gam7"))
 
 a = Analysis(
@@ -138,15 +141,16 @@ a = Analysis(
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="GamGUI", console=False)
 coll = COLLECT(exe, a.binaries, a.datas, name="GamGUI")
-app = BUNDLE(
-    coll,
-    name="GamGUI.app",
-    icon=None,
-    bundle_identifier="io.github.goetchstone.gamgui",
-    info_plist={
-        "NSHighResolutionCapable": True,
-        "LSMinimumSystemVersion": minimum_macos,
-        "GamGUIBuildProfile": profile,
-        "GamGUISourceSHA": source,
-    },
-)
+if platform.system() == "Darwin":
+    app = BUNDLE(
+        coll,
+        name="GamGUI.app",
+        icon=None,
+        bundle_identifier="io.github.goetchstone.gamgui",
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": minimum_macos,
+            "GamGUIBuildProfile": profile,
+            "GamGUISourceSHA": source,
+        },
+    )

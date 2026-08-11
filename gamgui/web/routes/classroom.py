@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Annotated, Optional
+from dataclasses import asdict, is_dataclass
+from enum import Enum
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
@@ -157,6 +159,158 @@ def _index_context(request: Request, service: ClassroomService) -> dict:
     }
 
 
+def _plain_value(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value) and not isinstance(value, type):
+        return _plain_value(asdict(value))
+    if isinstance(value, dict):
+        return {key: _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _plain(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if is_dataclass(value) and not isinstance(value, type):
+        return _plain_value(asdict(value))
+    if isinstance(value, dict):
+        return _plain_value(value)
+    return _plain_value({
+        name: getattr(value, name)
+        for name in dir(value)
+        if not name.startswith("_") and not callable(getattr(value, name, None))
+    })
+
+
+async def _classroom_workspace_context(request: Request) -> dict[str, Any]:
+    """Project durable local state into the friendly Classroom workspaces."""
+
+    state = request.app.state.gamgui
+    roster = getattr(state, "oneroster_service", None)
+    context: dict[str, Any] = {
+        "available": roster is not None,
+        "snapshot": {},
+        "manifest": {},
+        "progress": {},
+        "gate": {"state": "CLOSED"},
+        "phase": "setup",
+        "risk_tone": "quiet",
+        "risk_label": "No active import",
+        "next_title": "Start a guided import",
+        "next_detail": "GamGUI will ask one small question at a time before anything can change.",
+        "next_href": "/classroom/imports",
+        "next_label": "Begin guided setup",
+    }
+    if roster is None:
+        context.update(
+            risk_label="Guided imports are not available",
+            next_title="Turn on OneRoster Classroom",
+            next_detail="Install or enable the Classroom OneRoster component first.",
+            next_href="/components",
+            next_label="Open component settings",
+        )
+        return context
+
+    dashboard_method = getattr(roster, "dashboard", None)
+    dashboard = _plain(await asyncio.to_thread(dashboard_method)) if callable(dashboard_method) else {}
+    snapshot = _plain(dashboard.get("latest"))
+    context["snapshot"] = snapshot
+    gate_method = getattr(roster, "get_gate", None)
+    if callable(gate_method):
+        context["gate"] = _plain(await asyncio.to_thread(gate_method))
+
+    manifest_method = getattr(roster, "latest_manifest_header", None)
+    manifest = {}
+    if callable(manifest_method):
+        value = await asyncio.to_thread(
+            manifest_method,
+            str(snapshot.get("id", "") or "") or None,
+        )
+        manifest = _plain(value)
+    context["manifest"] = manifest
+    manifest_id = str(manifest.get("id", "") or "")
+    progress_method = getattr(roster, "get_execution_progress", None)
+    if manifest_id and callable(progress_method):
+        try:
+            context["progress"] = _plain(
+                await asyncio.to_thread(progress_method, manifest_id)
+            )
+        except (KeyError, TypeError):
+            pass
+
+    snapshot_state = str(snapshot.get("state", "") or "").casefold()
+    manifest_status = str(manifest.get("status", "") or "").casefold()
+    if manifest_status in {"running", "pause_requested", "paused"}:
+        context.update(
+            phase="in_progress",
+            risk_tone="warn" if manifest_status != "running" else "good",
+            risk_label=(
+                "Pausing after the current checked batch"
+                if manifest_status == "pause_requested"
+                else "Import paused safely"
+                if manifest_status == "paused"
+                else "Import is running"
+            ),
+            next_title="Watch the checked batches",
+            next_detail="GamGUI finishes and verifies each small batch before moving on.",
+            next_href=f"/classroom/imports/manifest/{manifest_id}",
+            next_label="Open live progress",
+        )
+    elif manifest_status in {"recovery_required", "interrupted", "failed", "stale"}:
+        context.update(
+            phase="results",
+            risk_tone="danger",
+            risk_label="A person needs to review what happened",
+            next_title="Open the protected recovery workspace",
+            next_detail="GamGUI kept the evidence and will not repeat uncertain work.",
+            next_href="/classroom/recovery",
+            next_label="Review recovery",
+        )
+    elif manifest_status == "completed":
+        context.update(
+            phase="results",
+            risk_tone="good",
+            risk_label="Last import finished and was checked",
+            next_title="Read the final results",
+            next_detail="See what changed, what was skipped, and whether anything needs follow-up.",
+            next_href=f"/classroom/imports/manifest/{manifest_id}",
+            next_label="See final results",
+        )
+    elif manifest_status in {"planned", "awaiting_students"}:
+        context.update(
+            phase="review",
+            risk_tone="warn" if manifest_status == "awaiting_students" else "good",
+            risk_label=(
+                "Student changes are safely held"
+                if manifest_status == "awaiting_students"
+                else "The checked plan is ready for your review"
+            ),
+            next_title="Review the exact impact before starting",
+            next_detail="Nothing changes until you confirm the saved plan.",
+            next_href=f"/classroom/imports/manifest/{manifest_id}",
+            next_label="Review and start",
+        )
+    elif snapshot:
+        blocked = int(snapshot.get("blocking_issue_count", 0) or 0)
+        context.update(
+            phase="setup",
+            risk_tone="danger" if blocked else "quiet",
+            risk_label=(
+                f"{blocked} source problem{'s' if blocked != 1 else ''} need help"
+                if blocked
+                else "Setup is waiting for you"
+            ),
+            next_title="Answer the next setup question",
+            next_detail="The source stays local while you review names, dates, and people.",
+            next_href=f"/classroom/imports/import/{snapshot.get('id', '')}",
+            next_label="Continue guided setup",
+        )
+    return context
+
+
 async def _course_list_response(
     request: Request,
     service: ClassroomService,
@@ -189,16 +343,33 @@ async def classroom_page(
     service = _service(request)
     if service is None:
         return TEMPLATES.TemplateResponse(
-            request, "classroom.html", {"connected": False}
+            request, "classroom_dashboard.html", {"connected": False}
         )
     status = service.course_index.status(service.domain)
     if status.stale:
         _schedule_refresh(request, service)
-    page = await service.search(
-        query=q,
-        state=state,
-        refreshing=_refreshing(request),
+    return TEMPLATES.TemplateResponse(
+        request,
+        "classroom_dashboard.html",
+        {
+            "connected": True,
+            "index": _index_context(request, service),
+            "workspace": await _classroom_workspace_context(request),
+        },
     )
+
+
+@router.get("/courses/manage", response_class=HTMLResponse)
+async def course_admin_page(
+    request: Request, q: str = "", state: str = ""
+) -> HTMLResponse:
+    service = _service(request)
+    if service is None:
+        return TEMPLATES.TemplateResponse(request, "classroom.html", {"connected": False})
+    status = service.course_index.status(service.domain)
+    if status.stale:
+        _schedule_refresh(request, service)
+    page = await service.search(query=q, state=state, refreshing=_refreshing(request))
     return TEMPLATES.TemplateResponse(
         request,
         "classroom.html",
@@ -209,6 +380,32 @@ async def classroom_page(
             "state_filter": state.strip().upper(),
             "states": COURSE_STATES,
             "index": _index_context(request, service),
+        },
+    )
+
+
+@router.get("/monitoring", response_class=HTMLResponse)
+async def classroom_monitoring(request: Request) -> HTMLResponse:
+    service = _service(request)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "classroom_monitoring.html",
+        {
+            "connected": service is not None,
+            "workspace": await _classroom_workspace_context(request),
+        },
+    )
+
+
+@router.get("/recovery", response_class=HTMLResponse)
+async def classroom_recovery(request: Request) -> HTMLResponse:
+    service = _service(request)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "classroom_recovery.html",
+        {
+            "connected": service is not None,
+            "workspace": await _classroom_workspace_context(request),
         },
     )
 

@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Classroom Recovery — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set classroom_section = "recovery" %}
+{% include "_classroom_subnav.html" %}
+<div class="space-y-6">
+  <header>
+    <p class="eyebrow text-red-800">Protected workspace</p>
+    <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">What happened?</h1>
+    <p class="mt-2 max-w-3xl text-sm text-brand-blueink">Choose the situation that matches. Recovery never promises a magic undo, and uncertain work always stops for a person.</p>
+  </header>
+  {% if not connected or not workspace.available %}
+  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm"><h2 class="font-serif text-xl text-brand-black">Recovery records are not available</h2><p class="mt-2 text-sm text-brand-blueink">Connect a domain and enable OneRoster Classroom first.</p></section>
+  {% else %}
+  <div class="grid items-start gap-5 lg:grid-cols-[20rem_minmax(0,1fr)]">
+    <nav class="space-y-2" aria-label="Recovery situations">
+      <a href="#running-work" class="block rounded-xl border {% if workspace.manifest.status in ('running', 'pause_requested') %}border-amber-400 bg-amber-50{% else %}border-brand-gray/40 bg-brand-white{% endif %} p-4 shadow-sm focus-visible:ring-2 focus-visible:ring-brand-blue"><span class="font-semibold text-brand-black">Work is running</span><span class="mt-1 block text-sm text-brand-blueink">I need it to stop safely.</span></a>
+      <a href="#changes-back" class="block rounded-xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm focus-visible:ring-2 focus-visible:ring-brand-blue"><span class="font-semibold text-brand-black">Applied changes should go back</span><span class="mt-1 block text-sm text-brand-blueink">I need to understand what can be reversed.</span></a>
+      <a href="#serious-incident" class="block rounded-xl border {% if workspace.manifest.status in ('recovery_required', 'interrupted') %}border-red-400 bg-red-50{% else %}border-brand-gray/40 bg-brand-white{% endif %} p-4 shadow-sm focus-visible:ring-2 focus-visible:ring-brand-blue"><span class="font-semibold text-brand-black">Something stopped unexpectedly</span><span class="mt-1 block text-sm text-brand-blueink">I need to check an uncertain batch.</span></a>
+    </nav>
+
+    <div class="space-y-4">
+      <section id="running-work" class="scroll-mt-4 rounded-2xl border border-amber-300 bg-amber-50 p-5 shadow-sm" aria-labelledby="stop-safely-heading">
+        <p class="eyebrow text-amber-900">Stop safely</p><h2 id="stop-safely-heading" class="mt-1 font-serif text-2xl text-brand-black">Finish and check the current small batch, then pause</h2>
+        <p class="mt-2 text-sm text-amber-950">GamGUI will not cut a GAM batch in half. That keeps the saved evidence honest.</p>
+        {% if workspace.manifest.status == "running" %}
+        <form class="mt-4" hx-post="/classroom/imports/manifest/{{ workspace.manifest.id }}/pause" hx-target="#recovery-result" hx-swap="innerHTML"><button type="submit" class="rounded-lg bg-amber-800 px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-amber-600">Pause after this checked batch</button></form>
+        {% elif workspace.manifest.status == "pause_requested" %}<p class="mt-4 rounded-lg border border-amber-400 bg-white px-3 py-2 text-sm font-semibold text-amber-950" role="status">Pause requested. The current batch is finishing and being checked.</p>
+        {% else %}<p class="mt-4 text-sm font-semibold text-brand-blueink">There is no running import to pause.</p>{% endif %}
+      </section>
+
+      <section id="changes-back" class="scroll-mt-4 rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="rollback-heading">
+        <p class="eyebrow text-brand-blueink">Compensating rollback</p><h2 id="rollback-heading" class="mt-1 font-serif text-2xl text-brand-black">Build a new inverse plan only from matching evidence</h2>
+        <p class="mt-2 text-sm text-brand-blueink">This release records the before-and-after evidence, but it does not yet execute an automatic inverse plan. Newly created classes would be archived, never deleted. Changed or unclear values must wait for a person.</p>
+        <span class="mt-4 inline-flex cursor-not-allowed rounded-lg border border-brand-gray/60 bg-paper px-4 py-2 text-sm font-semibold text-brand-blueink" aria-disabled="true">Automatic rollback is not available yet</span>
+      </section>
+
+      <section id="serious-incident" class="scroll-mt-4 rounded-2xl border border-red-300 bg-red-50 p-5 shadow-sm" aria-labelledby="incident-heading">
+        <p class="eyebrow text-red-800">Interrupted batch</p><h2 id="incident-heading" class="mt-1 font-serif text-2xl text-brand-black">Check live Classroom before doing anything twice</h2>
+        <p class="mt-2 text-sm text-red-900">GamGUI compares the saved batch with live Classroom. Actions that already landed are marked complete; uncertain work stays stopped.</p>
+        {% if workspace.manifest.status == "recovery_required" %}
+        <form class="mt-4" hx-post="/classroom/imports/manifest/{{ workspace.manifest.id }}/recover" hx-target="#recovery-result" hx-swap="innerHTML"><button type="submit" class="rounded-lg bg-red-800 px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-red-600">Reconcile the interrupted batch</button></form>
+        {% else %}<p class="mt-4 text-sm font-semibold text-brand-blueink">There is no interrupted batch waiting for reconciliation.</p>{% endif %}
+        <div class="mt-4 rounded-lg border border-red-200 bg-white p-3"><p class="text-sm font-semibold text-brand-black">Checkpoint restore</p><p class="mt-1 text-xs text-brand-blueink">Incident-only checkpoint capture and restore are planned safeguards, not current production capabilities. GamGUI will not offer a button that cannot be honored safely.</p></div>
+      </section>
+      <div id="recovery-result" aria-live="polite"></div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -17,24 +17,30 @@ def _render_subnav(section: str) -> str:
     )
 
 
-def test_classroom_subnav_has_native_links_scroll_and_visible_focus():
+def test_classroom_subnav_has_native_wrapping_links_and_visible_focus():
     rendered = _render_subnav("courses")
 
-    assert '<nav class="mb-6 overflow-x-auto' in rendered
+    assert '<nav class="classroom-subnav mb-6 w-full min-w-0 max-w-full border-b' in rendered
     assert 'aria-label="Classroom sections"' in rendered
-    assert 'class="flex min-w-max items-center gap-1 whitespace-nowrap"' in rendered
+    assert 'class="flex w-full flex-wrap items-center gap-1"' in rendered
     assert 'href="/classroom"' in rendered
     assert 'href="/classroom/access"' in rendered
     assert 'href="/classroom/imports"' in rendered
-    assert rendered.count("<a ") == 3
-    assert rendered.count("focus-visible:ring-2") == 3
+    assert 'href="/classroom/courses/manage"' in rendered
+    assert 'href="/classroom/monitoring"' in rendered
+    assert 'href="/classroom/recovery"' in rendered
+    assert rendered.count("<a ") == 6
+    assert rendered.count("focus-visible:ring-2") == 6
 
 
 def test_classroom_subnav_marks_only_the_active_section_as_current():
     expected_labels = {
-        "courses": "Course administration",
+        "dashboard": "Dashboard",
+        "courses": "Courses",
         "access": "Teacher access",
-        "imports": "OneRoster imports",
+        "imports": "Guided import",
+        "monitoring": "Monitoring",
+        "recovery": "Recovery",
     }
 
     for section, label in expected_labels.items():
@@ -48,9 +54,12 @@ def test_classroom_subnav_marks_only_the_active_section_as_current():
 
 def test_classroom_pages_include_the_shared_section_navigation():
     expected_sections = {
+        "classroom_dashboard.html": "dashboard",
         "classroom.html": "courses",
         "classroom_access.html": "access",
         "oneroster.html": "imports",
+        "classroom_monitoring.html": "monitoring",
+        "classroom_recovery.html": "recovery",
     }
 
     for template_name, section in expected_sections.items():

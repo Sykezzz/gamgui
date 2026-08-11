@@ -566,6 +566,7 @@ def load_bundle_embedded_profile(bundle: Path) -> EmbeddedProfile:
         root / "Contents" / "Resources" / PROFILE_METADATA_RELATIVE,
         root / "Contents" / "Frameworks" / PROFILE_METADATA_RELATIVE,
         root / "Contents" / "MacOS" / "_internal" / PROFILE_METADATA_RELATIVE,
+        root / "_internal" / PROFILE_METADATA_RELATIVE,
     )
     for candidate in candidates:
         if candidate.is_file():
@@ -622,16 +623,18 @@ def verify_bundle_artifact(
 
 
 def verify_runtime_compatibility(artifact: ComponentArtifactId) -> None:
-    """Fail closed when a macOS artifact targets another architecture or OS."""
+    """Fail closed when a packaged artifact targets another architecture or OS."""
 
-    if sys.platform != "darwin":
+    if sys.platform not in {"darwin", "win32"}:
         return
     current_architecture = _normalize_architecture(platform.machine())
     if artifact.architecture != current_architecture:
         raise ComponentError(
             "CMP-INCOMPATIBLE",
-            "Application artifact architecture does not match this Mac.",
+            "Application artifact architecture does not match this computer.",
         )
+    if sys.platform == "win32":
+        return
     current_version = _version_tuple(platform.mac_ver()[0])
     minimum_version = _version_tuple(artifact.minimum_macos_version)
     if not current_version or not minimum_version or current_version < minimum_version:
