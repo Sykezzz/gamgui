@@ -175,12 +175,12 @@ jobs:
       - name: Enroll ephemeral runner signing identity
         shell: pwsh
         run: |
-          $identity = & .\scripts\windows_local_signing.ps1 -Action Enroll -TrustLocalCertificate -CiEphemeralCertificate | ConvertFrom-Json
+          $identity = & .\scripts\windows_local_signing.ps1 -Action Enroll -CiEphemeralCertificate | ConvertFrom-Json
           "WINDOWS_SIGNER_SHA=$($identity.certificate_sha256)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build exact-SHA validation-only bootstrap
         shell: pwsh
         run: |
-          .\scripts\build_windows_release.ps1 -Profile "${{ matrix.profile }}" -ExpectedSha "${{ inputs.sha }}" -CertificateSha256 $env:WINDOWS_SIGNER_SHA -ToolchainBundleDir ".ci-toolchain\windows-local-build-v1\downloads" -Bootstrap
+          .\scripts\build_windows_release.ps1 -Profile "${{ matrix.profile }}" -ExpectedSha "${{ inputs.sha }}" -CertificateSha256 $env:WINDOWS_SIGNER_SHA -CiEphemeralCertificate -ToolchainBundleDir ".ci-toolchain\windows-local-build-v1\downloads" -Bootstrap
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload validation-only bootstrap

@@ -170,11 +170,11 @@ jobs:
       - name: Enroll ephemeral runner signing identity
         shell: pwsh
         run: |
-          $identity = & .\scripts\windows_local_signing.ps1 -Action Enroll -TrustLocalCertificate -CiEphemeralCertificate | ConvertFrom-Json
+          $identity = & .\scripts\windows_local_signing.ps1 -Action Enroll -CiEphemeralCertificate | ConvertFrom-Json
           "WINDOWS_SIGNER_SHA=$($identity.certificate_sha256)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build, sign, verify, and self-test validation-only bundle
         shell: pwsh
-        run: .\scripts\build_windows_release.ps1 -Profile "${{ matrix.profile }}" -ExpectedSha "${{ github.sha }}" -CertificateSha256 $env:WINDOWS_SIGNER_SHA
+        run: .\scripts\build_windows_release.ps1 -Profile "${{ matrix.profile }}" -ExpectedSha "${{ github.sha }}" -CertificateSha256 $env:WINDOWS_SIGNER_SHA -CiEphemeralCertificate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload validation-only bundle

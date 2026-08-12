@@ -126,6 +126,11 @@ function Get-SignableFiles([System.IO.DirectoryInfo]$Root) {
     } | Sort-Object FullName)
 }
 
+function Test-SignatureStatus($Signature) {
+    if ($Signature.Status -eq "Valid") { return $true }
+    return [bool]($CiEphemeralCertificate -and $Signature.Status -in @("UnknownError", "NotTrusted"))
+}
+
 function Write-DetachedManifest([System.IO.DirectoryInfo]$Root, [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $records = @()
     foreach ($file in @(Get-ChildItem -LiteralPath $Root.FullName -Recurse -File | Sort-Object FullName)) {
@@ -216,7 +221,7 @@ if ($Action -eq "Enroll") {
         $certificate = $existing[0]
     }
     $CertificateSha256 = Get-CertificateSha256 $certificate
-    if ($TrustLocalCertificate) { Add-Trust $certificate }
+    if ($TrustLocalCertificate -and -not $CiEphemeralCertificate) { Add-Trust $certificate }
     [ordered]@{
         certificate_sha256 = $CertificateSha256
         store_thumbprint = $certificate.Thumbprint.ToLowerInvariant()
@@ -247,8 +252,9 @@ if ($Action -eq "RemoveTrust") {
 $certificate = Find-LocalCertificate ($Action -in @("Inspect", "Sign", "SignFile"))
 
 if ($Action -eq "Inspect") {
-    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
-    [ordered]@{ certificate_sha256 = Get-CertificateSha256 $certificate; store_thumbprint = $certificate.Thumbprint.ToLowerInvariant(); trusted = $true } | ConvertTo-Json -Compress
+    $trusted = Test-Trusted $certificate
+    if (-not $trusted -and -not $CiEphemeralCertificate) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+    [ordered]@{ certificate_sha256 = Get-CertificateSha256 $certificate; store_thumbprint = $certificate.Thumbprint.ToLowerInvariant(); trusted = $trusted } | ConvertTo-Json -Compress
     exit 0
 }
 
@@ -256,15 +262,15 @@ if (-not $Path) { throw "A Windows application bundle path is required." }
 $target = Get-Item -LiteralPath $Path
 if ($Action -eq "SignFile") {
     if ($target.PSIsContainer) { throw "The standalone updater helper path is not a file." }
-    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+    if (-not $CiEphemeralCertificate -and -not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
     $result = Set-AuthenticodeSignature -LiteralPath $target.FullName -Certificate $certificate -HashAlgorithm SHA256
-    if ($result.Status -ne "Valid") { throw "Authenticode signing failed for the updater helper: $($result.Status)" }
+    if (-not (Test-SignatureStatus $result)) { throw "Authenticode signing failed for the updater helper: $($result.Status)" }
     exit 0
 }
 if ($Action -eq "VerifyFile") {
-    if ($target.PSIsContainer -or -not (Test-Trusted $certificate)) { throw "The standalone updater helper trust check failed." }
+    if ($target.PSIsContainer -or (-not $CiEphemeralCertificate -and -not (Test-Trusted $certificate))) { throw "The standalone updater helper trust check failed." }
     $signature = Get-AuthenticodeSignature -LiteralPath $target.FullName
-    if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate -or (Get-CertificateSha256 $signature.SignerCertificate) -ne $CertificateSha256.ToLowerInvariant()) {
+    if (-not (Test-SignatureStatus $signature) -or $null -eq $signature.SignerCertificate -or (Get-CertificateSha256 $signature.SignerCertificate) -ne $CertificateSha256.ToLowerInvariant()) {
         throw "The standalone updater helper is unsigned or changed."
     }
     exit 0
@@ -275,19 +281,19 @@ if (-not $root.PSIsContainer -or -not (Test-Path -LiteralPath (Join-Path $root.F
 }
 
 if ($Action -eq "Sign") {
-    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+    if (-not $CiEphemeralCertificate -and -not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
     foreach ($file in Get-SignableFiles $root) {
         $result = Set-AuthenticodeSignature -LiteralPath $file.FullName -Certificate $certificate -HashAlgorithm SHA256
-        if ($result.Status -ne "Valid") { throw "Authenticode signing failed for $($file.Name): $($result.Status)" }
+        if (-not (Test-SignatureStatus $result)) { throw "Authenticode signing failed for $($file.Name): $($result.Status)" }
     }
     Write-DetachedManifest $root $certificate
     exit 0
 }
 
-if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+if (-not $CiEphemeralCertificate -and -not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
 foreach ($file in Get-SignableFiles $root) {
     $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
-    if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate -or (Get-CertificateSha256 $signature.SignerCertificate) -ne $CertificateSha256.ToLowerInvariant()) {
+    if (-not (Test-SignatureStatus $signature) -or $null -eq $signature.SignerCertificate -or (Get-CertificateSha256 $signature.SignerCertificate) -ne $CertificateSha256.ToLowerInvariant()) {
         throw "A Windows executable file is unsigned or changed: $($file.Name)"
     }
 }

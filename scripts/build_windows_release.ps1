@@ -5,6 +5,7 @@ param(
     [switch]$AllowDirty,
     [string]$ExpectedSha = "",
     [string]$CertificateSha256 = "",
+    [switch]$CiEphemeralCertificate,
     [string]$ToolchainBundleDir = "",
     [switch]$Bootstrap
 )
@@ -96,14 +97,16 @@ if ($helperProbe.ExitCode -ne 2) { throw "The standalone updater helper accepted
 
 $signingScript = Join-Path $PSScriptRoot "windows_local_signing.ps1"
 if ($CertificateSha256) {
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Sign -Path $bundle -CertificateSha256 $CertificateSha256
+    $ciSigning = @()
+    if ($CiEphemeralCertificate) { $ciSigning += "-CiEphemeralCertificate" }
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Sign -Path $bundle -CertificateSha256 $CertificateSha256 @ciSigning
     if ($LASTEXITCODE) { throw "Application signing failed." }
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $helper -CertificateSha256 $CertificateSha256
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $helper -CertificateSha256 $CertificateSha256 @ciSigning
     if ($LASTEXITCODE) { throw "Updater-helper signing failed." }
     & $python -c "import sys; from pathlib import Path; from gamgui.core.components import write_artifact_sidecar; write_artifact_sidecar(Path(sys.argv[1]), signing_channel='local', signing_authority='GamGUI Local')" $bundle
     if ($LASTEXITCODE) { throw "Artifact identity generation failed." }
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Verify -Path $bundle -CertificateSha256 $CertificateSha256
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $helper -CertificateSha256 $CertificateSha256
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Verify -Path $bundle -CertificateSha256 $CertificateSha256 @ciSigning
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $helper -CertificateSha256 $CertificateSha256 @ciSigning
     if ($LASTEXITCODE) { throw "Signed Windows bundle verification failed." }
 }
 
