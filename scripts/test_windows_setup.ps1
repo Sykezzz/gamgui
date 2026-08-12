@@ -63,7 +63,7 @@ function Invoke-SetupFailure([string[]]$Arguments) {
 }
 
 function New-TrustedIdentity() {
-    $identity = & $signing -Action Enroll -TrustLocalCertificate | ConvertFrom-Json
+    $identity = & $signing -Action Enroll -TrustLocalCertificate -CiEphemeralCertificate | ConvertFrom-Json
     if ($LASTEXITCODE -or $identity.trust_required -or -not $identity.created) {
         throw "The disposable runner identity was not created and trusted."
     }

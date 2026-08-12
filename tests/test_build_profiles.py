@@ -169,6 +169,7 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert "Hosted Setup checksum mismatch" in workflow
     assert "-SkipTamperedBootstrap" in workflow
     assert 'if (-not $env:CI)' in exercise
+    assert "-CiEphemeralCertificate" in exercise
     assert "[switch]$SkipTamperedBootstrap" in exercise
     assert "unsafe Setup invocation unexpectedly succeeded" in exercise
     assert 'Exercise-Profile "core"' in exercise
