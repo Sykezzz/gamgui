@@ -30,7 +30,8 @@ function Invoke-Process([string]$FilePath, [string[]]$Arguments, [int]$ExpectedE
 
 function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200) {
     Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
-    $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $setupLog = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-setup-" + [guid]::NewGuid() + ".log")
+    $process = Start-Process -FilePath $SetupPath -ArgumentList @($Arguments + "/LOG=$setupLog") -PassThru -WindowStyle Hidden
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastMessage = "SETUP-NOT-STARTED"
     while (-not $process.HasExited) {
@@ -52,8 +53,13 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
         Start-Sleep -Milliseconds 500
     }
     if ($process.ExitCode -ne 0) {
+        if (Test-Path -LiteralPath $setupLog -PathType Leaf) {
+            Write-Host "Setup diagnostic log (sanitized runner paths only):"
+            Get-Content -LiteralPath $setupLog -Tail 100
+        }
         throw "Setup returned $($process.ExitCode) at sanitized phase $lastMessage."
     }
+    Remove-Item -LiteralPath $setupLog -Force -ErrorAction SilentlyContinue
 }
 
 function Invoke-SetupFailure([string[]]$Arguments) {
