@@ -35,6 +35,7 @@ from .store import OneRosterStore, action_sequence_hash
 
 
 MAX_BATCH_COMMANDS = 50
+EXECUTION_HEARTBEAT_INTERVAL_SECONDS = 5.0
 ADAPTIVE_WORKER_LEVELS = (3, 5, 8, 10)
 STUDENT_ACTIONS = frozenset({"student_add", "student_remove"})
 ACTION_PRIORITIES = {
@@ -918,7 +919,7 @@ class OneRosterExecutor:
         if run_id:
             async def pulse() -> None:
                 while True:
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(EXECUTION_HEARTBEAT_INTERVAL_SECONDS)
                     await asyncio.to_thread(
                         self.store.heartbeat_execution_run,
                         run_id,
@@ -931,16 +932,17 @@ class OneRosterExecutor:
                 commands,
                 worker_count=worker_count,
             )
+        except asyncio.CancelledError:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            raise
         except Exception as exc:
             batch_failed = True
             throttling_count = int(
                 isinstance(exc, GAMError) and exc.kind is GAMErrorKind.RATE_LIMITED
             )
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat_task
         apply_seconds = (
             float(batch_receipt.duration_seconds)
             if batch_receipt is not None
@@ -948,85 +950,97 @@ class OneRosterExecutor:
         )
         if batch_receipt is not None:
             throttling_count = int(batch_receipt.throttling_count)
-        verified, verification_attempts, verification_seconds = (
-            await self._verify_with_retries(chunk, owner_ids)
-        )
-        applied = guarded_applied
-        failed = guarded_failed
-        results: dict[str, tuple[str, str]] = {}
-        for action in chunk:
-            ok = bool(verified.get(action.id))
-            if ok:
-                results[action.id] = (
-                    "applied",
-                    (
-                        "Verified live after GAM reported a batch error."
-                        if batch_failed
-                        else "Verified against live Classroom state."
-                    ),
-                )
-                applied += 1
-            else:
-                results[action.id] = ("failed", "OR-BATCH-VERIFY-FAILED")
-                failed += 1
-                if action.kind in {
-                    "course_create",
-                    "teacher_add",
-                    "owner_transfer",
-                    "course_activate",
-                }:
-                    blocked_courses.add(action.subject.casefold())
-        if durable_batch is not None:
-            completed_batch = self.store.complete_verified_batch(
-                durable_batch.id,
-                manifest_id,
-                results,
-                owner_id=self._operation_owner,
-                apply_seconds=apply_seconds,
-                verification_seconds=verification_seconds,
-                verification_attempts=verification_attempts,
-                worker_count=worker_count,
-                throttling_count=throttling_count,
+        try:
+            verified, verification_attempts, verification_seconds = (
+                await self._verify_with_retries(chunk, owner_ids)
             )
-            persistence_seconds = completed_batch.persistence_seconds
-        else:
-            persistence_started = time.perf_counter()
-            for action_id, (status, detail) in results.items():
-                self.store.mark_action_result(
+            applied = guarded_applied
+            failed = guarded_failed
+            results: dict[str, tuple[str, str]] = {}
+            for action in chunk:
+                ok = bool(verified.get(action.id))
+                if ok:
+                    results[action.id] = (
+                        "applied",
+                        (
+                            "Verified live after GAM reported a batch error."
+                            if batch_failed
+                            else "Verified against live Classroom state."
+                        ),
+                    )
+                    applied += 1
+                else:
+                    results[action.id] = ("failed", "OR-BATCH-VERIFY-FAILED")
+                    failed += 1
+                    if action.kind in {
+                        "course_create",
+                        "teacher_add",
+                        "owner_transfer",
+                        "course_activate",
+                    }:
+                        blocked_courses.add(action.subject.casefold())
+            if durable_batch is not None:
+                completed_batch = self.store.complete_verified_batch(
+                    durable_batch.id,
                     manifest_id,
-                    action_id,
-                    status=status,
-                    detail=detail,
-                    load_manifest=False,
+                    results,
                     owner_id=self._operation_owner,
+                    apply_seconds=apply_seconds,
+                    verification_seconds=verification_seconds,
+                    verification_attempts=verification_attempts,
+                    worker_count=worker_count,
+                    throttling_count=throttling_count,
                 )
-            persistence_seconds = time.perf_counter() - persistence_started
-        self._adaptive_workers.observe(
-            action_count=len(chunk),
-            duration_seconds=apply_seconds,
-            batch_failed=batch_failed,
-            throttling_count=throttling_count,
-            verification_attempts=verification_attempts,
-        )
-        self._record_performance_audit(
-            "oneroster_batch_performance",
-            target=f"{len(chunk)} actions",
-            extra={
-                "apply_seconds": apply_seconds,
-                "verification_seconds": verification_seconds,
-                "persistence_seconds": persistence_seconds,
-                "verification_attempts": verification_attempts,
-                "worker_count": worker_count,
-                "next_worker_count": self._adaptive_workers.worker_count,
-                "throttling_count": throttling_count,
-                "outcome": "failed" if failed else "completed",
-                "actions_per_minute": (
-                    len(chunk) * 60.0
-                    / max(0.001, apply_seconds + verification_seconds + persistence_seconds)
-                ),
-            },
-        )
-        return applied, failed
+                persistence_seconds = completed_batch.persistence_seconds
+            else:
+                persistence_started = time.perf_counter()
+                for action_id, (status, detail) in results.items():
+                    self.store.mark_action_result(
+                        manifest_id,
+                        action_id,
+                        status=status,
+                        detail=detail,
+                        load_manifest=False,
+                        owner_id=self._operation_owner,
+                    )
+                persistence_seconds = time.perf_counter() - persistence_started
+            self._adaptive_workers.observe(
+                action_count=len(chunk),
+                duration_seconds=apply_seconds,
+                batch_failed=batch_failed,
+                throttling_count=throttling_count,
+                verification_attempts=verification_attempts,
+            )
+            self._record_performance_audit(
+                "oneroster_batch_performance",
+                target=f"{len(chunk)} actions",
+                extra={
+                    "apply_seconds": apply_seconds,
+                    "verification_seconds": verification_seconds,
+                    "persistence_seconds": persistence_seconds,
+                    "verification_attempts": verification_attempts,
+                    "worker_count": worker_count,
+                    "next_worker_count": self._adaptive_workers.worker_count,
+                    "throttling_count": throttling_count,
+                    "outcome": "failed" if failed else "completed",
+                    "actions_per_minute": (
+                        len(chunk)
+                        * 60.0
+                        / max(
+                            0.001,
+                            apply_seconds
+                            + verification_seconds
+                            + persistence_seconds,
+                        )
+                    ),
+                },
+            )
+            return applied, failed
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
     async def _run_classroom_batch(
         self,

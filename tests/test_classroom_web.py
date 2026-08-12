@@ -454,3 +454,5 @@ def test_user_classroom_partial_lists_teaching_and_enrolled(web_client):
     assert "Teaching" in response.text
     assert "English 1" in response.text
     assert "Enrolled" in response.text
+    assert '/classroom/courses/manage?q=123' in response.text
+    assert '/classroom?q=123' not in response.text

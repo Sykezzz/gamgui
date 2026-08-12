@@ -887,6 +887,91 @@ async def test_pause_request_stops_only_after_current_batch_is_verified(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_continues_through_verification_and_durable_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class SlowVerificationClassroom(FakeClassroom):
+        def __init__(self):
+            super().__init__()
+            self.verification_started = asyncio.Event()
+            self.release_verification = asyncio.Event()
+
+        async def get_course(self, course_id: str, **kwargs):
+            if self.batches:
+                self.verification_started.set()
+                await self.release_verification.wait()
+            return await super().get_course(course_id, **kwargs)
+
+    service, import_id = _ready_service(tmp_path)
+    action = ImportAction(
+        id="create-1",
+        kind="course_create",
+        subject="Section_101",
+        target="teacher@example.org",
+        after=json.dumps(
+            {
+                "alias": "Section_101",
+                "name": "Course 101",
+                "owner_email": "teacher@example.org",
+                "room": "",
+                "section": "",
+            },
+            sort_keys=True,
+        ),
+    )
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(action,),
+        limited_import=True,
+    )
+    connector = SlowVerificationClassroom()
+    executor = OneRosterExecutor(service.store, connector)
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="course_create",
+        owner_id=executor._operation_owner,
+    )
+    heartbeats: list[float] = []
+    original_heartbeat = service.store.heartbeat_execution_run
+
+    def record_heartbeat(*args, **kwargs):
+        heartbeats.append(time.monotonic())
+        return original_heartbeat(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service.store,
+        "heartbeat_execution_run",
+        record_heartbeat,
+    )
+    monkeypatch.setattr(
+        "gamgui.components.oneroster.executor.EXECUTION_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    task = asyncio.create_task(
+        executor._apply(
+            manifest.id,
+            (action,),
+            {"teacher@example.org": "teacher-id"},
+            run_id=run.id,
+        )
+    )
+    await connector.verification_started.wait()
+    await asyncio.sleep(0.04)
+    assert heartbeats
+    connector.release_verification.set()
+
+    assert await task == (1, 0, 0)
+    saved_heartbeat_count = len(heartbeats)
+    await asyncio.sleep(0.03)
+    assert len(heartbeats) == saved_heartbeat_count
+
+
+@pytest.mark.asyncio
 async def test_final_alias_guard_recognizes_matching_course_without_duplicate_create(
     tmp_path: Path,
 ):
