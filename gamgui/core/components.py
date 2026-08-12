@@ -31,6 +31,11 @@ CORE_PROFILE = "core"
 ONEROSTER_PROFILE = "classroom-oneroster"
 ONEROSTER_COMPONENT = "classroom-oneroster"
 SUPPORTED_PROFILES = (CORE_PROFILE, ONEROSTER_PROFILE)
+SUPPORTED_ARTIFACT_PLATFORMS = ("macos", "windows")
+PLATFORM_BUNDLE_FORMATS = {
+    "macos": "app-bundle",
+    "windows": "onedir",
+}
 HOST_COMPONENT_API_VERSION = "1"
 PROFILE_METADATA_RELATIVE = Path("resources") / "components" / "profile.json"
 ARTIFACT_SIDECAR_SUFFIX = ".artifact.json"
@@ -271,6 +276,10 @@ class ComponentArtifactId:
     architecture: str
     minimum_macos_version: str
     packaging_revision: str
+    platform: str = "macos"
+    bundle_format: str = "app-bundle"
+    signer_thumbprint: str = ""
+    toolchain_manifest_digest: str = ""
     artifact_sha256: str = ""
 
     @classmethod
@@ -296,6 +305,12 @@ class ComponentArtifactId:
             architecture=_normalize_architecture(text("architecture", 32)),
             minimum_macos_version=text("minimum_macos_version", 32),
             packaging_revision=text("packaging_revision", 64),
+            platform=text("platform", 16).lower(),
+            bundle_format=text("bundle_format", 32).lower(),
+            signer_thumbprint=text("signer_thumbprint", 64).lower(),
+            toolchain_manifest_digest=text(
+                "toolchain_manifest_digest", 64
+            ).lower(),
             artifact_sha256=text("artifact_sha256", 64).lower(),
         )
         identity.validate(
@@ -330,6 +345,27 @@ class ComponentArtifactId:
                 "CMP-VERIFY-FAILED",
                 "Artifact platform metadata is incomplete.",
             )
+        if self.platform:
+            expected_format = PLATFORM_BUNDLE_FORMATS.get(self.platform)
+            if expected_format is None or self.bundle_format != expected_format:
+                raise ComponentError(
+                    "CMP-INCOMPATIBLE",
+                    "Artifact platform and bundle format do not match.",
+                )
+        elif self.bundle_format:
+            raise ComponentError(
+                "CMP-VERIFY-FAILED",
+                "Legacy artifact metadata has an incomplete platform identity.",
+            )
+        for value, label in (
+            (self.signer_thumbprint, "signer thumbprint"),
+            (self.toolchain_manifest_digest, "toolchain manifest digest"),
+        ):
+            if value and not _valid_sha256(value):
+                raise ComponentError(
+                    "CMP-VERIFY-FAILED",
+                    f"Artifact {label} is invalid.",
+                )
         if self.artifact_sha256 and not _valid_sha256(self.artifact_sha256):
             raise ComponentError("CMP-VERIFY-FAILED", "Artifact hash is invalid.")
         if require_hash and not self.artifact_sha256:
@@ -445,6 +481,10 @@ def build_profile_payload(
     architecture: str,
     minimum_macos_version: str,
     packaging_revision: str,
+    platform_name: str = "macos",
+    bundle_format: str = "app-bundle",
+    signer_thumbprint: str = "",
+    toolchain_manifest_digest: str = "",
 ) -> dict[str, object]:
     identity = ComponentArtifactId(
         source_sha=str(source_sha).lower(),
@@ -454,6 +494,10 @@ def build_profile_payload(
         architecture=_normalize_architecture(architecture),
         minimum_macos_version=str(minimum_macos_version),
         packaging_revision=str(packaging_revision),
+        platform=str(platform_name).lower(),
+        bundle_format=str(bundle_format).lower(),
+        signer_thumbprint=str(signer_thumbprint).lower(),
+        toolchain_manifest_digest=str(toolchain_manifest_digest).lower(),
     )
     identity.validate()
     return EmbeddedProfile(
@@ -596,6 +640,24 @@ def verify_bundle_artifact(
             "Application artifact sidecar is missing or invalid.",
         ) from exc
     envelope = ArtifactEnvelope.from_json(raw)
+    if not envelope.artifact.platform:
+        if (
+            bundle.suffix != ".app"
+            or envelope.signing_channel not in {"local", "developer-id"}
+            or not (bundle / "Contents" / "MacOS" / "GamGUI").is_file()
+        ):
+            raise ComponentError(
+                "CMP-VERIFY-FAILED",
+                "Legacy artifact platform identity could not be proven as macOS.",
+            )
+        envelope = replace(
+            envelope,
+            artifact=replace(
+                envelope.artifact,
+                platform="macos",
+                bundle_format="app-bundle",
+            ),
+        )
     actual_hash = bundle_sha256(bundle)
     if envelope.artifact.artifact_sha256 != actual_hash:
         raise ComponentError(
@@ -603,6 +665,12 @@ def verify_bundle_artifact(
             "Application artifact hash did not match its verified sidecar.",
         )
     embedded_identity = embedded.artifact
+    if not embedded_identity.platform and envelope.artifact.platform == "macos":
+        embedded_identity = replace(
+            embedded_identity,
+            platform="macos",
+            bundle_format="app-bundle",
+        )
     sidecar_identity = replace(envelope.artifact, artifact_sha256="")
     if embedded_identity != sidecar_identity:
         raise ComponentError(
@@ -627,6 +695,12 @@ def verify_runtime_compatibility(artifact: ComponentArtifactId) -> None:
 
     if sys.platform not in {"darwin", "win32"}:
         return
+    runtime_platform = "macos" if sys.platform == "darwin" else "windows"
+    if artifact.platform != runtime_platform:
+        raise ComponentError(
+            "CMP-INCOMPATIBLE",
+            "Application artifact targets another operating system.",
+        )
     current_architecture = _normalize_architecture(platform.machine())
     if artifact.architecture != current_architecture:
         raise ComponentError(

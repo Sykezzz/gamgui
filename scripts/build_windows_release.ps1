@@ -30,6 +30,8 @@ try {
     $env:GAMGUI_BUILD_PROFILE = $Profile
     $env:GAMGUI_SOURCE_SHA = $sourceSha
     $env:GAMGUI_BUILD_ARCH = "x86_64"
+    $env:GAMGUI_BUILD_PLATFORM = "windows"
+    $env:GAMGUI_BUNDLE_FORMAT = "onedir"
     $env:GAMGUI_MINIMUM_MACOS = "10.0"
     $env:GAMGUI_PACKAGING_REVISION = "1-windows"
     $env:GAMGUI_BUILD_METADATA_DIR = $metadataRoot

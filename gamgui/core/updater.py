@@ -41,6 +41,12 @@ from .components import (
     verify_runtime_compatibility,
 )
 from .paths import APP_DATA_ENV, app_data_dir
+from .update_platform import (
+    bundle_executable,
+    bundle_is_complete,
+    installed_bundle_path,
+    runtime_platform,
+)
 
 UPDATE_REPOSITORY = "Sykezzz/gamgui"
 UPDATE_BRANCH = "district-main"
@@ -185,6 +191,12 @@ class UpdateState:
     activation_transaction_id: str = ""
     activation_journal: Optional[ActivationJournal] = None
     activation_journal_invalid: bool = False
+    installed_platform: str = ""
+    candidate_platform: str = ""
+    local_signer_thumbprint: str = ""
+    toolchain_revision: str = ""
+    windows_installation_root: str = ""
+    pending_bundle: str = ""
 
     @classmethod
     def from_json(cls, value: object) -> "UpdateState":
@@ -311,10 +323,24 @@ class UpdateState:
                 activation_journal = ActivationJournal.from_json(raw_journal)
             except (TypeError, ValueError):
                 activation_journal_invalid = True
+        installed_platform = _text("installed_platform", 16).lower()
+        candidate_platform = _text("candidate_platform", 16).lower()
+        if installed_platform not in {"", "macos", "windows"}:
+            installed_platform = ""
+        if candidate_platform not in {"", "macos", "windows"}:
+            candidate_platform = ""
+        if not installed_platform and installed_artifact is not None:
+            installed_platform = installed_artifact.platform
+        if not candidate_platform and candidate_artifact is not None:
+            candidate_platform = candidate_artifact.platform
+        signer_thumbprint = _text("local_signer_thumbprint", 64).lower()
+        if signer_thumbprint and not re.fullmatch(r"[0-9a-f]{64}", signer_thumbprint):
+            signer_thumbprint = ""
+        pending_bundle = _text("pending_bundle") or _text("pending_app")
         return cls(
             installed_sha=installed_sha,
             candidate_sha=candidate_sha,
-            pending_app=_text("pending_app") if candidate_sha else "",
+            pending_app=pending_bundle if candidate_sha else "",
             blocked_shas=blocked_shas,
             last_checked_at=last_checked_at,
             last_error=_text("last_error"),
@@ -361,6 +387,12 @@ class UpdateState:
             ),
             activation_journal=activation_journal,
             activation_journal_invalid=activation_journal_invalid,
+            installed_platform=installed_platform,
+            candidate_platform=(candidate_platform if candidate_sha else ""),
+            local_signer_thumbprint=signer_thumbprint,
+            toolchain_revision=_text("toolchain_revision", 128),
+            windows_installation_root=_text("windows_installation_root"),
+            pending_bundle=(pending_bundle if candidate_sha else ""),
         )
 
 
@@ -431,9 +463,15 @@ class UpdateStateStore:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True)
         _owner_only_directory(parent)
-        encoded = (
-            json.dumps(asdict(state), sort_keys=True, indent=2) + "\n"
-        ).encode("utf-8")
+        payload = asdict(state)
+        payload["pending_bundle"] = state.pending_app
+        if state.installed_artifact is not None:
+            payload["installed_platform"] = state.installed_artifact.platform
+        if state.candidate_artifact is not None:
+            payload["candidate_platform"] = state.candidate_artifact.platform
+        encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(
+            "utf-8"
+        )
         descriptor, temporary_value = tempfile.mkstemp(
             prefix=f".{self.path.name}.",
             suffix=".tmp",
@@ -2899,11 +2937,7 @@ def wait_for_process_exit(pid: int, timeout: float = 60.0) -> bool:
 
 
 def installed_app_path(executable: Optional[Path] = None) -> Optional[Path]:
-    path = Path(executable) if executable is not None else Path(sys.executable).resolve()
-    for parent in path.parents:
-        if parent.suffix == ".app":
-            return parent
-    return None
+    return installed_bundle_path(executable)
 
 
 def write_health_marker_from_environment(
@@ -3037,9 +3071,13 @@ def _require_paired_profile_identity(
     paired_fields = (
         "source_sha",
         "version",
+        "platform",
+        "bundle_format",
         "architecture",
         "minimum_macos_version",
         "packaging_revision",
+        "signer_thumbprint",
+        "toolchain_manifest_digest",
     )
     mismatches = [
         field
