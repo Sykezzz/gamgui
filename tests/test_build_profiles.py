@@ -40,6 +40,9 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "helper accepted an ordinary application launch" in script
     assert "Get-FileHash" in fetch
     assert "Checksum mismatch" in fetch
+    assert "gamgui-gam-download-cache" in fetch
+    assert "$attempt -le 3" in fetch
+    assert "Reusing checksum-verified" in fetch
     assert "gam.exe" in fetch
     assert "gam-7.47.02-windows-x86_64.zip" in checksums
 
