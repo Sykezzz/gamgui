@@ -71,7 +71,10 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "-KeyLength 3072" in script
     assert "-KeyExportPolicy NonExportable" in script
     assert ".AddYears(10)" in script
-    assert "TrustedPublisher" in script and "CurrentUser\\Root" in script
+    assert '@("Root", "TrustedPublisher")' in script
+    assert "StoreLocation]::CurrentUser" in script
+    assert "X509Store" in script and "OpenFlags]::ReadWrite" in script
+    assert "Import-Certificate" not in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script
     assert "Get-AuthenticodeSignature" in script
     assert '"RemoveTrust"' in script

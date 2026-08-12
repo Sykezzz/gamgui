@@ -45,13 +45,20 @@ function Test-Trusted([System.Security.Cryptography.X509Certificates.X509Certifi
 }
 
 function Add-Trust([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
-    $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-local-" + [guid]::NewGuid() + ".cer")
-    try {
-        [System.IO.File]::WriteAllBytes($temporary, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-        Import-Certificate -FilePath $temporary -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-        Import-Certificate -FilePath $temporary -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
-    } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    # The PowerShell import cmdlet can surface an interactive root-trust prompt
+    # on hosted Windows even for CurrentUser.  The caller owns the consent boundary; write
+    # the public certificate through the noninteractive store API after consent.
+    foreach ($storeName in @("Root", "TrustedPublisher")) {
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            $storeName,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+        )
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $store.Add($Certificate)
+        } finally {
+            $store.Dispose()
+        }
     }
 }
 
