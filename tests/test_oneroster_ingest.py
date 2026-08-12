@@ -414,6 +414,29 @@ def test_future_teacher_enrollment_is_immediate_but_future_student_waits(
     assert "student@example.org" in students.getvalue()
 
 
+def test_schedule_scope_reuses_same_day_immutable_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OneRosterService("example.org", tmp_path / "same-day-scope")
+    snapshot = service.upload(zip_bytes(valid_files()))
+
+    def unexpected_rebuild(*_args, **_kwargs):
+        raise AssertionError("same-day scope should reuse the immutable course plan")
+
+    monkeypatch.setattr(
+        "gamgui.components.oneroster.store.rebuild_course_plans",
+        unexpected_rebuild,
+    )
+
+    refreshed = service.store.refresh_schedule_scope(
+        snapshot.id,
+        today=date.fromisoformat(snapshot.scope_date),
+    )
+
+    assert refreshed == snapshot
+
+
 def test_selects_nearest_upcoming_school_year_during_summer(
     tmp_path: Path,
 ) -> None:

@@ -25,6 +25,7 @@ from gamgui.core.processes import current_process_identity, process_lease_is_dea
 from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
 from .ingest import (
+    district_roster_date,
     normalize_course_name_template,
     read_schedule_scope,
     rebuild_course_plans,
@@ -264,7 +265,13 @@ class OneRosterStore:
     ) -> OneRosterSnapshot:
         snapshot = self.get_import(import_id)
         self._require_material(snapshot)
-        return self._refresh_automatic_scope(snapshot, today=today)
+        scope_date = today or district_roster_date()
+        if (
+            snapshot.selected_session_id == AUTOMATIC_SESSION_SCOPE
+            and snapshot.scope_date == scope_date.isoformat()
+        ):
+            return snapshot
+        return self._refresh_automatic_scope(snapshot, today=scope_date)
 
     def history(self, limit: int = MAX_PAGE_SIZE) -> tuple[OneRosterSnapshot, ...]:
         page_size = max(1, min(int(limit or MAX_PAGE_SIZE), MAX_PAGE_SIZE))
