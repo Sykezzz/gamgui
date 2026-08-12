@@ -175,6 +175,9 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert 'Exercise-Profile "classroom-oneroster"' in exercise
     assert "Apps & Features" in exercise
     assert "tampered bootstrap was accepted" in exercise
+    assert "Invoke-MonitoredSetup" in exercise
+    assert "Setup progress:" in exercise
+    assert "sanitized phase" in exercise
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():
