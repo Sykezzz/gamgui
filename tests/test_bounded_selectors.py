@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
+
 from gamgui.core.audit import AuditLog
 from gamgui.core.directory_index import Page
 from gamgui.core.connectors.gam_connector import GAMConnector
@@ -37,8 +39,9 @@ def bounded_client(tmp_path: Path):
     )
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / "mock_gam.sh",
+        gam_binary=MOCK_GAM,
         base_dir=tmp_path,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     connector = GAMConnector(
         runner=runner,

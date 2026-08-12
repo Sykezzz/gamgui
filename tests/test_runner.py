@@ -42,6 +42,25 @@ def test_gam_worker_override_is_scoped_to_child_environment(runner, tmp_path, mo
     assert "GAM_THREADS" not in os.environ
 
 
+def test_command_prefix_keeps_user_arguments_separate(vault, tmp_path):
+    binary = tmp_path / "interpreter"
+    script = tmp_path / "mock gam script"
+    binary.write_text("mock", encoding="utf-8")
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=binary,
+        base_dir=tmp_path,
+        command_prefix=(str(binary), str(script)),
+    )
+
+    assert runner._subprocess_command(["signature", "<div>A & B</div>"]) == [
+        str(binary),
+        str(script),
+        "signature",
+        "<div>A & B</div>",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_independent_authenticated_reads_use_isolated_configs_concurrently(
     runner,

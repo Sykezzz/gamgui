@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +20,7 @@ from gamgui.core.connectors.gam_connector import GAMConnector
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 from gamgui.web.server import AppState, create_app
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
 
 FIXTURES = Path(__file__).parent / "fixtures"
 DOMAIN = "example.com"
@@ -34,9 +34,10 @@ def client(tmp_path, monkeypatch):
     registry = ActivityRegistry()
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / ("mock_gam.cmd" if os.name == "nt" else "mock_gam.sh"),
+        gam_binary=MOCK_GAM,
         base_dir=tmp_path,
         activity_registry=registry,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     conn = GAMConnector(runner=runner, domain=DOMAIN, audit=AuditLog(tmp_path / "audit.jsonl"))
     state = AppState(

@@ -8,6 +8,8 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
+
 from gamgui.core.audit import AuditLog
 from gamgui.core.calendar_index import CalendarIndex, IndexedCalendar
 from gamgui.core.connectors.gam_connector import GAMConnector
@@ -26,7 +28,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("GAM_MOCK_FIXTURES", str(FIXTURES))
     vault = SecretsVault(InMemoryBackend())
     vault.set_all(DOMAIN, {"client_secrets": "{}", "oauth2": "tok", "oauth2service": '{"client_id": "x"}'})
-    runner = GAMRunner(vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path)
+    runner = GAMRunner(vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path, command_prefix=MOCK_GAM_COMMAND_PREFIX)
     conn = GAMConnector(runner=runner, domain=DOMAIN, audit=AuditLog(tmp_path / "audit.jsonl"))
     state = AppState(vault=vault, runner=runner, audit_domain=DOMAIN, connector=conn, token="t",
                      calendar_index=CalendarIndex(tmp_path / "calendar_index.db"))

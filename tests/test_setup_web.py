@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
 
 from gamgui.core import setup as setup_mod
 from gamgui.core.activity import ActivityPathUnavailableError
@@ -32,16 +35,46 @@ except ImportError:  # Windows does not expose the POSIX account database.
     pwd = None
 
 
+def _set_home(monkeypatch, path) -> None:
+    monkeypatch.setenv("HOME", str(path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(path))
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise OSError(completed.stderr or completed.stdout or "junction creation failed")
+
+
+def _file_symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows file-symlink privilege is unavailable")
+        raise
+
+
 @pytest.fixture
 def ctx(tmp_path, monkeypatch):
     # An import is bounded to the home dir plus $GAMCFGDIR (see SetupService.allowed_roots), so make
     # tmp_path *be* home for the duration: the folders these tests build are then genuinely "under
     # home", and the app's own data dir (~/Library/Application Support/GamGUI) stays out of the real
     # one. $GAMCFGDIR starts unset so the default roots are exercised.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GAMCFGDIR", raising=False)
     vault = SecretsVault(InMemoryBackend())
-    runner = GAMRunner(vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path)
+    runner = GAMRunner(vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path, command_prefix=MOCK_GAM_COMMAND_PREFIX)
     state = AppState(vault=vault, runner=runner, audit_domain="", connector=None, token="t")
     client = TestClient(create_app(state))
     client.get("/?token=t")  # establish the token cookie
@@ -410,7 +443,7 @@ def test_import_rejects_a_symlink_under_home_pointing_outside(ctx, tmp_path_fact
     outside = tmp_path_factory.mktemp("off-limits")
     _write_creds(outside)
     link = base / "shortcut"
-    link.symlink_to(outside, target_is_directory=True)
+    _directory_link(link, outside)
     with pytest.raises(ValueError, match="outside the places"):
         _svc(state).import_dir(link, "ex.com")
     assert not vault.has_credentials("ex.com")
@@ -453,7 +486,7 @@ def test_unicode_normalization_variant_of_home_is_accepted(ctx, monkeypatch):
     home_nfc.mkdir()
     if not (os.path.exists(home_nfd) and os.path.samefile(home_nfc, home_nfd)):
         pytest.skip("this volume distinguishes NFC from NFD: the two spellings are not one dir")
-    monkeypatch.setenv("HOME", str(home_nfd))    # home, decomposed
+    _set_home(monkeypatch, home_nfd)              # home, decomposed
     cfg = home_nfc / "gam"                       # a folder under it, composed
     _write_creds(cfg)
     assert _svc(state).import_dir(cfg, "ex.com")
@@ -484,6 +517,8 @@ def test_overbroad_gamcfgdir_does_not_expose_system_config(ctx, monkeypatch):
     _, base, vault, state = ctx
     svc = _svc(state)
     home = Path.home().resolve()
+    default_roots = svc.allowed_roots()
+    assert home in default_roots
     cfg = base / "still-fine"
     _write_creds(cfg)
 
@@ -493,7 +528,7 @@ def test_overbroad_gamcfgdir_does_not_expose_system_config(ctx, monkeypatch):
 
     for bad in ("/", "/private", "/etc/..", "/System/Volumes/Data"):
         monkeypatch.setenv("GAMCFGDIR", bad)
-        assert svc.allowed_roots() == [home]        # nothing was added
+        assert svc.allowed_roots() == default_roots  # nothing was added
         for etc in spellings_of_etc:
             with pytest.raises(ValueError, match="outside the places"):
                 svc.resolve_dir(etc)
@@ -512,12 +547,14 @@ def test_gamcfgdir_must_be_an_existing_directory(ctx, monkeypatch, tmp_path_fact
     _, base, vault, state = ctx
     svc = _svc(state)
     home = Path.home().resolve()
+    default_roots = svc.allowed_roots()
+    assert home in default_roots
     volume = tmp_path_factory.mktemp("volume")
     keyfile = volume / "not-a-folder.txt"
     keyfile.write_text("secret bytes")
 
     monkeypatch.setenv("GAMCFGDIR", str(keyfile))
-    assert svc.allowed_roots() == [home]            # a file never becomes a root…
+    assert svc.allowed_roots() == default_roots     # a file never becomes a root…
     with pytest.raises(ValueError, match="outside the places"):
         svc.resolve_dir(volume)                     # …so its folder is still off-limits
     with pytest.raises(ValueError, match="outside the places"):
@@ -527,7 +564,7 @@ def test_gamcfgdir_must_be_an_existing_directory(ctx, monkeypatch, tmp_path_fact
     cfg = base / "cfg"
     _write_creds(cfg)
     (cfg / "oauth2.txt").unlink()
-    (cfg / "oauth2.txt").symlink_to(keyfile)
+    _file_symlink_or_skip(cfg / "oauth2.txt", keyfile)
     imported = svc.import_dir(cfg, "ex.com")
     assert "oauth2" not in imported
     assert vault.get("ex.com", "oauth2") is None
@@ -535,7 +572,7 @@ def test_gamcfgdir_must_be_an_existing_directory(ctx, monkeypatch, tmp_path_fact
 
     if Path("/etc/passwd").is_file():               # the real thing, same rule
         monkeypatch.setenv("GAMCFGDIR", "/etc/passwd")
-        assert svc.allowed_roots() == [home]
+        assert svc.allowed_roots() == default_roots
 
 
 @pytest.mark.parametrize(
@@ -546,13 +583,15 @@ def test_overbroad_gamcfgdir_values_are_skipped_quietly(ctx, monkeypatch, bad):
     _, base, vault, state = ctx
     svc = _svc(state)
     home = Path.home().resolve()
+    default_roots = svc.allowed_roots()
+    assert home in default_roots
     if not Path(bad).is_dir():
         pytest.skip(f"no {bad} on this machine")
     cfg = base / "still-fine"
     _write_creds(cfg)
 
     monkeypatch.setenv("GAMCFGDIR", bad)
-    assert svc.allowed_roots() == [home]            # quiet skip: the bound is not widened
+    assert svc.allowed_roots() == default_roots     # quiet skip: the bound is not widened
     for etc in ("/etc", "/private/etc", "/System/Volumes/Data/private/etc"):
         if Path(etc).exists():                      # every spelling of /etc stays out of reach
             with pytest.raises(ValueError, match="outside the places"):
@@ -569,12 +608,14 @@ def test_gamcfgdir_above_home_is_skipped(ctx, monkeypatch, tmp_path_factory):
     outer = tmp_path_factory.mktemp("Users-like")
     home = outer / "me"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
+    monkeypatch.delenv("GAMCFGDIR", raising=False)
+    default_roots = _svc(state).allowed_roots()
     monkeypatch.setenv("GAMCFGDIR", str(outer))
     _write_creds(outer)
     svc = _svc(state)
 
-    assert svc.allowed_roots() == [home.resolve()]
+    assert svc.allowed_roots() == default_roots
     with pytest.raises(ValueError, match="outside the places"):
         svc.import_dir(outer, "ex.com")
     assert not vault.has_credentials("ex.com")
@@ -589,7 +630,7 @@ def test_gamcfgdir_of_users_is_skipped_because_home_sits_under_it(ctx, monkeypat
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     if Path("/Users") not in real_home.parents:
         pytest.skip("this account's home does not live under /Users")
-    monkeypatch.setenv("HOME", str(real_home))       # the operator's actual home, as in production
+    _set_home(monkeypatch, real_home)                 # the operator's actual home, as in production
     monkeypatch.setenv("GAMCFGDIR", "/Users")
     svc = _svc(state)
     assert svc.allowed_roots() == [real_home]
@@ -627,9 +668,10 @@ def test_home_is_allowed_even_when_the_sanity_rules_would_drop_it(ctx, monkeypat
     # just walked the operator through creating.
     _, _, _, state = ctx
     svc = _svc(state)
-    monkeypatch.setenv("HOME", "/")
-    assert not _root_is_sane(Path("/"), Path("/"))            # the rules would indeed drop it…
-    assert svc.allowed_roots() == [Path("/")]                 # …but home is a root regardless
+    _set_home(monkeypatch, "/")
+    root_home = Path.home().resolve()
+    assert not _root_is_sane(root_home, root_home)             # the rules would indeed drop it…
+    assert svc.allowed_roots() == [root_home]                  # …but home is a root regardless
     anywhere = tmp_path_factory.mktemp("under-the-root")
     assert svc.resolve_dir(anywhere) == anywhere.resolve()    # so nothing is refused outright
 
@@ -644,7 +686,8 @@ def test_no_determinable_home_reports_instead_of_crashing(ctx, monkeypatch):
 
     monkeypatch.setattr(Path, "home", staticmethod(no_home))
     svc = _svc(state)
-    assert svc.allowed_roots() == []                         # nothing is in bounds any more…
+    roots = svc.allowed_roots()
+    assert base.resolve() not in roots                       # the chosen folder is not in bounds
     with pytest.raises(ValueError, match="outside the places"):
         svc.import_dir(base, "ex.com")                       # …but that is a ValueError, not a crash
     assert svc.candidate_dirs() == []
@@ -779,7 +822,7 @@ def test_candidate_dirs_never_offers_what_the_import_would_refuse(ctx, monkeypat
     outer = tmp_path_factory.mktemp("above-home")
     home = outer / "me"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
     monkeypatch.setenv("GAMCFGDIR", str(outer))
     _write_creds(outer)
     svc = _svc(state)
@@ -808,16 +851,15 @@ def test_every_offered_candidate_dir_actually_imports(ctx, monkeypatch, tmp_path
 
 
 def test_out_of_bounds_message_is_truthful_about_gamcfgdir(ctx):
-    # The old message said "point $GAMCFGDIR at it and relaunch GamGUI" — but the .app has no
-    # LSEnvironment in gamgui.spec, so an app launched from Finder never sees shell variables. Lead
-    # with the advice that always works, and keep the caveat attached to the other one.
+    # Lead with the advice that always works. The environment-variable alternative must explain
+    # that a desktop launch sees only the environment it inherited, on either platform.
     _, _, _, state = ctx
     with pytest.raises(ValueError) as exc:
         _svc(state).resolve_dir("/etc")
     msg = str(exc.value)
     assert "home folder" in msg
     assert msg.index("home folder") < msg.index("GAMCFGDIR")   # the working advice comes first
-    assert "same terminal session" in msg and "Finder" in msg
+    assert "same environment" in msg
 
 
 def test_verify_activates_connector_without_minting_oneroster_readiness(

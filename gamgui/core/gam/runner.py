@@ -163,6 +163,7 @@ class GAMRunner:
         base_dir: Optional[Path] = None,
         timeout: float = DEFAULT_TIMEOUT,
         activity_registry: Optional[ActivityRegistry] = None,
+        command_prefix: Optional[Sequence[str]] = None,
     ) -> None:
         self.vault = vault
         self.gam_binary = Path(gam_binary) if gam_binary else locate_gam_binary()
@@ -173,6 +174,13 @@ class GAMRunner:
             if activity_registry is not None
             else global_activity_registry
         )
+        self._command_prefix = (
+            tuple(str(part) for part in command_prefix)
+            if command_prefix is not None
+            else (str(self.gam_binary),)
+        )
+        if not self._command_prefix or Path(self._command_prefix[0]) != self.gam_binary:
+            raise ValueError("The GAM command prefix must begin with the checked GAM binary.")
         # Serializes mutating calls so two writes can't race the same ephemeral GAMCFGDIR.
         self._write_lock = asyncio.Lock()
         # Independent read processes use isolated GAMCFGDIRs. Only refreshed OAuth
@@ -230,6 +238,16 @@ class GAMRunner:
             "pass_fds": pass_fds,
         }
 
+    def _subprocess_command(self, argv: Sequence[str]) -> list[str]:
+        """Return a directly executable command for this platform.
+
+        A prefix is used only by controlled test harnesses that launch the
+        cross-platform mock through an interpreter. User-controlled GAM
+        arguments are still passed separately and are never shell-parsed.
+        """
+
+        return [*self._command_prefix, *argv]
+
     async def _exec(
         self,
         argv: Sequence[str],
@@ -241,8 +259,7 @@ class GAMRunner:
         self._require_binary()
         with self.activity_registry.subprocess_pass_fds() as pass_fds:
             proc = await asyncio.create_subprocess_exec(
-                str(self.gam_binary),
-                *argv,
+                *self._subprocess_command(argv),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._build_env(cfgdir, gam_threads=gam_threads),
@@ -275,8 +292,7 @@ class GAMRunner:
         with stdout_path.open("wb", buffering=0) as stdout_file:
             with self.activity_registry.subprocess_pass_fds() as pass_fds:
                 proc = await asyncio.create_subprocess_exec(
-                    str(self.gam_binary),
-                    *argv,
+                    *self._subprocess_command(argv),
                     stdout=stdout_file,
                     stderr=asyncio.subprocess.PIPE,
                     env=self._build_env(cfgdir),

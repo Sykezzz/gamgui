@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,13 @@ from gamgui.core.setup import (
     _extract_auth_url,
     _parse_check,
 )
+from tests.windows_acl_assertions import assert_current_user_only_acl
+
+
+def _set_home(monkeypatch, path) -> None:
+    monkeypatch.setenv("HOME", str(path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(path))
 
 
 @pytest.fixture
@@ -30,7 +39,7 @@ def bounded_home(tmp_path, monkeypatch):
     app's own data dir stays out of the operator's real one. $GAMCFGDIR starts unset so the default
     roots are what gets exercised.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GAMCFGDIR", raising=False)
     return tmp_path
 
@@ -42,6 +51,30 @@ def _write_config(d: Path, with_client_id: bool = True) -> None:
     if with_client_id:
         svc["client_id"] = "123456789.apps.googleusercontent.com"
     (d / "oauth2service.json").write_text(json.dumps(svc))
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise OSError(completed.stderr or completed.stdout or "junction creation failed")
+
+
+def _file_symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows file-symlink privilege is unavailable")
+        raise
 
 
 def _svc(vault: SecretsVault, tmp_path: Path) -> SetupService:
@@ -72,6 +105,18 @@ def test_import_dir_populates_vault(tmp_path, bounded_home):
     assert set(imported) == set(FILENAMES.keys())
     assert vault.has_credentials("ex.com")
     assert "service_account" in (vault.get("ex.com", "oauth2service") or "")
+
+
+def test_managed_setup_dir_is_owner_only(tmp_path, monkeypatch):
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    monkeypatch.setattr(setup_mod, "app_runtime_dir", lambda: runtime)
+    managed = _svc(SecretsVault(InMemoryBackend()), tmp_path).managed_setup_dir()
+
+    if os.name == "nt":
+        assert_current_user_only_acl(managed, directory=True)
+    else:
+        assert stat.S_IMODE(managed.stat().st_mode) == 0o700
 
 
 def test_import_from_managed_dir_wipes_plaintext(tmp_path, monkeypatch, bounded_home):
@@ -117,7 +162,7 @@ def test_import_skips_a_credential_file_symlinked_out_of_bounds(tmp_path, bounde
     if not secret.is_file():
         pytest.skip("no /private/etc/passwd to point at on this machine")
     (tmp_path / "oauth2.txt").unlink()
-    (tmp_path / "oauth2.txt").symlink_to(secret)
+    _file_symlink_or_skip(tmp_path / "oauth2.txt", secret)
 
     vault = SecretsVault(InMemoryBackend())
     imported = _svc(vault, tmp_path).import_dir(tmp_path, "ex.com")
@@ -178,7 +223,7 @@ def _outside_dir(factory, contents: str) -> Path:
 def test_a_swap_between_the_bounds_check_and_the_read_lands_nothing(
     tmp_path, monkeypatch, tmp_path_factory
 ):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GAMCFGDIR", raising=False)
     cfg = tmp_path / "cfg"
     cfg.mkdir()
@@ -187,7 +232,7 @@ def test_a_swap_between_the_bounds_check_and_the_read_lands_nothing(
 
     def win_the_race() -> None:
         cfg.rename(tmp_path / "cfg-real")                    # the approved dir steps aside…
-        cfg.symlink_to(outside, target_is_directory=True)    # …a link out of bounds takes its name
+        _directory_link(cfg, outside)                        # …a link out of bounds takes its name
 
     vault = SecretsVault(InMemoryBackend())
     svc = _svc(vault, tmp_path)
@@ -207,7 +252,7 @@ def test_a_swap_between_the_bounds_check_and_the_read_lands_nothing(
 def test_a_swap_after_the_pin_cannot_redirect_the_read(tmp_path, monkeypatch, tmp_path_factory):
     # Same swap, one instant later. A descriptor names an inode, so the reads still come from the
     # directory that was proven in bounds — the attacker's rename simply has nothing left to bite on.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GAMCFGDIR", raising=False)
     cfg = tmp_path / "cfg"
     cfg.mkdir()
@@ -215,8 +260,13 @@ def test_a_swap_after_the_pin_cannot_redirect_the_read(tmp_path, monkeypatch, tm
     outside = _outside_dir(tmp_path_factory, "OUT-OF-BOUNDS")
 
     def win_the_race() -> None:
-        cfg.rename(tmp_path / "cfg-real")
-        cfg.symlink_to(outside, target_is_directory=True)
+        try:
+            cfg.rename(tmp_path / "cfg-real")
+        except PermissionError:
+            # Windows pins without delete sharing, so the attempted swap is
+            # blocked before it can affect the read.
+            return
+        _directory_link(cfg, outside)
 
     _after_the_pin(monkeypatch, win_the_race)
     vault = SecretsVault(InMemoryBackend())
@@ -240,7 +290,7 @@ def test_a_symlinked_credential_file_is_not_followed_even_in_bounds(tmp_path, bo
     target.parent.mkdir()
     target.write_text("in-bounds, but reached through a link")
     (tmp_path / "oauth2.txt").unlink()
-    (tmp_path / "oauth2.txt").symlink_to(target)
+    _file_symlink_or_skip(tmp_path / "oauth2.txt", target)
 
     vault = SecretsVault(InMemoryBackend())
     imported = _svc(vault, tmp_path).import_dir(tmp_path, "ex.com")
@@ -255,7 +305,7 @@ def test_the_wipe_never_destroys_a_file_it_did_not_import(tmp_path, monkeypatch,
     # The destructive half of the same race: swapping our managed staging dir for a symlink to
     # somebody else's directory made GamGUI zero and unlink files there — files it had never imported,
     # outside the roots, while the real plaintext credentials survived elsewhere.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GAMCFGDIR", raising=False)
     staging = tmp_path / "staging"
     staging.mkdir()
@@ -267,8 +317,11 @@ def test_the_wipe_never_destroys_a_file_it_did_not_import(tmp_path, monkeypatch,
     monkeypatch.setattr(svc, "managed_setup_dir", lambda: staging)
 
     def win_the_race(p, dir_fd=None) -> bool:
-        staging.rename(tmp_path / "staging-real")
-        staging.symlink_to(theirs, target_is_directory=True)
+        try:
+            staging.rename(tmp_path / "staging-real")
+        except PermissionError:
+            return True                 # the Windows pin blocked the swap
+        _directory_link(staging, theirs)
         return True                     # …and claim the dir is ours, so the wipe pass does run
 
     monkeypatch.setattr(svc, "_is_managed", win_the_race)
@@ -278,8 +331,10 @@ def test_the_wipe_never_destroys_a_file_it_did_not_import(tmp_path, monkeypatch,
     for fname in FILENAMES.values():
         assert (theirs / fname).is_file()                    # nothing of theirs unlinked…
         assert (theirs / fname).read_text() == "NOT OURS"    # …or zeroed
+    renamed_staging = tmp_path / "staging-real"
+    pinned_staging = renamed_staging if renamed_staging.exists() else staging
     for fname in FILENAMES.values():                         # our own staged files are what went
-        assert not (tmp_path / "staging-real" / fname).exists()
+        assert not (pinned_staging / fname).exists()
 
 
 def test_the_wipe_only_touches_the_inodes_it_imported(tmp_path, monkeypatch, bounded_home):

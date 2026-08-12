@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
+
 import gamgui.core.audit as audit_mod
 from gamgui.core.audit import AUDIT_PAGE_SIZE, AuditIndex, AuditLog
 from gamgui.core.connectors.gam_connector import GAMConnector
@@ -264,7 +266,8 @@ def indexed_client(tmp_path, monkeypatch):
         },
     )
     runner = GAMRunner(
-        vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path
+        vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     connector = GAMConnector(
         runner=runner,
