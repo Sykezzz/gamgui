@@ -25,6 +25,7 @@ from gamgui.core.processes import current_process_identity, process_lease_is_dea
 from .gate import arm_gate as gate_arm
 from .gate import closed_gate, hold_gate as gate_hold, open_gate as gate_open
 from .ingest import (
+    district_roster_date,
     normalize_course_name_template,
     read_schedule_scope,
     rebuild_course_plans,
@@ -35,6 +36,8 @@ from .models import (
     DEFAULT_COURSE_NAME_TEMPLATE,
     DashboardStatus,
     ExecutionBatch,
+    ExecutionBatchProgress,
+    ExecutionPhaseProgress,
     ExecutionProgress,
     ExecutionRun,
     GateState,
@@ -69,6 +72,38 @@ from .thresholds import evaluation_hash
 
 def default_component_data_root() -> Path:
     return app_data_dir() / "components" / "classroom-oneroster"
+
+
+_PROGRESS_PHASES = (
+    (
+        "classes",
+        "Class setup",
+        frozenset({
+            "course_create",
+            "course_update",
+            "course_activate",
+            "course_archive",
+        }),
+    ),
+    (
+        "teachers",
+        "Teacher access",
+        frozenset({"teacher_add", "teacher_remove", "owner_transfer"}),
+    ),
+    (
+        "students",
+        "Student roster",
+        frozenset({"student_add", "student_remove"}),
+    ),
+)
+
+
+def _progress_phase(kind: str) -> tuple[str, str]:
+    normalized = str(kind or "").casefold()
+    for key, label, kinds in _PROGRESS_PHASES:
+        if normalized in kinds:
+            return key, label
+    return "other", "Other checked work"
 
 
 class OneRosterStore:
@@ -264,7 +299,13 @@ class OneRosterStore:
     ) -> OneRosterSnapshot:
         snapshot = self.get_import(import_id)
         self._require_material(snapshot)
-        return self._refresh_automatic_scope(snapshot, today=today)
+        scope_date = today or district_roster_date()
+        if (
+            snapshot.selected_session_id == AUTOMATIC_SESSION_SCOPE
+            and snapshot.scope_date == scope_date.isoformat()
+        ):
+            return snapshot
+        return self._refresh_automatic_scope(snapshot, today=scope_date)
 
     def history(self, limit: int = MAX_PAGE_SIZE) -> tuple[OneRosterSnapshot, ...]:
         page_size = max(1, min(int(limit or MAX_PAGE_SIZE), MAX_PAGE_SIZE))
@@ -1093,6 +1134,47 @@ class OneRosterStore:
         assert created is not None
         return _execution_run_from_row(created)
 
+    def record_execution_planning_receipt(
+        self,
+        run_id: str,
+        *,
+        total_seconds: float,
+        directory_snapshot_seconds: float,
+        classroom_snapshot_seconds: float,
+        now: Optional[float] = None,
+    ) -> ExecutionRun:
+        """Persist sanitized planning timings without storing source or tenant data."""
+
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            result = conn.execute(
+                """
+                UPDATE execution_runs
+                SET planning_seconds = ?, directory_snapshot_seconds = ?,
+                    classroom_snapshot_seconds = ?, updated_at = ?,
+                    last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                  AND status IN ('running', 'pause_requested')
+                """,
+                (
+                    max(0.0, float(total_seconds)),
+                    max(0.0, float(directory_snapshot_seconds)),
+                    max(0.0, float(classroom_snapshot_seconds)),
+                    timestamp,
+                    timestamp,
+                    run_id,
+                    self.domain,
+                ),
+            )
+            if result.rowcount != 1:
+                raise KeyError("Active OneRoster execution run not found.")
+            row = conn.execute(
+                "SELECT * FROM execution_runs WHERE id = ? AND domain = ?",
+                (run_id, self.domain),
+            ).fetchone()
+        assert row is not None
+        return _execution_run_from_row(row)
+
     def heartbeat_execution_run(
         self,
         run_id: str,
@@ -1334,6 +1416,7 @@ class OneRosterStore:
         self,
         batch_id: str,
         *,
+        worker_count: int = 5,
         now: Optional[float] = None,
     ) -> ExecutionBatch:
         timestamp = float(now if now is not None else time.time())
@@ -1341,11 +1424,11 @@ class OneRosterStore:
             result = conn.execute(
                 """
                 UPDATE execution_batches
-                SET status = 'running', started_at = ?
+                SET status = 'running', started_at = ?, worker_count = ?
                 WHERE id = ? AND status = 'prepared'
                   AND run_id IN (SELECT id FROM execution_runs WHERE domain = ?)
                 """,
-                (timestamp, batch_id, self.domain),
+                (timestamp, int(worker_count), batch_id, self.domain),
             )
             if result.rowcount != 1:
                 raise OneRosterError(
@@ -1423,6 +1506,142 @@ class OneRosterStore:
         return _execution_batch_from_row(
             row, tuple(str(item["action_id"]) for item in action_rows)
         )
+
+    def complete_verified_batch(
+        self,
+        batch_id: str,
+        manifest_id: str,
+        results: Mapping[str, tuple[str, str]],
+        *,
+        owner_id: str,
+        apply_seconds: float,
+        verification_seconds: float,
+        verification_attempts: int,
+        worker_count: int,
+        throttling_count: int = 0,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Atomically save exact verified results and complete their durable batch."""
+
+        owner = owner_id.strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        normalized = {
+            str(action_id): (str(status), str(detail))
+            for action_id, (status, detail) in results.items()
+        }
+        if not normalized or any(
+            status not in {"applied", "failed", "skipped"}
+            for status, _detail in normalized.values()
+        ):
+            raise ValueError("Verified batch results are invalid.")
+        timestamp = float(now if now is not None else time.time())
+        persist_started = time.perf_counter()
+        with closing(self._conn()) as conn, conn:
+            batch = conn.execute(
+                """
+                SELECT b.*, r.status AS run_status, m.status AS manifest_status,
+                       m.run_owner
+                FROM execution_batches AS b
+                JOIN execution_runs AS r ON r.id = b.run_id
+                JOIN manifests AS m ON m.id = b.manifest_id
+                WHERE b.id = ? AND b.manifest_id = ? AND r.domain = ?
+                """,
+                (batch_id, manifest_id, self.domain),
+            ).fetchone()
+            if (
+                batch is None
+                or str(batch["status"]) != "running"
+                or str(batch["run_status"]) not in {"running", "pause_requested"}
+                or str(batch["manifest_status"]) != "running"
+                or str(batch["run_owner"]) != owner
+            ):
+                raise PermissionError(
+                    "The active execution batch does not own this manifest."
+                )
+            membership_rows = conn.execute(
+                """
+                SELECT action_id FROM execution_batch_actions
+                WHERE batch_id = ? ORDER BY ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+            action_ids = tuple(str(row["action_id"]) for row in membership_rows)
+            if (
+                set(action_ids) != set(normalized)
+                or len(action_ids) != int(batch["action_count"])
+                or canonical_hash(action_ids) != str(batch["action_ids_hash"])
+            ):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Verified results no longer match immutable batch membership.",
+                )
+            placeholders = ",".join("?" for _ in action_ids)
+            pending_rows = conn.execute(
+                f"""
+                SELECT action_id FROM manifest_actions
+                WHERE manifest_id = ? AND status = 'pending'
+                  AND action_id IN ({placeholders})
+                """,
+                (manifest_id, *action_ids),
+            ).fetchall()
+            if {str(row["action_id"]) for row in pending_rows} != set(action_ids):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Verified results no longer match pending manifest actions.",
+                )
+            updated = conn.executemany(
+                """
+                UPDATE manifest_actions SET status = ?, detail = ?
+                WHERE manifest_id = ? AND action_id = ? AND status = 'pending'
+                """,
+                (
+                    (normalized[action_id][0], normalized[action_id][1], manifest_id, action_id)
+                    for action_id in action_ids
+                ),
+            )
+            if updated.rowcount != len(action_ids):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Not every immutable batch action could be updated.",
+                )
+            failed = any(status == "failed" for status, _detail in normalized.values())
+            persistence_seconds = time.perf_counter() - persist_started
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = ?, completed_at = ?, error_code = ?,
+                    apply_seconds = ?, verification_seconds = ?,
+                    persistence_seconds = ?, verification_attempts = ?,
+                    worker_count = ?, throttling_count = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    "failed" if failed else "completed",
+                    timestamp,
+                    "OR-BATCH-VERIFY-FAILED" if failed else "",
+                    max(0.0, float(apply_seconds)),
+                    max(0.0, float(verification_seconds)),
+                    max(0.0, float(persistence_seconds)),
+                    max(1, int(verification_attempts)),
+                    int(worker_count),
+                    max(0, int(throttling_count)),
+                    batch_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE execution_runs SET updated_at = ?, last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                """,
+                (timestamp, timestamp, str(batch["run_id"]), self.domain),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row, action_ids)
 
     def request_execution_pause(
         self,
@@ -1522,13 +1741,26 @@ class OneRosterStore:
             ).fetchone()
             if manifest is None:
                 raise KeyError("OneRoster import manifest not found.")
-            counts = conn.execute(
+            action_rows = conn.execute(
                 """
-                SELECT COUNT(*) AS total,
-                    COALESCE(SUM(status = 'pending'), 0) AS pending,
-                    COALESCE(SUM(status = 'applied'), 0) AS applied,
-                    COALESCE(SUM(status = 'failed'), 0) AS failed,
-                    COALESCE(SUM(status = 'skipped'), 0) AS skipped
+                SELECT kind, COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)
+                        AS pending,
+                    COALESCE(SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END), 0)
+                        AS applied,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+                        AS failed,
+                    COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0)
+                        AS skipped
+                FROM manifest_actions WHERE manifest_id = ? GROUP BY kind
+                """,
+                (manifest_id,),
+            ).fetchall()
+            course_counts = conn.execute(
+                """
+                SELECT COUNT(DISTINCT subject) AS total,
+                    COUNT(DISTINCT CASE WHEN status = 'pending' THEN subject END)
+                        AS pending
                 FROM manifest_actions WHERE manifest_id = ?
                 """,
                 (manifest_id,),
@@ -1542,28 +1774,146 @@ class OneRosterStore:
                 (self.domain, manifest_id),
             ).fetchone()
             completed_batches = 0
+            batch_actions = 0
+            batch_seconds = 0.0
+            worker_count = 5
+            adaptive_state = "normal"
+            latest_batch = None
             if run_row is not None:
                 batch_row = conn.execute(
                     """
-                    SELECT COALESCE(SUM(status IN ('completed','reconciled')), 0) AS count
+                    SELECT COALESCE(SUM(status IN ('completed','reconciled')), 0) AS count,
+                           COALESCE(SUM(
+                               CASE WHEN status IN ('completed','failed','reconciled')
+                               THEN action_count ELSE 0 END
+                           ), 0) AS actions,
+                           COALESCE(SUM(
+                               CASE WHEN status IN ('completed','failed','reconciled')
+                               THEN apply_seconds + verification_seconds + persistence_seconds
+                               ELSE 0 END
+                           ), 0) AS seconds
                     FROM execution_batches WHERE run_id = ?
                     """,
                     (run_row["id"],),
                 ).fetchone()
                 completed_batches = int(batch_row["count"] or 0)
-        assert counts is not None
-        total = int(counts["total"] or 0)
-        pending = int(counts["pending"] or 0)
-        applied = int(counts["applied"] or 0)
-        failed = int(counts["failed"] or 0)
-        skipped = int(counts["skipped"] or 0)
+                batch_actions = int(batch_row["actions"] or 0)
+                batch_seconds = float(batch_row["seconds"] or 0)
+                latest_batch = conn.execute(
+                    """
+                    SELECT b.*, COUNT(DISTINCT actions.subject) AS course_count
+                    FROM execution_batches AS b
+                    LEFT JOIN execution_batch_actions AS membership
+                        ON membership.batch_id = b.id
+                    LEFT JOIN manifest_actions AS actions
+                        ON actions.manifest_id = b.manifest_id
+                        AND actions.action_id = membership.action_id
+                    WHERE b.run_id = ?
+                    GROUP BY b.id
+                    ORDER BY b.sequence_number DESC LIMIT 1
+                    """,
+                    (run_row["id"],),
+                ).fetchone()
+                if latest_batch is not None:
+                    worker_count = int(latest_batch["worker_count"] or 5)
+                    adaptive_state = (
+                        "protecting_google"
+                        if worker_count <= 3
+                        or int(latest_batch["throttling_count"] or 0) > 0
+                        or int(latest_batch["verification_attempts"] or 0) > 1
+                        or str(latest_batch["status"]) == "failed"
+                        else "normal"
+                    )
+        phase_totals: dict[str, dict[str, int | str]] = {
+            key: {
+                "key": key,
+                "label": label,
+                "total": 0,
+                "pending": 0,
+                "applied": 0,
+                "failed": 0,
+                "skipped": 0,
+            }
+            for key, label, _kinds in _PROGRESS_PHASES
+        }
+        for row in action_rows:
+            phase_key, phase_label = _progress_phase(str(row["kind"] or ""))
+            bucket = phase_totals.setdefault(
+                phase_key,
+                {
+                    "key": phase_key,
+                    "label": phase_label,
+                    "total": 0,
+                    "pending": 0,
+                    "applied": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+            )
+            for field_name in ("total", "pending", "applied", "failed", "skipped"):
+                bucket[field_name] = int(bucket[field_name]) + int(row[field_name] or 0)
+        phases = tuple(
+            ExecutionPhaseProgress(
+                key=str(bucket["key"]),
+                label=str(bucket["label"]),
+                total=int(bucket["total"]),
+                finished=(int(bucket["total"]) - int(bucket["pending"])),
+                applied=int(bucket["applied"]),
+                failed=int(bucket["failed"]),
+                skipped=int(bucket["skipped"]),
+                pending=int(bucket["pending"]),
+            )
+            for bucket in phase_totals.values()
+            if int(bucket["total"]) > 0
+        )
+        total = sum(phase.total for phase in phases)
+        pending = sum(phase.pending for phase in phases)
+        applied = sum(phase.applied for phase in phases)
+        failed = sum(phase.failed for phase in phases)
+        skipped = sum(phase.skipped for phase in phases)
         complete = applied + failed + skipped
         run = _execution_run_from_row(run_row) if run_row is not None else None
         elapsed = max(0.0, timestamp - run.started_at) if run else 0.0
-        rate = (complete * 60.0 / elapsed) if complete and elapsed > 0 else 0.0
-        eta = (pending * 60.0 / rate) if pending and rate > 0 else None
+        rate = (
+            batch_actions * 60.0 / batch_seconds
+            if batch_actions and batch_seconds > 0
+            else (complete * 60.0 / elapsed if complete and elapsed > 0 else 0.0)
+        )
+        eta = (
+            pending * 60.0 / rate
+            if completed_batches >= 2 and pending and rate > 0
+            else None
+        )
         effective_batch_size = max(1, min(int(batch_size or 50), 50))
         estimated_batches = (total + effective_batch_size - 1) // effective_batch_size
+        heartbeat_age = max(0.0, timestamp - run.last_heartbeat_at) if run else 0.0
+        heartbeat_active = bool(
+            run and run.status in {"running", "pause_requested"}
+        )
+        heartbeat_stale = bool(heartbeat_active and heartbeat_age >= 180.0)
+        heartbeat_delayed = bool(heartbeat_active and heartbeat_age >= 30.0)
+        batch_progress = None
+        if latest_batch is not None:
+            phase_key, phase_label = _progress_phase(str(latest_batch["phase"] or ""))
+            batch_progress = ExecutionBatchProgress(
+                sequence_number=int(latest_batch["sequence_number"] or 0),
+                phase=str(latest_batch["phase"] or ""),
+                phase_key=phase_key,
+                phase_label=phase_label,
+                action_count=int(latest_batch["action_count"] or 0),
+                course_count=int(latest_batch["course_count"] or 0),
+                status=str(latest_batch["status"] or ""),
+                apply_seconds=float(latest_batch["apply_seconds"] or 0),
+                verification_seconds=float(
+                    latest_batch["verification_seconds"] or 0
+                ),
+                persistence_seconds=float(latest_batch["persistence_seconds"] or 0),
+                verification_attempts=int(
+                    latest_batch["verification_attempts"] or 0
+                ),
+                worker_count=int(latest_batch["worker_count"] or 5),
+                throttling_count=int(latest_batch["throttling_count"] or 0),
+            )
         return ExecutionProgress(
             run=run,
             total=total,
@@ -1575,16 +1925,22 @@ class OneRosterStore:
             completed_batches=completed_batches,
             total_batches_estimate=estimated_batches,
             elapsed_seconds=elapsed,
-            heartbeat_age_seconds=(
-                max(0.0, timestamp - run.last_heartbeat_at) if run else 0.0
-            ),
-            heartbeat_stale=bool(
-                run
-                and run.status in {"running", "pause_requested"}
-                and timestamp - run.last_heartbeat_at > 30.0
-            ),
+            heartbeat_age_seconds=heartbeat_age,
+            heartbeat_stale=heartbeat_stale,
             actions_per_minute=rate,
             eta_seconds=eta,
+            worker_count=worker_count,
+            adaptive_state=adaptive_state,
+            heartbeat_delayed=heartbeat_delayed,
+            heartbeat_state=(
+                "stale" if heartbeat_stale else "delayed" if heartbeat_delayed else "current"
+            ),
+            course_count=int(course_counts["total"] or 0) if course_counts else 0,
+            remaining_course_count=(
+                int(course_counts["pending"] or 0) if course_counts else 0
+            ),
+            phases=phases,
+            current_batch=batch_progress,
         )
 
     def mark_running_interrupted(self) -> int:
@@ -1747,6 +2103,48 @@ class OneRosterStore:
             raise KeyError("OneRoster import manifest not found.")
         return _manifest_from_rows(row, ())
 
+    def latest_manifest_header(
+        self,
+        import_id: Optional[str] = None,
+    ) -> Optional[ClassroomImportManifest]:
+        """Return the most actionable recent manifest without loading actions.
+
+        A single comparison can seal ordinary, archive, and ownership manifests at
+        the same instant. Prefer the item needing attention over a merely newer
+        sibling so a reopened guided journey resumes at the truthful current step.
+        """
+
+        if import_id is not None:
+            _validate_id(import_id)
+        sql = "SELECT * FROM manifests WHERE domain = ?"
+        params: list[object] = [self.domain]
+        if import_id is not None:
+            sql += " AND import_id = ?"
+            params.append(import_id)
+        sql += """
+            ORDER BY
+              CASE
+                WHEN status = 'recovery_required' THEN 0
+                WHEN status IN ('running', 'pause_requested', 'paused') THEN 1
+                WHEN status IN ('failed', 'interrupted', 'stale', 'partial') THEN 2
+                WHEN status IN ('planned', 'awaiting_students') THEN 3
+                WHEN status = 'completed' THEN 4
+                ELSE 5
+              END,
+              CASE plan_kind
+                WHEN 'ordinary' THEN 0
+                WHEN 'archive' THEN 1
+                WHEN 'ownership' THEN 2
+                ELSE 3
+              END,
+              created_at DESC,
+              id DESC
+            LIMIT 1
+        """
+        with closing(self._conn()) as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return _manifest_from_rows(row, ()) if row is not None else None
+
     def pending_action_kinds(self, manifest_id: str) -> tuple[str, ...]:
         """Return distinct pending action kinds without loading action records."""
 
@@ -1821,7 +2219,7 @@ class OneRosterStore:
                 JOIN manifests AS m ON m.id = a.manifest_id
                 WHERE m.domain = ? AND a.manifest_id = ?
                   AND a.status = 'pending' AND a.kind IN ({placeholders})
-                ORDER BY a.rowid
+                ORDER BY a.subject COLLATE NOCASE, a.target COLLATE NOCASE, a.rowid
                 LIMIT ?
                 """,
                 (self.domain, manifest_id, *selected_kinds, batch_size),
@@ -2407,6 +2805,9 @@ class OneRosterStore:
                     stop_requested INTEGER NOT NULL DEFAULT 0,
                     attempt_number INTEGER NOT NULL DEFAULT 1,
                     last_error_code TEXT NOT NULL DEFAULT '',
+                    planning_seconds REAL NOT NULL DEFAULT 0,
+                    directory_snapshot_seconds REAL NOT NULL DEFAULT 0,
+                    classroom_snapshot_seconds REAL NOT NULL DEFAULT 0,
                     FOREIGN KEY(manifest_id) REFERENCES manifests(id) ON DELETE CASCADE
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_active_manifest
@@ -2428,6 +2829,12 @@ class OneRosterStore:
                     completed_at REAL NOT NULL DEFAULT 0,
                     attempt_number INTEGER NOT NULL DEFAULT 1,
                     error_code TEXT NOT NULL DEFAULT '',
+                    apply_seconds REAL NOT NULL DEFAULT 0,
+                    verification_seconds REAL NOT NULL DEFAULT 0,
+                    persistence_seconds REAL NOT NULL DEFAULT 0,
+                    verification_attempts INTEGER NOT NULL DEFAULT 0,
+                    worker_count INTEGER NOT NULL DEFAULT 5,
+                    throttling_count INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(run_id, sequence_number),
                     FOREIGN KEY(run_id) REFERENCES execution_runs(id) ON DELETE CASCADE,
                     FOREIGN KEY(manifest_id) REFERENCES manifests(id) ON DELETE CASCADE
@@ -2560,6 +2967,21 @@ class OneRosterStore:
                 "run_identity",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            for column, definition in (
+                ("planning_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("directory_snapshot_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("classroom_snapshot_seconds", "REAL NOT NULL DEFAULT 0"),
+            ):
+                _ensure_column(conn, "execution_runs", column, definition)
+            for column, definition in (
+                ("apply_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("verification_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("persistence_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("verification_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("worker_count", "INTEGER NOT NULL DEFAULT 5"),
+                ("throttling_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                _ensure_column(conn, "execution_batches", column, definition)
 
     def _restrict_state_perms(self) -> None:
         _chmod(self.root, 0o700)
@@ -2599,6 +3021,9 @@ def _execution_run_from_row(row: sqlite3.Row) -> ExecutionRun:
         stop_requested=bool(row["stop_requested"]),
         attempt_number=int(row["attempt_number"] or 1),
         last_error_code=str(row["last_error_code"] or ""),
+        planning_seconds=float(row["planning_seconds"] or 0),
+        directory_snapshot_seconds=float(row["directory_snapshot_seconds"] or 0),
+        classroom_snapshot_seconds=float(row["classroom_snapshot_seconds"] or 0),
     )
 
 
@@ -2620,6 +3045,12 @@ def _execution_batch_from_row(
         completed_at=float(row["completed_at"] or 0),
         attempt_number=int(row["attempt_number"] or 1),
         error_code=str(row["error_code"] or ""),
+        apply_seconds=float(row["apply_seconds"] or 0),
+        verification_seconds=float(row["verification_seconds"] or 0),
+        persistence_seconds=float(row["persistence_seconds"] or 0),
+        verification_attempts=int(row["verification_attempts"] or 0),
+        worker_count=int(row["worker_count"] or 5),
+        throttling_count=int(row["throttling_count"] or 0),
         action_ids=tuple(action_ids),
     )
 

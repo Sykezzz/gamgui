@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,7 +34,7 @@ def client(tmp_path, monkeypatch):
     registry = ActivityRegistry()
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / "mock_gam.sh",
+        gam_binary=FIXTURES / ("mock_gam.cmd" if os.name == "nt" else "mock_gam.sh"),
         base_dir=tmp_path,
         activity_registry=registry,
     )

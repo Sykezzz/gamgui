@@ -13,6 +13,29 @@ def test_make_and_build_script_expose_only_fixed_profiles():
     assert "write_artifact_sidecar" in script
 
 
+def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
+    script = (ROOT / "scripts" / "build_windows_release.ps1").read_text(
+        encoding="utf-8"
+    )
+    fetch = (ROOT / "scripts" / "fetch_gam_windows.ps1").read_text(
+        encoding="utf-8"
+    )
+    checksums = (ROOT / "scripts" / "gam_checksums.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Packaged source changes are present" in script
+    assert "GAMGUI_SOURCE_SHA" in script
+    assert "write_artifact_sidecar" in script
+    assert "GAMGUI_SELF_TEST_OUTPUT" in script
+    assert "Compress-Archive" in script
+    assert "unsigned local artifact" in script
+    assert "Get-FileHash" in fetch
+    assert "Checksum mismatch" in fetch
+    assert "gam.exe" in fetch
+    assert "gam-7.47.02-windows-x86_64.zip" in checksums
+
+
 def test_exact_sha_build_rejects_untracked_packaged_source():
     script = (ROOT / "scripts" / "build_app.sh").read_text(encoding="utf-8")
     assert "git status --porcelain --untracked-files=all" in script
@@ -47,5 +70,8 @@ def test_pyinstaller_profile_excludes_optional_code_and_assets_from_core():
     assert 'collect_submodules("gamgui.components.oneroster")' in spec
     assert 'hiddenimports.append("gamgui.web.routes.oneroster")' in spec
     assert 'excludes.append("gamgui.web.routes.oneroster")' in spec
+    assert 'path.name.startswith("oneroster")' in spec
     assert 'path.name.startswith("_oneroster_")' in spec
     assert '"resources/components"' in spec
+    assert 'gam_executable = "gam.exe" if os.name == "nt" else "gam"' in spec
+    assert 'if platform.system() == "Darwin":' in spec

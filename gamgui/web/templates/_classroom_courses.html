@@ -1,4 +1,4 @@
-<div class="overflow-hidden rounded-2xl border border-brand-gray/40 bg-brand-white shadow-sm">
+<div class="min-w-0 max-w-full overflow-hidden rounded-2xl border border-brand-gray/40 bg-brand-white shadow-sm">
   <div class="flex items-center justify-between gap-3 border-b border-brand-gray/30 px-4 py-3">
     <p class="text-sm text-brand-blueink"><span class="font-semibold tabular-nums text-brand-black">{{ page.total }}</span> course{{ "" if page.total == 1 else "s" }}</p>
     {% if page.snapshot_age_seconds is not none %}
@@ -6,7 +6,7 @@
     {% endif %}
   </div>
   {% if page.items %}
-  <div class="overflow-x-auto">
+  <div class="max-w-full overflow-x-auto">
     <table class="min-w-full text-left text-sm">
       <caption class="sr-only">Classroom course search results</caption>
       <thead class="bg-paper text-xs uppercase tracking-wider text-brand-blueink">

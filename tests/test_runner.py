@@ -12,7 +12,18 @@ from keyring.errors import PasswordSetError
 
 from gamgui.core.gam.commands import EXPECTED_GAM_VERSION, GAMCommands
 from gamgui.core.gam.errors import GAMError, GAMErrorKind, TokenPersistenceError
-from gamgui.core.gam.runner import GAMRunner, secure_remove_private_file
+from gamgui.core.gam.runner import (
+    GAMRunner,
+    RunResult,
+    locate_gam_binary,
+    secure_remove_private_file,
+)
+
+
+def test_windows_bundle_resolves_gam_exe(monkeypatch, tmp_path):
+    monkeypatch.setattr("gamgui.core.gam.runner.sys.platform", "win32")
+    monkeypatch.setattr("gamgui.core.gam.runner.sys._MEIPASS", str(tmp_path), raising=False)
+    assert locate_gam_binary() == tmp_path / "resources" / "gam7" / "gam.exe"
 
 
 async def test_version(runner):
@@ -22,6 +33,39 @@ async def test_version(runner):
 async def test_run_authenticated_reads_users(runner, domain):
     out = await runner.run_authenticated(domain, GAMCommands.print_users())
     assert "alice@example.com" in out
+
+
+def test_gam_worker_override_is_scoped_to_child_environment(runner, tmp_path, monkeypatch):
+    monkeypatch.delenv("GAM_THREADS", raising=False)
+    env = runner._build_env(tmp_path, gam_threads=8)
+    assert env["GAM_THREADS"] == "8"
+    assert "GAM_THREADS" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_independent_authenticated_reads_use_isolated_configs_concurrently(
+    runner,
+    domain,
+    monkeypatch,
+):
+    entered = asyncio.Event()
+    cfgdirs: list[Path] = []
+
+    async def overlapping_read(_argv, cfgdir, _timeout):
+        cfgdirs.append(Path(cfgdir))
+        if len(cfgdirs) == 2:
+            entered.set()
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        return RunResult(stdout="[]", stderr="", returncode=0)
+
+    monkeypatch.setattr(runner, "_exec", overlapping_read)
+    await asyncio.gather(
+        runner.run_authenticated(domain, ["read-one"]),
+        runner.run_authenticated(domain, ["read-two"]),
+    )
+
+    assert len(set(cfgdirs)) == 2
+    assert all(not path.exists() for path in cfgdirs)
 
 
 @pytest.mark.parametrize(

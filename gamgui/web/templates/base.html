@@ -172,7 +172,7 @@
         try {
           var d = evt.detail || {};
           var p = (d.pathInfo && d.pathInfo.requestPath) || (d.requestConfig && d.requestConfig.path) || "";
-          return p.includes("/apply/status");
+          return p.includes("/apply/status") || p.includes("/classroom/monitoring/status");
         } catch (e) { return false; }
       }
       document.body.addEventListener("htmx:beforeRequest", function (e) { if (isPoll(e)) { return; } pending++; showBusy(); });

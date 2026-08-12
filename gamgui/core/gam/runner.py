@@ -146,12 +146,13 @@ def locate_gam_binary() -> Path:
     if override:
         return Path(override)
 
+    executable_name = "gam.exe" if sys.platform == "win32" else "gam"
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:  # frozen .app
-        return Path(meipass) / "resources" / "gam7" / "gam"
+        return Path(meipass) / "resources" / "gam7" / executable_name
 
     # Source tree: gamgui/core/gam/runner.py -> gamgui/resources/gam7/gam
-    return Path(__file__).resolve().parents[2] / "resources" / "gam7" / "gam"
+    return Path(__file__).resolve().parents[2] / "resources" / "gam7" / executable_name
 
 
 class GAMRunner:
@@ -174,6 +175,10 @@ class GAMRunner:
         )
         # Serializes mutating calls so two writes can't race the same ephemeral GAMCFGDIR.
         self._write_lock = asyncio.Lock()
+        # Independent read processes use isolated GAMCFGDIRs. Only refreshed OAuth
+        # token persistence is serialized so one read cannot overwrite another's
+        # newer token while both exports still run concurrently.
+        self._token_persistence_lock = asyncio.Lock()
 
     def binary_exists(self) -> bool:
         return self.gam_binary.exists()
@@ -184,12 +189,30 @@ class GAMRunner:
                 f"GAM binary not found at {self.gam_binary}. Run scripts/fetch_gam.sh to vendor it."
             )
 
-    def _build_env(self, cfgdir: Path) -> dict:
+    def _build_env(self, cfgdir: Path, *, gam_threads: Optional[int] = None) -> dict:
         env = os.environ.copy()
         env["GAMCFGDIR"] = str(cfgdir)
         # Keep GAM quiet/non-interactive where possible.
         env.setdefault("GAM_NO_UPDATE_CHECK", "1")
+        if gam_threads is not None:
+            env["GAM_THREADS"] = str(max(1, min(int(gam_threads), 1000)))
         return env
+
+    @asynccontextmanager
+    async def _authenticated_config(
+        self,
+        config: EphemeralConfig,
+    ) -> AsyncIterator[Path]:
+        cfgdir = config.__enter__()
+        try:
+            yield cfgdir
+        except BaseException as exc:
+            async with self._token_persistence_lock:
+                config.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            async with self._token_persistence_lock:
+                config.__exit__(None, None, None)
 
     def _subprocess_options(
         self,
@@ -207,7 +230,14 @@ class GAMRunner:
             "pass_fds": pass_fds,
         }
 
-    async def _exec(self, argv: Sequence[str], cfgdir: Path, timeout: float) -> RunResult:
+    async def _exec(
+        self,
+        argv: Sequence[str],
+        cfgdir: Path,
+        timeout: float,
+        *,
+        gam_threads: Optional[int] = None,
+    ) -> RunResult:
         self._require_binary()
         with self.activity_registry.subprocess_pass_fds() as pass_fds:
             proc = await asyncio.create_subprocess_exec(
@@ -215,7 +245,7 @@ class GAMRunner:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._build_env(cfgdir),
+                env=self._build_env(cfgdir, gam_threads=gam_threads),
                 **self._subprocess_options(pass_fds),
             )
         try:
@@ -279,6 +309,7 @@ class GAMRunner:
         argv: Sequence[str],
         timeout: Optional[float] = None,
         serialize: bool = False,
+        gam_threads: Optional[int] = None,
     ) -> str:
         """Run a gam command as ``domain`` (credentials materialized from the vault).
 
@@ -293,8 +324,16 @@ class GAMRunner:
             token_persistence_failed = False
             config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
             try:
-                with config as cfgdir:
-                    result = await self._exec(argv, cfgdir, timeout)
+                async with self._authenticated_config(config) as cfgdir:
+                    if gam_threads is None:
+                        result = await self._exec(argv, cfgdir, timeout)
+                    else:
+                        result = await self._exec(
+                            argv,
+                            cfgdir,
+                            timeout,
+                            gam_threads=gam_threads,
+                        )
             except TokenPersistenceError:
                 if not config.token_persistence_error_raised:
                     raise
@@ -343,7 +382,7 @@ class GAMRunner:
             token_persistence_failed = False
             config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
             try:
-                with config as cfgdir:
+                async with self._authenticated_config(config) as cfgdir:
                     fd, raw_path = tempfile.mkstemp(
                         prefix="gam-output-", suffix=".tmp", dir=str(cfgdir)
                     )

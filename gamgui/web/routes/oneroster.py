@@ -854,7 +854,7 @@ def _uploaded_snapshot_response(request: Request, value: Any) -> HTMLResponse:
     snapshot.setdefault("id", import_id)
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_import.html",
+        "_oneroster_guided_setup.html",
         {"snapshot": snapshot},
     )
 
@@ -901,9 +901,14 @@ def _manifest_response(
     progress: Any = None,
     gate: Any = None,
 ) -> HTMLResponse:
+    template = (
+        "_oneroster_manifest.html"
+        if request.headers.get("HX-Request", "").casefold() == "true"
+        else "oneroster_activity.html"
+    )
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_manifest.html",
+        template,
         {
             "manifest": _manifest_record(manifest, offset=offset),
             "task_error_code": task_error[0] if task_error else "",
@@ -920,14 +925,14 @@ async def _manifest_progress(service: Any, manifest_id: str) -> Any:
     method = getattr(service, "get_execution_progress", None)
     if not callable(method):
         return None
-
-
-async def _manifest_gate(service: Any) -> Any:
-    return await _local_gate(service)
     try:
         return await asyncio.to_thread(method, manifest_id)
     except (KeyError, TypeError):
         return None
+
+
+async def _manifest_gate(service: Any) -> Any:
+    return await _local_gate(service)
 
 
 async def _run_manifest(
@@ -1224,12 +1229,45 @@ async def oneroster_page(request: Request) -> HTMLResponse:
     gate: dict[str, Any] = {}
     thresholds: dict[str, Any] = {}
     access: dict[str, Any] = {}
+    active_snapshot: dict[str, Any] = {}
+    active_manifest: dict[str, Any] = {}
+    active_progress: dict[str, Any] = {}
     if feature["ready"]:
         # These contracts are local SQLite/config reads. No connector is consulted.
         history = await _local_history(feature["service"])
         gate = await _local_gate(feature["service"])
         thresholds = await _local_thresholds(feature["service"])
         access = await _local_scope_readiness(feature["service"])
+        active_snapshot = history[0] if history else {}
+        latest_method = getattr(feature["service"], "latest_manifest_header", None)
+        if active_snapshot and callable(latest_method):
+            latest = await _call(
+                feature["service"],
+                ("latest_manifest_header",),
+                (
+                    ((str(active_snapshot.get("id", "")),), {}),
+                    ((), {"import_id": str(active_snapshot.get("id", ""))}),
+                ),
+            )
+            latest_record = _record(latest)
+            manifest_id = str(latest_record.get("id", "") or "")
+            if manifest_id:
+                try:
+                    page = await _load_manifest_page(
+                        feature["service"], manifest_id
+                    )
+                    active_manifest = _manifest_record(page)
+                    progress = await _manifest_progress(
+                        feature["service"], manifest_id
+                    )
+                    active_progress = (
+                        _record(progress) if progress is not None else {}
+                    )
+                except KeyError:
+                    # The manifest can be pruned between the bounded header and
+                    # page reads. Falling back to setup is safer than showing a
+                    # stale action surface.
+                    active_manifest = {}
     return TEMPLATES.TemplateResponse(
         request,
         "oneroster.html",
@@ -1239,6 +1277,9 @@ async def oneroster_page(request: Request) -> HTMLResponse:
             "gate": gate,
             "thresholds": thresholds,
             "access": access,
+            "active_snapshot": active_snapshot,
+            "active_manifest": active_manifest,
+            "active_progress": active_progress,
         },
     )
 
@@ -1363,6 +1404,7 @@ async def verify_live_access(
         if callable(invalidator):
             await asyncio.to_thread(invalidator)
         access = await _local_scope_readiness(feature["service"])
+        active_snapshot = history[0] if history else {}
         code, message = _safe_error(exc, "CMP-AUTH-REQUIRED")
         notice = ""
         error = message
@@ -1374,6 +1416,7 @@ async def verify_live_access(
         "_oneroster_access.html",
         {
             "access": access,
+            "active_snapshot": active_snapshot,
             "notice": notice,
             "error": error,
             "error_code": error_code,
@@ -1387,6 +1430,7 @@ async def verify_live_access(
 async def upload_snapshot(
     request: Request,
     package: Annotated[UploadFile, File()],
+    replace_active: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
     feature = await _feature(request)
     if not feature["ready"]:
@@ -1419,6 +1463,15 @@ async def upload_snapshot(
         )
     bounded_source = _BoundedUploadStream(package.file, _MAX_UPLOAD_BYTES)
     try:
+        if await _local_history(feature["service"]) and replace_active != "yes":
+            return _status(
+                request,
+                error=(
+                    "A guided import is already saved. Open 'Replace the current "
+                    "roster' and confirm the replacement before choosing a new file."
+                ),
+                error_code="OR-ACTIVE-JOURNEY",
+            )
         value = await _ingest_uploaded_stream(
             feature["service"],
             bounded_source,
@@ -1436,6 +1489,7 @@ async def upload_snapshot(
 async def upload_snapshot_folder(
     request: Request,
     folder_files: Annotated[list[UploadFile], File()],
+    replace_active: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
     feature = await _feature(request)
     if not feature["ready"]:
@@ -1458,6 +1512,15 @@ async def upload_snapshot_folder(
             _folder_upload_archive,
             folder_files,
         )
+        if await _local_history(feature["service"]) and replace_active != "yes":
+            return _status(
+                request,
+                error=(
+                    "A guided import is already saved. Open 'Replace the current "
+                    "roster' and confirm the replacement before choosing a new folder."
+                ),
+                error_code="OR-ACTIVE-JOURNEY",
+            )
         value = await _ingest_uploaded_stream(
             feature["service"],
             archive,
@@ -1495,7 +1558,7 @@ async def import_detail(request: Request, import_id: str) -> HTMLResponse:
         return _status(request, error=message, error_code=code)
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_import.html",
+        "_oneroster_guided_setup.html",
         {"snapshot": snapshot},
     )
 
@@ -1557,7 +1620,7 @@ async def select_academic_session(
     snapshot.setdefault("id", import_id)
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_import.html",
+        "_oneroster_guided_setup.html",
         {
             "snapshot": snapshot,
             "notice": (
@@ -1637,7 +1700,7 @@ async def configure_course_naming(
     snapshot.setdefault("id", import_id)
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_import.html",
+        "_oneroster_guided_setup.html",
         {
             "snapshot": snapshot,
             "notice": (
@@ -1762,7 +1825,7 @@ async def validate_snapshot(request: Request, import_id: str) -> HTMLResponse:
     snapshot.setdefault("id", import_id)
     return TEMPLATES.TemplateResponse(
         request,
-        "_oneroster_import.html",
+        "_oneroster_guided_setup.html",
         {
             "snapshot": snapshot,
             "notice": "Local validation completed. No Classroom changes were made.",

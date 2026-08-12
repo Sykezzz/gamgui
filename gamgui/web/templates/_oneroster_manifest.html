@@ -75,7 +75,7 @@
     <summary class="cursor-pointer text-sm font-medium text-brand-blueink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-blue">Approval evidence</summary>
     <dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2">
       <div><dt class="text-brand-blueink">Pilot or rollout evidence</dt><dd class="mt-1 text-brand-black">{{ manifest.pilot_evidence.operator_note | default("No operator note recorded.", true) }}</dd></div>
-      <div><dt class="text-brand-blueink">Prior accepted import</dt><dd class="mt-1 break-all font-mono text-xs text-brand-black">{{ manifest.pilot_evidence.prior_accepted_import_id | default("None", true) }}</dd></div>
+      <div><dt class="text-brand-blueink">Prior accepted import</dt><dd class="mt-1 break-all font-mono text-xs text-brand-black">{{ manifest.pilot_evidence.prior_accepted_import_id | default("No earlier import", true) }}</dd></div>
       <div><dt class="text-brand-blueink">Threshold profile hash</dt><dd class="mt-1 truncate font-mono text-xs text-brand-black" title="{{ manifest.threshold_evidence.profile_hash }}">{{ manifest.threshold_evidence.profile_hash | default("Not configured", true) }}</dd></div>
       <div><dt class="text-brand-blueink">Quarantines and exclusions</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ manifest.exclusion_total }}</dd></div>
     </dl>

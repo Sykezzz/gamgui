@@ -199,6 +199,55 @@ body {
   }
 }
 
+.classroom-subnav {
+  contain: inline-size;
+}
+
+.monitor-eta-ring {
+  display: grid;
+  width: 9rem;
+  aspect-ratio: 1;
+  padding: 0.8rem;
+  background: conic-gradient(
+    #52647b var(--monitor-progress, 0%),
+    #dbe3eb 0
+  );
+  border-radius: 9999px;
+  place-items: center;
+}
+
+.monitor-eta-ring__center {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #faf9f6;
+  border-radius: inherit;
+}
+
+.monitor-phase-progress {
+  overflow: hidden;
+  appearance: none;
+  color: #52647b;
+  background: #dbe3eb;
+  border: 0;
+  border-radius: 9999px;
+}
+
+.monitor-phase-progress::-webkit-progress-bar {
+  background: #dbe3eb;
+}
+
+.monitor-phase-progress::-webkit-progress-value {
+  background: #52647b;
+}
+
+.monitor-phase-progress::-moz-progress-bar {
+  background: #52647b;
+}
+
 @media (max-width: 720px) {
   .oneroster-action-table,
   .oneroster-action-table tbody,

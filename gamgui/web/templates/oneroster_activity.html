@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Import Activity — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set classroom_section = "imports" %}
+{% include "_classroom_subnav.html" %}
+<div class="space-y-5">
+  <header>
+    <p class="eyebrow text-brand-blueink">Guided import / activity</p>
+    <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Review, run, and results</h1>
+    <p class="mt-2 max-w-3xl text-sm text-brand-blueink">See the exact impact, start only after confirmation, watch checked batches, and read the final result in one place.</p>
+  </header>
+  <nav class="rounded-2xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm" aria-label="Guided import phases"><ol class="grid gap-2 sm:grid-cols-4">
+    {% set status = manifest.status | default("") %}
+    {% for number, label, complete, current in (
+      ("1", "Setup", true, false),
+      ("2", "Review & start", status in ("planned", "awaiting_students"), status in ("planned", "awaiting_students")),
+      ("3", "In progress", status in ("running", "pause_requested", "paused"), status in ("running", "pause_requested", "paused")),
+      ("4", "Results", status in ("completed", "failed", "stale", "recovery_required"), status in ("completed", "failed", "stale", "recovery_required"))
+    ) %}<li class="rounded-lg border {% if current %}border-brand-blue bg-paper{% elif complete %}border-emerald-300 bg-emerald-50{% else %}border-brand-gray/30 bg-white{% endif %} p-3"><div class="flex items-center gap-2"><span class="grid size-7 place-items-center rounded-full {% if complete %}bg-emerald-700{% else %}bg-brand-blueink{% endif %} text-sm font-semibold text-white">{{ "✓" if complete else number }}</span><span class="font-semibold text-brand-black">{{ label }}</span></div></li>{% endfor %}
+  </ol></nav>
+  {% include "_oneroster_manifest.html" %}
+</div>
+{% endblock %}

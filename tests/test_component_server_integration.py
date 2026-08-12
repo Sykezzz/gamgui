@@ -676,6 +676,6 @@ def test_purge_rebinds_oneroster_service_without_restart(tmp_path, monkeypatch):
 
     imports = client.get("/classroom/imports?token=test-token")
     assert imports.status_code == 200
-    assert "Classroom / OneRoster" in imports.text
+    assert "One safe roster import" in imports.text
     assert "Import Studio" in imports.text
     assert "CMP-INCOMPATIBLE" not in imports.text

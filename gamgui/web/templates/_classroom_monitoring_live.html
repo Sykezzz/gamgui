@@ -1,0 +1,113 @@
+{% set progress = workspace.progress | default({}, true) %}
+{% set run = progress.run | default({}, true) %}
+{% set batch = progress.current_batch | default({}, true) %}
+<section id="monitoring-live"
+         data-monitor-state="{{ monitor.state }}"
+         data-monitor-announcement="{{ monitor.announcement }}"
+         {% if monitor.polling %}hx-get="/classroom/monitoring/status" hx-trigger="every 3s" hx-swap="outerHTML" hx-sync="this:drop"{% endif %}>
+  {% if not connected or not workspace.available %}
+  <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
+    <h2 class="font-serif text-xl text-brand-black">Monitoring is not ready yet</h2>
+    <p class="mt-2 text-sm text-brand-blueink">Connect a domain and enable OneRoster Classroom first.</p>
+  </div>
+  {% elif not workspace.manifest %}
+  <div class="rounded-2xl border border-dashed border-brand-gray/60 bg-brand-white p-8 text-center">
+    <h2 class="font-serif text-xl text-brand-black">No checked plan to watch</h2>
+    <p class="mt-2 text-sm text-brand-blueink">Start with Guided import. Monitoring appears after GamGUI builds a saved plan.</p>
+    <a href="/classroom/imports" class="mt-4 inline-flex rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open guided import</a>
+  </div>
+  {% else %}
+  <div class="rounded-2xl border border-brand-gray/40 bg-brand-white p-4 shadow-sm sm:p-5">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <p class="eyebrow text-brand-blueink">Current roster import</p>
+        <h2 class="mt-1 font-serif text-2xl text-brand-black">{{ progress.total | default(0) }} approved changes across {{ progress.course_count | default(0) }} classes</h2>
+        <p class="mt-1 text-sm text-brand-blueink">{% if monitor.started_label %}Started at {{ monitor.started_label }} · {% endif %}{{ progress.completed_batches | default(0) }} checked batches saved</p>
+      </div>
+      <span class="rounded-lg border border-brand-gray/50 bg-paper px-3 py-1.5 text-sm font-semibold text-brand-black">{{ workspace.manifest.status | replace("_", " ") | title }}</span>
+    </div>
+
+    {% if monitor.state == "stale" %}
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900" {% if not monitor_partial %}role="alert"{% endif %}>
+      <span>GamGUI has not checked in for three minutes. Do not start another import.</span>
+      <a href="/classroom/recovery" class="font-semibold underline decoration-2 underline-offset-2 focus-visible:ring-2 focus-visible:ring-red-700">Open Recovery</a>
+    </div>
+    {% elif monitor.state in ("recovery", "failed") %}
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900" {% if not monitor_partial %}role="alert"{% endif %}>
+      <span>This import stopped with saved evidence. Review it before continuing or starting another import.</span>
+      <a href="/classroom/recovery" class="font-semibold underline decoration-2 underline-offset-2 focus-visible:ring-2 focus-visible:ring-red-700">Open Recovery</a>
+    </div>
+    {% elif monitor.state == "delayed" %}
+    <p class="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">The latest check-in is delayed. GamGUI is still watching the saved batch and will escalate if the delay reaches three minutes.</p>
+    {% elif monitor.state == "protecting" %}
+    <p class="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">Google asked this run to slow down. GamGUI adjusted automatically; saved progress and verification remain unchanged.</p>
+    {% elif monitor.state == "pausing" %}
+    <p class="mt-4 rounded-lg border border-brand-blue/60 bg-blue-50 px-3 py-2 text-sm text-brand-blueink">Safe pause requested. The active batch is finishing its Classroom check before the next batch is held.</p>
+    {% elif progress.failed | default(0) %}
+    <p class="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900">{{ progress.failed }} checked change{% if progress.failed != 1 %}s{% endif %} need review. Confirmed results remain saved.</p>
+    {% endif %}
+
+    <div class="mt-4 grid gap-4 lg:grid-cols-5">
+      <section class="rounded-xl border border-brand-gray/40 bg-paper p-4 lg:col-span-2" aria-labelledby="time-forecast-heading">
+        <p class="eyebrow text-brand-blueink">Time forecast</p>
+        <div class="mt-3 flex flex-col items-center text-center">
+          <div class="monitor-eta-ring" style="--monitor-progress: {{ monitor.percent }}%;" role="img" aria-label="{{ monitor.percent }} percent of approved changes have a terminal checked result">
+            <div class="monitor-eta-ring__center">
+              <strong class="font-serif text-2xl text-brand-black">{{ monitor.eta_value }}</strong>
+              <span class="text-xs text-brand-blueink">{{ monitor.percent }}% checked</span>
+            </div>
+          </div>
+          <h3 id="time-forecast-heading" class="mt-3 font-serif text-xl text-brand-black">{{ monitor.eta_caption }}</h3>
+          <p class="mt-1 max-w-sm text-sm text-brand-blueink">{{ monitor.eta_detail }}</p>
+        </div>
+        <dl class="mt-4 grid grid-cols-2 gap-2">
+          <div class="rounded-lg border border-brand-gray/40 bg-brand-white p-3 text-center"><dt class="text-xs text-brand-blueink">Verified pace</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{% if progress.actions_per_minute | default(0) %}{{ progress.actions_per_minute | round }} / min{% else %}—{% endif %}</dd></div>
+          <div class="rounded-lg border border-brand-gray/40 bg-brand-white p-3 text-center"><dt class="text-xs text-brand-blueink">Changes waiting</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ progress.pending | default(0) }}</dd></div>
+        </dl>
+      </section>
+
+      <section class="rounded-xl border border-brand-gray/40 bg-brand-white p-4 lg:col-span-3" aria-labelledby="import-phases-heading">
+        <p class="eyebrow text-brand-blueink">Import phases</p>
+        <h3 id="import-phases-heading" class="mt-1 font-serif text-xl text-brand-black">What GamGUI is working through</h3>
+        <div class="mt-4 space-y-3">
+          {% for phase in progress.phases | default([]) if phase.key != "other" %}
+          <div class="rounded-lg border {% if batch.phase_key == phase.key and monitor.state not in ('completed', 'paused') %}border-brand-blue bg-blue-50/50{% else %}border-brand-gray/40 bg-paper{% endif %} p-3">
+            <div class="flex items-center justify-between gap-3 text-sm"><span class="font-semibold text-brand-black">{{ phase.label }}</span><span class="tabular-nums text-brand-blueink">{{ phase.finished }} / {{ phase.total }} checked</span></div>
+            <progress class="monitor-phase-progress mt-2 h-2 w-full" max="{{ phase.total }}" value="{{ phase.finished }}">{{ phase.finished }} of {{ phase.total }}</progress>
+            {% if phase.failed %}<p class="mt-1 text-xs font-semibold text-red-800">{{ phase.failed }} need{% if phase.failed == 1 %}s{% endif %} review</p>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="mt-4 rounded-lg border-l-4 border-amber-700 bg-amber-50 px-3 py-3">
+          {% if batch %}
+          <p class="text-sm font-semibold text-brand-black">{{ batch.phase_label }} · batch {{ batch.sequence_number }} of about {{ progress.total_batches_estimate | default(0) }}</p>
+          <p class="mt-1 text-sm text-brand-blueink">{{ batch.action_count }} approved changes across {{ batch.course_count }} class{% if batch.course_count != 1 %}es{% endif %}. Status: {{ batch.status | replace("_", " ") }}.</p>
+          {% else %}
+          <p class="text-sm font-semibold text-brand-black">Preparing the first checked batch</p>
+          <p class="mt-1 text-sm text-brand-blueink">The time forecast will learn from completed verification evidence.</p>
+          {% endif %}
+        </div>
+
+        <dl class="mt-3 grid gap-2 sm:grid-cols-2">
+          <div class="rounded-lg border border-brand-gray/40 bg-paper p-3"><dt class="text-xs text-brand-blueink">Classes in this batch</dt><dd class="mt-1 font-serif text-xl tabular-nums text-brand-black">{{ batch.course_count | default(0) }}</dd></div>
+          <div class="rounded-lg border border-brand-gray/40 bg-paper p-3"><dt class="text-xs text-brand-blueink">Classes still ahead</dt><dd class="mt-1 font-serif text-xl tabular-nums text-brand-black">{{ progress.remaining_course_count | default(0) }}</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-sm text-brand-blueink">
+      <span><strong class="text-brand-black">Progress moves in verified steps.</strong> This local page checks about every three seconds; totals may hold steady, then jump after a batch is saved.</span>
+      {% if run %}<button type="button" data-open-monitoring-receipt hx-get="/classroom/monitoring/receipt" hx-target="#monitoring-receipt-content" hx-swap="innerHTML" class="shrink-0 rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Technical receipt</button>{% endif %}
+    </div>
+
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+      <span class="text-xs tabular-nums text-brand-blueink">{{ monitor.last_update_label }} · local saved progress</span>
+      <div class="flex flex-wrap gap-3">
+        {% if run.status in ("running", "pause_requested") %}<button type="button" data-open-monitoring-pause class="rounded-lg border border-brand-gray/60 bg-brand-white px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Preview safe pause</button>{% endif %}
+        <a href="/classroom/imports/manifest/{{ workspace.manifest.id }}" class="rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open full activity</a>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</section>

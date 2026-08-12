@@ -1,0 +1,24 @@
+{
+  "base_url": "http://127.0.0.1:8771",
+  "health": "/health",
+  "roles": ["operator"],
+  "seed_urls": [
+    "/classroom",
+    "/classroom/imports",
+    "/classroom/courses/manage",
+    "/classroom/access",
+    "/classroom/monitoring",
+    "/classroom/recovery"
+  ],
+  "data_loaded": [
+    {"path": "/classroom/courses/manage", "expect_min_rows": 50}
+  ],
+  "gated_probes": [
+    {"role": "operator", "path": "/classroom/not-a-workspace", "method": "GET"}
+  ],
+  "not_verified": [
+    "Live district GAM reads and mutations are intentionally replaced with synthetic fixtures.",
+    "Automatic compensating rollback and checkpoint restore remain unavailable by design.",
+    "Windows Authenticode signing and clean-machine SmartScreen reputation are outside this local build gate."
+  ]
+}

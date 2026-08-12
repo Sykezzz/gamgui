@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Classroom Monitoring — GamGUI Console{% endblock %}
+{% block container_class %}max-w-7xl{% endblock %}
+{% block content %}
+{% set classroom_section = "monitoring" %}
+{% include "_classroom_subnav.html" %}
+<div class="space-y-5">
+  <header class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <p class="eyebrow text-brand-blueink">Classroom monitoring · current run</p>
+      <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Live import operations</h1>
+      <p class="mt-2 max-w-3xl text-sm text-brand-blueink">Time, checked progress, and the work still ahead—from GamGUI's saved local record.</p>
+    </div>
+    <a href="/classroom/recovery" class="rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm font-semibold text-brand-blueink shadow-sm focus-visible:ring-2 focus-visible:ring-brand-blue">Recovery</a>
+  </header>
+
+  <p id="monitoring-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+  {% include "_classroom_monitoring_live.html" %}
+</div>
+
+<dialog id="monitoring-receipt" aria-labelledby="monitoring-receipt-title" class="w-[min(46rem,calc(100%-2rem))] rounded-2xl border border-brand-gray/60 bg-brand-white p-0 text-ink shadow-2xl backdrop:bg-brand-black/30">
+  <div id="monitoring-receipt-content">
+    {% include "_classroom_monitoring_receipt.html" %}
+  </div>
+</dialog>
+
+<dialog id="monitoring-pause-preview" aria-labelledby="monitoring-pause-title" class="w-[min(38rem,calc(100%-2rem))] rounded-2xl border border-brand-gray/60 bg-brand-white p-0 text-ink shadow-2xl backdrop:bg-brand-black/30">
+  <div class="p-5 sm:p-6">
+    <p class="eyebrow text-brand-blueink">Safe pause preview</p>
+    <h2 id="monitoring-pause-title" class="mt-1 font-serif text-2xl text-brand-black">Pause after the active batch is checked</h2>
+    <p class="mt-3 text-sm text-brand-blueink">GamGUI will finish sending the current small group, reread the affected classes, and save the verified stopping point before it pauses.</p>
+    <ul class="mt-4 list-disc space-y-2 pl-5 text-sm text-brand-black">
+      <li>It will not stop halfway through the active batch.</li>
+      <li>Already confirmed work will not be repeated.</li>
+      <li>The next batch stays untouched until an operator resumes.</li>
+    </ul>
+  </div>
+  <div class="flex flex-wrap justify-end gap-3 border-t border-brand-gray/40 bg-paper px-5 py-4">
+    <button type="button" data-close-monitoring-dialog class="rounded-lg border border-brand-gray/60 bg-brand-white px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Keep monitoring</button>
+    <a href="/classroom/recovery#running-work" class="rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open Recovery to pause</a>
+  </div>
+</dialog>
+
+<script>
+  (function () {
+    if (window.gamguiMonitoringBound) return;
+    window.gamguiMonitoringBound = true;
+    var lastDialogOpener = null;
+    var previousState = "";
+
+    function openDialog(dialog, opener) {
+      if (!dialog || typeof dialog.showModal !== "function") return;
+      lastDialogOpener = opener || null;
+      dialog.showModal();
+      var focusTarget = dialog.querySelector("button, a[href]");
+      if (focusTarget) focusTarget.focus();
+    }
+
+    document.addEventListener("click", function (event) {
+      var receipt = event.target.closest("[data-open-monitoring-receipt]");
+      if (receipt) lastDialogOpener = receipt;
+      var pause = event.target.closest("[data-open-monitoring-pause]");
+      if (pause) openDialog(document.getElementById("monitoring-pause-preview"), pause);
+      var close = event.target.closest("[data-close-monitoring-dialog]");
+      if (close) {
+        var dialog = close.closest("dialog");
+        if (dialog) dialog.close();
+      }
+    });
+
+    document.addEventListener("close", function (event) {
+      if (event.target.tagName === "DIALOG" && lastDialogOpener && lastDialogOpener.isConnected) {
+        lastDialogOpener.focus();
+      }
+    }, true);
+
+    document.body.addEventListener("htmx:beforeSwap", function (event) {
+      if (event.detail.target && event.detail.target.id === "monitoring-live") {
+        previousState = event.detail.target.dataset.monitorState || "";
+      }
+    });
+
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+      if (event.detail.target && event.detail.target.id === "monitoring-receipt-content") {
+        openDialog(document.getElementById("monitoring-receipt"), lastDialogOpener);
+        return;
+      }
+      var live = document.getElementById("monitoring-live");
+      if (!live || !previousState) return;
+      var nextState = live.dataset.monitorState || "";
+      if (nextState !== previousState) {
+        var announcer = document.getElementById("monitoring-announcer");
+        if (announcer) announcer.textContent = live.dataset.monitorAnnouncement || "Import status changed.";
+      }
+      previousState = "";
+    });
+  })();
+</script>
+{% endblock %}

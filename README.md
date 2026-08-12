@@ -205,6 +205,10 @@ Removing the component preserves its protected audit and import state. Raw and n
 OneRoster snapshots retain their 30-day expiry and are purged by Core. Permanent local data removal
 is a separate typed-confirmation action.
 
+See [Classroom OneRoster guided operations](docs/classroom-oneroster.md) for the guided flow,
+verified-step Monitoring behavior, heartbeat escalation, safe pause, Recovery, sanitized receipts,
+and the exact-SHA Mac update boundary.
+
 ### Enforced bounds and confirmation rules
 
 | Surface | Enforced bound or confirmation |

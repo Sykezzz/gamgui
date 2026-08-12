@@ -458,6 +458,11 @@ class LivePlanningResult:
         compare=False,
         repr=False,
     )
+    performance: "PlanningPerformanceReceipt" = field(
+        default_factory=lambda: PlanningPerformanceReceipt(),
+        compare=False,
+        repr=False,
+    )
 
     def actions_for(self, plan_kind: str) -> Tuple[ImportAction, ...]:
         kind = str(plan_kind or "").strip().casefold()
@@ -502,6 +507,9 @@ class ExecutionRun:
     stop_requested: bool = False
     attempt_number: int = 1
     last_error_code: str = ""
+    planning_seconds: float = 0.0
+    directory_snapshot_seconds: float = 0.0
+    classroom_snapshot_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -521,7 +529,46 @@ class ExecutionBatch:
     completed_at: float = 0.0
     attempt_number: int = 1
     error_code: str = ""
+    apply_seconds: float = 0.0
+    verification_seconds: float = 0.0
+    persistence_seconds: float = 0.0
+    verification_attempts: int = 0
+    worker_count: int = 5
+    throttling_count: int = 0
     action_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionPhaseProgress:
+    """Sanitized progress for one operator-facing group of action kinds."""
+
+    key: str
+    label: str
+    total: int
+    finished: int
+    applied: int
+    failed: int
+    skipped: int
+    pending: int
+
+
+@dataclass(frozen=True)
+class ExecutionBatchProgress:
+    """Sanitized receipt for the newest immutable execution batch."""
+
+    sequence_number: int
+    phase: str
+    phase_key: str
+    phase_label: str
+    action_count: int
+    course_count: int
+    status: str
+    apply_seconds: float = 0.0
+    verification_seconds: float = 0.0
+    persistence_seconds: float = 0.0
+    verification_attempts: int = 0
+    worker_count: int = 5
+    throttling_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -542,6 +589,25 @@ class ExecutionProgress:
     heartbeat_stale: bool
     actions_per_minute: float
     eta_seconds: Optional[float]
+    worker_count: int = 5
+    adaptive_state: str = "normal"
+    heartbeat_delayed: bool = False
+    heartbeat_state: str = "current"
+    course_count: int = 0
+    remaining_course_count: int = 0
+    phases: Tuple[ExecutionPhaseProgress, ...] = ()
+    current_batch: Optional[ExecutionBatchProgress] = None
+
+
+@dataclass(frozen=True)
+class PlanningPerformanceReceipt:
+    """Sanitized timings for one fresh, credential-backed planning pass."""
+
+    total_seconds: float = 0.0
+    source_seconds: float = 0.0
+    directory_snapshot_seconds: float = 0.0
+    classroom_snapshot_seconds: float = 0.0
+    roster_snapshot_seconds: float = 0.0
 
 
 @dataclass(frozen=True)

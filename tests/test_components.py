@@ -70,6 +70,32 @@ def _embedded_bundle(tmp_path: Path, profile: str) -> Path:
     return bundle
 
 
+def test_windows_bundle_profile_location_is_supported(tmp_path):
+    bundle = tmp_path / "GamGUI"
+    metadata = bundle / "_internal" / "resources" / "components" / "profile.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps(
+            build_profile_payload(
+                ONEROSTER_PROFILE,
+                source_sha=SHA,
+                version="1.2.3",
+                architecture="x86_64",
+                minimum_macos_version="10.0",
+                packaging_revision="1-windows",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (bundle / "GamGUI.exe").write_bytes(b"candidate")
+
+    sidecar = write_artifact_sidecar(bundle)
+    verified = verify_bundle_artifact(bundle, sidecar=sidecar)
+
+    assert verified.artifact.profile == ONEROSTER_PROFILE
+    assert verified.artifact.architecture == "x86_64"
+
+
 def test_profiles_are_fixed_and_have_distinct_digests():
     assert component_ids_for_profile(CORE_PROFILE) == ()
     assert component_ids_for_profile(ONEROSTER_PROFILE) == (ONEROSTER_COMPONENT,)

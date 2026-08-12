@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 
 FIXTURES = Path(__file__).parent / "fixtures"
-MOCK_GAM = FIXTURES / "mock_gam.sh"
+MOCK_GAM = FIXTURES / ("mock_gam.cmd" if os.name == "nt" else "mock_gam.sh")
 DOMAIN = "example.com"
 
 

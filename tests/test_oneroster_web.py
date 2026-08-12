@@ -303,6 +303,100 @@ class FakeOneRosterService:
         self.calls.append(("get_manifest", manifest_id))
         return self.manifests[manifest_id]
 
+    def latest_manifest_header(self, import_id=None):
+        self.calls.append(("latest_manifest_header", import_id))
+        matches = [
+            manifest
+            for manifest in self.manifests.values()
+            if import_id is None or manifest.import_id == import_id
+        ]
+        priority = {
+            "recovery_required": 0,
+            "running": 1,
+            "pause_requested": 1,
+            "paused": 1,
+            "failed": 2,
+            "interrupted": 2,
+            "stale": 2,
+            "partial": 2,
+            "planned": 3,
+            "awaiting_students": 3,
+            "completed": 4,
+        }
+        plan_priority = {"ordinary": 0, "archive": 1, "ownership": 2}
+        return (
+            min(
+                matches,
+                key=lambda manifest: (
+                    priority.get(manifest.status, 5),
+                    plan_priority.get(manifest.plan_kind, 3),
+                    manifest.id,
+                ),
+            )
+            if matches
+            else None
+        )
+
+    def get_execution_progress(self, manifest_id):
+        self.calls.append(("get_execution_progress", manifest_id))
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                status="running",
+                phase="student_add",
+                current_batch_sequence=4,
+                started_at=time.time() - 420,
+                planning_seconds=18.4,
+            ),
+            total=432,
+            pending=232,
+            applied=200,
+            failed=0,
+            skipped=0,
+            percent=46.3,
+            completed_batches=3,
+            total_batches_estimate=9,
+            elapsed_seconds=420.0,
+            heartbeat_age_seconds=4.0,
+            heartbeat_stale=False,
+            heartbeat_delayed=False,
+            heartbeat_state="current",
+            actions_per_minute=112.0,
+            eta_seconds=720.0,
+            worker_count=8,
+            adaptive_state="normal",
+            course_count=88,
+            remaining_course_count=41,
+            phases=(
+                SimpleNamespace(
+                    key="classes", label="Class setup", total=88, finished=88,
+                    applied=88, failed=0, skipped=0, pending=0,
+                ),
+                SimpleNamespace(
+                    key="teachers", label="Teacher access", total=84, finished=84,
+                    applied=84, failed=0, skipped=0, pending=0,
+                ),
+                SimpleNamespace(
+                    key="students", label="Student roster", total=260, finished=28,
+                    applied=28, failed=0, skipped=0, pending=232,
+                ),
+            ),
+            current_batch=SimpleNamespace(
+                sequence_number=4,
+                phase="student_add",
+                phase_key="students",
+                phase_label="Student roster",
+                action_count=50,
+                course_count=11,
+                status="running",
+                apply_seconds=23.6,
+                verification_seconds=12.0,
+                persistence_seconds=0.08,
+                verification_attempts=1,
+                worker_count=8,
+                throttling_count=0,
+            ),
+        )
+
     async def retry_stabilization_read(self, connector, manifest_id):
         self.calls.append(("retry_stabilization_read", connector, manifest_id))
         return SimpleNamespace(live_hash="stable-live")
@@ -459,6 +553,7 @@ def test_upload_rejects_non_zip_before_service_and_accepts_zip_stream():
 
     accepted = client.post(
         "/classroom/imports/upload",
+        data={"replace_active": "yes"},
         files={"package": ("district.zip", b"PKfixture", "application/zip")},
     )
     assert accepted.status_code == 200
@@ -507,7 +602,11 @@ def test_folder_upload_endpoint_accepts_selected_directory():
         for name, value in valid_files().items()
     ]
 
-    response = client.post("/classroom/imports/upload-folder", files=files)
+    response = client.post(
+        "/classroom/imports/upload-folder",
+        data={"replace_active": "yes"},
+        files=files,
+    )
 
     assert response.status_code == 200
     assert "District Roster.zip" in response.text
@@ -665,6 +764,7 @@ def test_historical_session_reselection_allows_next_upload_without_active_job(
 
     second = client.post(
         "/classroom/imports/upload",
+        data={"replace_active": "yes"},
         files={
             "package": ("current.zip", zip_bytes(valid_files()), "application/zip")
         },
@@ -949,6 +1049,53 @@ def test_manifest_execution_requires_typed_import_id_and_polls_local_state():
     )
 
 
+def test_direct_manifest_page_wraps_activity_and_renders_durable_progress():
+    client, service = _client()
+    client.post(
+        "/classroom/imports/import/import-1/plan",
+        data={"mode": "normal", "pilot_evidence": "Pilot evidence reviewed."},
+    )
+    manifest_id = "1" * 32
+    service.manifests[manifest_id].status = "running"
+
+    response = client.get(f"/classroom/imports/manifest/{manifest_id}")
+
+    assert response.status_code == 200
+    assert "Review, run, and results" in response.text
+    assert "Execution progress" in response.text
+    assert 'value="46.3"' in response.text
+    assert ("get_execution_progress", manifest_id) in service.calls
+
+
+def test_guided_import_resumes_the_latest_durable_manifest():
+    client, service = _client()
+    client.post(
+        "/classroom/imports/import/import-1/plan",
+        data={"mode": "normal", "pilot_evidence": "Pilot evidence reviewed."},
+    )
+    manifest_id = "1" * 32
+    service.manifests[manifest_id].status = "running"
+
+    response = client.get("/classroom/imports")
+
+    assert response.status_code == 200
+    assert "The import is working in checked batches" in response.text
+    assert "Execution progress" in response.text
+    assert ("latest_manifest_header", "import-1") in service.calls
+
+
+def test_new_upload_requires_explicit_active_journey_replacement():
+    client, service = _client()
+
+    blocked = client.post(
+        "/classroom/imports/upload",
+        files={"package": ("district.zip", b"PKfixture", "application/zip")},
+    )
+
+    assert "OR-ACTIVE-JOURNEY" in blocked.text
+    assert not any(call[0] == "upload" for call in service.calls)
+
+
 def test_late_execution_failure_warns_of_partial_apply_and_shows_results():
     client, service = _client()
     client.post(
@@ -1210,7 +1357,8 @@ def test_history_is_bounded_to_fifty_rows():
 
 
 def test_import_controls_have_semantics_live_regions_and_focus_styles():
-    client, _ = _client()
+    client, service = _client()
+    service.snapshots = {}
     response = client.get("/classroom/imports")
 
     assert 'aria-live="polite"' in response.text
