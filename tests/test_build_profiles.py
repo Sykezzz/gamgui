@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +44,7 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "gam-7.47.02-windows-x86_64.zip" in checksums
 
 
-def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
+def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():
     install = (ROOT / "scripts" / "install_windows_bootstrap.ps1").read_text(
         encoding="utf-8"
     )
@@ -51,11 +52,18 @@ def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
         encoding="utf-8"
     )
 
-    assert "TRUST GAMGUI LOCAL" in install
+    assert 'ValidateSet("Interactive", "Pretrusted")' in install
+    assert "PretrustedSignerSha256" in install
+    assert "TrustApproved" in install
     assert "-TrustLocalCertificate" in install
     assert "RemoveTrust" in install
-    assert "$createdCertificate" in install
-    assert "$installedCurrent" in install
+    assert "$script:createdCertificate" in install
+    assert "$script:installedCurrent" in install
+    assert "bootstrap-install.json" in install
+    assert "Recover-IncompleteBootstrap" in install
+    assert "Write-AtomicJson" in install
+    assert "schema_version" in install
+    assert "message_code" in install
     assert '"$current.artifact.json"' in install
     assert "A bootstrap file failed its SHA-256 receipt" in install
     assert "GamGUIUpdater.exe" in install
@@ -63,8 +71,18 @@ def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
     assert '$shortcut.Arguments = "--launch-installed"' in install
     assert "--write-artifact-sidecar" in install
     assert "--self-test" in install
+    assert "AdditionalFileToSign" in install
+    assert "outside the installer directory" in install
+    assert install.index('$script:installedCurrent = $true') < install.index(
+        "Move-Item -LiteralPath $incomingCurrent -Destination $current"
+    )
+    assert install.index('$script:installedHelper = $true') < install.index(
+        'Copy-Item -LiteralPath (Join-Path $bootstrapRoot "updater\\GamGUIUpdater.exe")'
+    )
+    assert "Remove-Item -LiteralPath $statePath" in install
     assert "RemoveData" in uninstall
     assert 'if ($RemoveData' in uninstall
+    assert '"updates"' in uninstall
 
 
 def test_windows_updater_helper_is_built_outside_the_application_bundle():
@@ -77,6 +95,78 @@ def test_windows_updater_helper_is_built_outside_the_application_bundle():
     assert "windows-toolchain.json" in spec
     assert "windows_local_signing.ps1" in spec
     assert '"--apply-update-helper" not in sys.argv[1:]' in entrypoint
+
+
+def test_windows_setup_wizard_is_native_offline_and_fail_closed():
+    wizard = (ROOT / "scripts" / "windows_setup.iss").read_text(encoding="utf-8")
+
+    assert "Inno Setup" not in wizard  # no compiler path or runtime download
+    assert "PrivilegesRequired=lowest" in wizard
+    assert "MinVersion=10.0.22000" in wizard
+    assert "ArchitecturesAllowed=x64compatible" in wizard
+    assert "Classroom + OneRoster (recommended)" in wizard
+    assert "Trust and install" in wizard
+    assert "TrustCheck.Checked := False" in wizard
+    assert "desktopicon" in wizard and "Flags: unchecked" in wizard
+    assert "Launch GamGUI" in wizard and "skipifsilent" in wizard
+    assert "GamGUI is already installed" in wizard
+    assert "PrepareToInstall" in wizard
+    assert "/PINNEDSIGNERSHA256" in wizard
+    assert "Silent setup never creates or trusts a certificate" in wizard
+    assert "Google, GAM, Keychain, or tenant services" in wizard
+    assert "setup-progress.json" in wizard
+    assert "SETUP-RUNNING-SELF-TEST" in wizard
+    assert "Also delete local application data" in wizard
+
+
+def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
+    build = (ROOT / "scripts" / "build_windows_setup.ps1").read_text(
+        encoding="utf-8"
+    )
+    manifest = json.loads(
+        (ROOT / "gamgui/resources/installer/windows-installer-toolchain.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["compiler"]["version"] == "7.0.2"
+    assert len(manifest["compiler"]["sha256"]) == 64
+    assert len(manifest["compiler"]["executable_sha256"]) == 64
+    assert manifest["compiler"]["publisher"] == "Pyrsys B.V."
+    assert "Get-AuthenticodeSignature" in build
+    assert "The checkout does not match the requested exact SHA" in build
+    assert 'foreach ($profile in @("core", "classroom-oneroster"))' in build
+    assert "2GB" in build
+    assert 'signing_status = "NotSigned"' in build
+    assert "windows-bootstrap-manifest.json" in build
+    assert "gamgui-windows-setup-release-v1" in build
+
+
+def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
+    workflow = (ROOT / ".github/workflows/windows-prerelease.yml").read_text(
+        encoding="utf-8"
+    )
+    exercise = (ROOT / "scripts/test_windows_setup.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "v0.0.1-windows.1" in workflow
+    assert "origin/district-main" in workflow
+    assert "origin/update-ready" in workflow
+    assert 'environment: windows-prerelease' in workflow
+    assert 'signing_status -ne "NotSigned"' in workflow
+    assert "actions/attest-build-provenance@" in workflow
+    assert "--prerelease" in workflow
+    assert "--verify-tag" in workflow
+    assert "SmartScreen" in workflow
+    assert "Windows offline suite (py${{ matrix.python }})" in workflow
+    assert '["3.10", "3.12", "3.14"]' in workflow
+    assert 'if (-not $env:CI)' in exercise
+    assert "unsafe Setup invocation unexpectedly succeeded" in exercise
+    assert 'Exercise-Profile "core"' in exercise
+    assert 'Exercise-Profile "classroom-oneroster"' in exercise
+    assert "Apps & Features" in exercise
+    assert "tampered bootstrap was accepted" in exercise
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():
