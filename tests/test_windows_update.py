@@ -75,6 +75,9 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "StoreLocation]::CurrentUser" in script
     assert "X509Store" in script and "OpenFlags]::ReadWrite" in script
     assert "Import-Certificate" not in script
+    assert "if ($CiEphemeralCertificate)" in script
+    assert "New-CiSigningCertificate" in script
+    assert "CreateSelfSigned" in script and "AddDays(1)" in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script
     assert "Get-AuthenticodeSignature" in script
     assert '"RemoveTrust"' in script

@@ -62,6 +62,64 @@ function Add-Trust([System.Security.Cryptography.X509Certificates.X509Certificat
     }
 }
 
+function New-CiSigningCertificate() {
+    $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+    try {
+        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            $subject,
+            $rsa,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
+                [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature,
+                $true
+            )
+        )
+        $oids = [System.Security.Cryptography.OidCollection]::new()
+        [void]$oids.Add([System.Security.Cryptography.Oid]::new($codeSigningOid))
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
+                $oids,
+                $false
+            )
+        )
+        $temporary = $request.CreateSelfSigned(
+            [System.DateTimeOffset]::UtcNow.AddMinutes(-5),
+            [System.DateTimeOffset]::UtcNow.AddDays(1)
+        )
+        $password = [guid]::NewGuid().ToString("N")
+        $pfx = $temporary.Export(
+            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
+            $password
+        )
+        $flags = (
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        )
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $pfx,
+            $password,
+            $flags
+        )
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            "My",
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+        )
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $store.Add($certificate)
+        } finally {
+            $store.Dispose()
+        }
+        return $certificate
+    } finally {
+        $rsa.Dispose()
+    }
+}
+
 function Get-SignableFiles([System.IO.DirectoryInfo]$Root) {
     return @(Get-ChildItem -LiteralPath $Root.FullName -Recurse -File | Where-Object {
         $_.Extension.ToLowerInvariant() -in @(".exe", ".dll", ".pyd", ".ps1")
@@ -139,17 +197,21 @@ if ($Action -eq "Enroll") {
     if ($existing.Count -gt 1) { throw "More than one GamGUI Local certificate exists; refusing silent rotation." }
     $created = $existing.Count -eq 0
     if ($created) {
-        $certificate = New-SelfSignedCertificate `
-            -Subject $subject `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -KeyAlgorithm RSA `
-            -KeyLength 3072 `
-            -HashAlgorithm SHA256 `
-            -KeyExportPolicy NonExportable `
-            -KeyUsage DigitalSignature `
-            -Type Custom `
-            -TextExtension @("2.5.29.37={text}$codeSigningOid") `
-            -NotAfter (Get-Date).AddYears(10)
+        if ($CiEphemeralCertificate) {
+            $certificate = New-CiSigningCertificate
+        } else {
+            $certificate = New-SelfSignedCertificate `
+                -Subject $subject `
+                -CertStoreLocation "Cert:\CurrentUser\My" `
+                -KeyAlgorithm RSA `
+                -KeyLength 3072 `
+                -HashAlgorithm SHA256 `
+                -KeyExportPolicy NonExportable `
+                -KeyUsage DigitalSignature `
+                -Type Custom `
+                -TextExtension @("2.5.29.37={text}$codeSigningOid") `
+                -NotAfter (Get-Date).AddYears(10)
+        }
     } else {
         $certificate = $existing[0]
     }
