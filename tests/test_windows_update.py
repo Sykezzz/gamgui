@@ -122,6 +122,8 @@ class _Process:
 
 
 def test_windows_installer_uses_shared_journal_and_exact_health_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr("gamgui.core.updater.runtime_platform", lambda: "windows")
+    monkeypatch.setattr("gamgui.core.updater.sys.platform", "win32")
     data_root = tmp_path / "data"
     update_root = data_root / "updates"
     install_root = tmp_path / "Programs" / "GamGUI"
