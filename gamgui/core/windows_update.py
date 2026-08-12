@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from .update_platform import bundle_executable
 WINDOWS_TOOLCHAIN_RELATIVE = Path("resources") / "updater" / "windows-toolchain.json"
 WINDOWS_SIGNING_SCRIPT_RELATIVE = Path("resources") / "updater" / "windows_local_signing.ps1"
 TOOLCHAIN_TIMEOUT_SECONDS = 30 * 60
+TOOLCHAIN_DOWNLOAD_ATTEMPTS = 3
 
 
 def default_toolchain_manifest_path() -> Path:
@@ -216,15 +218,26 @@ class WindowsToolchain:
         temporary = destination.with_suffix(destination.suffix + ".download")
         temporary.unlink(missing_ok=True)
         try:
-            request = urllib.request.Request(
-                asset.url,
-                headers={"User-Agent": "GamGUI exact-SHA updater"},
-            )
-            with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
-                shutil.copyfileobj(response, output)
-            if _sha256_file(temporary) != asset.sha256:
-                raise RuntimeError(f"Downloaded {asset.name} archive failed its committed SHA-256 pin.")
-            os.replace(temporary, destination)
+            for attempt in range(1, TOOLCHAIN_DOWNLOAD_ATTEMPTS + 1):
+                temporary.unlink(missing_ok=True)
+                try:
+                    request = urllib.request.Request(
+                        asset.url,
+                        headers={"User-Agent": "GamGUI exact-SHA updater"},
+                    )
+                    with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
+                        shutil.copyfileobj(response, output)
+                    if _sha256_file(temporary) != asset.sha256:
+                        raise RuntimeError(
+                            f"Downloaded {asset.name} archive failed its committed SHA-256 pin."
+                        )
+                    os.replace(temporary, destination)
+                    return
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    if attempt == TOOLCHAIN_DOWNLOAD_ATTEMPTS:
+                        raise
+                    time.sleep(2 * attempt)
         finally:
             temporary.unlink(missing_ok=True)
 

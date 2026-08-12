@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -16,7 +18,7 @@ from gamgui.core.updater import (
     UpdateStateStore,
     _windows_directory_exchange,
 )
-from gamgui.core.windows_update import WindowsLocalUpdateBuilder, WindowsToolchain
+from gamgui.core.windows_update import ToolchainAsset, WindowsLocalUpdateBuilder, WindowsToolchain
 
 SHA = "a" * 40
 
@@ -33,6 +35,43 @@ def test_committed_windows_toolchain_manifest_is_exact_and_digestible(tmp_path):
     }
     assert all(len(asset.sha256) == 64 for asset in toolchain.assets)
     assert all(asset.url.startswith("https://github.com/") for asset in toolchain.assets)
+
+
+def test_windows_toolchain_download_retries_transient_disconnects_without_weakening_hash_pin(
+    tmp_path, monkeypatch
+):
+    payload = b"checksum-pinned-toolchain"
+    asset = ToolchainAsset(
+        name="uv",
+        version="1",
+        archive="uv.zip",
+        url="https://github.com/example/toolchain/uv.zip",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        executable="uv.exe",
+        version_argument="--version",
+        version_contains="uv 1",
+    )
+    attempts = 0
+    waits: list[int] = []
+
+    def urlopen(_request, timeout):
+        nonlocal attempts
+        assert timeout == 120
+        attempts += 1
+        if attempts < 3:
+            raise ConnectionError("remote closed early")
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr("gamgui.core.windows_update.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("gamgui.core.windows_update.time.sleep", waits.append)
+    destination = tmp_path / asset.archive
+
+    WindowsToolchain._download(asset, destination)
+
+    assert attempts == 3
+    assert waits == [2, 4]
+    assert destination.read_bytes() == payload
+    assert not destination.with_suffix(".zip.download").exists()
 
 
 def test_windows_builder_rejects_moving_update_ready_before_checkout(tmp_path, monkeypatch):
