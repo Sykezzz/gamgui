@@ -17,9 +17,11 @@ if ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath $signingScr
     }
 }
 $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\GamGUI.lnk"
+$desktop = Join-Path ([Environment]::GetFolderPath("Desktop")) "GamGUI.lnk"
 Remove-Item -LiteralPath $startMenu -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $desktop -Force -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $installRoot) { Remove-Item -LiteralPath $installRoot -Recurse -Force }
-foreach ($path in @((Join-Path $dataRoot "updater"), (Join-Path $dataRoot "updates\toolchain"))) {
+foreach ($path in @((Join-Path $dataRoot "updater"), (Join-Path $dataRoot "updates"))) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
 }
 if ($RemoveData -and (Test-Path -LiteralPath $dataRoot)) { Remove-Item -LiteralPath $dataRoot -Recurse -Force }

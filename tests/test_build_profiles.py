@@ -43,7 +43,7 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "gam-7.47.02-windows-x86_64.zip" in checksums
 
 
-def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
+def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():
     install = (ROOT / "scripts" / "install_windows_bootstrap.ps1").read_text(
         encoding="utf-8"
     )
@@ -51,11 +51,18 @@ def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
         encoding="utf-8"
     )
 
-    assert "TRUST GAMGUI LOCAL" in install
+    assert 'ValidateSet("Interactive", "Pretrusted")' in install
+    assert "PretrustedSignerSha256" in install
+    assert "TrustApproved" in install
     assert "-TrustLocalCertificate" in install
     assert "RemoveTrust" in install
-    assert "$createdCertificate" in install
-    assert "$installedCurrent" in install
+    assert "$script:createdCertificate" in install
+    assert "$script:installedCurrent" in install
+    assert "bootstrap-install.json" in install
+    assert "Recover-IncompleteBootstrap" in install
+    assert "Write-AtomicJson" in install
+    assert "schema_version" in install
+    assert "message_code" in install
     assert '"$current.artifact.json"' in install
     assert "A bootstrap file failed its SHA-256 receipt" in install
     assert "GamGUIUpdater.exe" in install
@@ -63,8 +70,11 @@ def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
     assert '$shortcut.Arguments = "--launch-installed"' in install
     assert "--write-artifact-sidecar" in install
     assert "--self-test" in install
+    assert "AdditionalFileToSign" in install
+    assert "outside the installer directory" in install
     assert "RemoveData" in uninstall
     assert 'if ($RemoveData' in uninstall
+    assert '"updates"' in uninstall
 
 
 def test_windows_updater_helper_is_built_outside_the_application_bundle():
