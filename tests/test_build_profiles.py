@@ -123,6 +123,13 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Refusing silent setup because /PROFILE or /PINNEDSIGNERSHA256 is invalid" in wizard
     assert "Google, GAM, Keychain, or tenant services" in wizard
     assert "setup-progress.json" in wizard
+    assert "function SilentSignerIsAvailable: Boolean;" in wizard
+    assert "Cert:\\CurrentUser\\My" in wizard
+    assert "Cert:\\CurrentUser\\Root" in wizard
+    assert "Cert:\\CurrentUser\\TrustedPublisher" in wizard
+    assert "HasPrivateKey" in wizard
+    assert "if not SilentSignerIsAvailable then" in wizard
+    assert "missing or is not trusted" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
     assert "Also delete local application data" in wizard
 
