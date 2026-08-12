@@ -136,6 +136,7 @@ if ($Bootstrap) {
     New-Item -ItemType Directory -Path (Join-Path $stage "application") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage "updater") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage "toolchain") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stage "licenses") -Force | Out-Null
     Copy-Item -LiteralPath $bundle -Destination (Join-Path $stage "application\current") -Recurse
     Copy-Item -LiteralPath $helper -Destination (Join-Path $stage "updater\GamGUIUpdater.exe")
     Copy-Item -LiteralPath $toolchainManifest -Destination (Join-Path $stage "toolchain\windows-toolchain.json")
@@ -144,6 +145,8 @@ if ($Bootstrap) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall_windows_bootstrap.ps1") -Destination (Join-Path $stage "uninstall.ps1")
     Copy-Item -LiteralPath $signingScript -Destination (Join-Path $stage "windows_local_signing.ps1")
     Copy-Item -LiteralPath $selfTest -Destination (Join-Path $stage "self-test.json")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $stage "licenses\GamGUI-LICENSE.txt")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "gamgui\resources\gam7\LICENSE") -Destination (Join-Path $stage "licenses\GAM-LICENSE.txt")
     $records = @()
     foreach ($file in @(Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName)) {
         $records += [ordered]@{

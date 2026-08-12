@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,50 @@ def test_windows_updater_helper_is_built_outside_the_application_bundle():
     assert "windows-toolchain.json" in spec
     assert "windows_local_signing.ps1" in spec
     assert '"--apply-update-helper" not in sys.argv[1:]' in entrypoint
+
+
+def test_windows_setup_wizard_is_native_offline_and_fail_closed():
+    wizard = (ROOT / "scripts" / "windows_setup.iss").read_text(encoding="utf-8")
+
+    assert "Inno Setup" not in wizard  # no compiler path or runtime download
+    assert "PrivilegesRequired=lowest" in wizard
+    assert "MinVersion=10.0.22000" in wizard
+    assert "ArchitecturesAllowed=x64compatible" in wizard
+    assert "Classroom + OneRoster (recommended)" in wizard
+    assert "Trust and install" in wizard
+    assert "TrustCheck.Checked := False" in wizard
+    assert "desktopicon" in wizard and "Flags: unchecked" in wizard
+    assert "Launch GamGUI" in wizard and "skipifsilent" in wizard
+    assert "GamGUI is already installed" in wizard
+    assert "PrepareToInstall" in wizard
+    assert "/PINNEDSIGNERSHA256" in wizard
+    assert "Silent setup never creates or trusts a certificate" in wizard
+    assert "Google, GAM, Keychain, or tenant services" in wizard
+    assert "setup-progress.json" in wizard
+    assert "SETUP-RUNNING-SELF-TEST" in wizard
+    assert "Also delete local application data" in wizard
+
+
+def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
+    build = (ROOT / "scripts" / "build_windows_setup.ps1").read_text(
+        encoding="utf-8"
+    )
+    manifest = json.loads(
+        (ROOT / "gamgui/resources/installer/windows-installer-toolchain.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["compiler"]["version"] == "7.0.2"
+    assert len(manifest["compiler"]["sha256"]) == 64
+    assert manifest["compiler"]["publisher"] == "Pyrsys B.V."
+    assert "Get-AuthenticodeSignature" in build
+    assert "The checkout does not match the requested exact SHA" in build
+    assert 'foreach ($profile in @("core", "classroom-oneroster"))' in build
+    assert "2GB" in build
+    assert 'signing_status = "NotSigned"' in build
+    assert "windows-bootstrap-manifest.json" in build
+    assert "gamgui-windows-setup-release-v1" in build
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():
