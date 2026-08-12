@@ -84,6 +84,8 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert '@("UnknownError", "NotTrusted")' in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script
     assert "Get-AuthenticodeSignature" in script
+    assert 'Join-Path $Root.FullName "GamGUI.exe"' in script
+    assert '@(".exe", ".dll", ".pyd", ".ps1")' not in script
     assert '"RemoveTrust"' in script
 
 

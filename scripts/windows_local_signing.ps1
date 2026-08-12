@@ -131,9 +131,9 @@ function New-CiSigningCertificate() {
 }
 
 function Get-SignableFiles([System.IO.DirectoryInfo]$Root) {
-    return @(Get-ChildItem -LiteralPath $Root.FullName -Recurse -File | Where-Object {
-        $_.Extension.ToLowerInvariant() -in @(".exe", ".dll", ".pyd", ".ps1")
-    } | Sort-Object FullName)
+    $application = Get-Item -LiteralPath (Join-Path $Root.FullName "GamGUI.exe")
+    if ($application.PSIsContainer) { throw "The Windows application executable is missing." }
+    return @($application)
 }
 
 function Test-SignatureStatus($Signature) {
