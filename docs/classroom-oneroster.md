@@ -64,13 +64,21 @@ courses are archived rather than deleted. Drifted or ambiguous actions require m
 Checkpoint restoration is reserved for incidents and depends on retained pre-mutation affected-
 course evidence.
 
-## Release and Mac update boundary
+## Release and cross-platform update boundary
 
 Merge through a checked pull request to protected `district-main`; do not push directly to the
 protected branch. A green pull request is source-control evidence, not installed-app evidence.
-After merge, post-merge validation must publish the exact merged SHA to `update-ready`. Only then can
-the Mac updater discover and build that exact revision. The Mac installation, local signature,
-self-test, embedded GAM version, and activated SHA must still be verified separately.
+After merge, post-merge validation must publish the exact merged SHA to `update-ready`. The ref does
+not advance unless macOS and Windows tests, both fixed profile builds, pinned GAM checks, offline
+self-tests, activation, and rollback contracts pass for that same SHA. Only then can either local
+updater discover and build the revision.
+
+`update-ready` is the routine local-build channel. Official public macOS releases remain manual,
+tag-based, signed, and notarized. Windows routine installs are per-user and use the pinned local
+`GamGUI Local` certificate created during the first manual bootstrap; it provides user/machine
+continuity, not public SmartScreen reputation. The bootstrap consent, actual installed SHA, selected
+profile, bundled GAM, local signature, self-test, runtime health, and preserved data must still be
+verified separately on each computer.
 
 The local sketches under `.planning/sketches/` are disposable review artifacts and are not part of
 the application or release.
