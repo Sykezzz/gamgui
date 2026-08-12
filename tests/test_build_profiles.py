@@ -73,6 +73,13 @@ def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():
     assert "--self-test" in install
     assert "AdditionalFileToSign" in install
     assert "outside the installer directory" in install
+    assert install.index('$script:installedCurrent = $true') < install.index(
+        "Move-Item -LiteralPath $incomingCurrent -Destination $current"
+    )
+    assert install.index('$script:installedHelper = $true') < install.index(
+        'Copy-Item -LiteralPath (Join-Path $bootstrapRoot "updater\\GamGUIUpdater.exe")'
+    )
+    assert "Remove-Item -LiteralPath $statePath" in install
     assert "RemoveData" in uninstall
     assert 'if ($RemoveData' in uninstall
     assert '"updates"' in uninstall

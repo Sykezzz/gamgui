@@ -114,6 +114,7 @@ function Recover-IncompleteBootstrap() {
     if ([bool]$journal.installed_helper) { Remove-Item -LiteralPath $helper -Force -ErrorAction SilentlyContinue }
     if ([bool]$journal.installed_signing_support) { Remove-Item -LiteralPath $installedSigningPath -Force -ErrorAction SilentlyContinue }
     if ([bool]$journal.installed_uninstall_support) { Remove-Item -LiteralPath $installedUninstallPath -Force -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-RecordedCertificate $journal
     Remove-Item -LiteralPath $journalPath -Force
 }
@@ -199,12 +200,15 @@ try {
     Write-SetupProgress "signing" "working" "SETUP-SIGNING-FILES"
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Sign -Path $incomingCurrent -CertificateSha256 $signerSha
     if ($LASTEXITCODE) { throw "The installed application could not be locally signed." }
-    Copy-Item -LiteralPath (Join-Path $bootstrapRoot "updater\GamGUIUpdater.exe") -Destination $helper -Force
     $script:installedHelper = $true
-    Copy-Item -LiteralPath $signingScript -Destination $installedSigningPath -Force
+    Write-InstallJournal "installing_helper"
+    Copy-Item -LiteralPath (Join-Path $bootstrapRoot "updater\GamGUIUpdater.exe") -Destination $helper -Force
     $script:installedSigningSupport = $true
-    Copy-Item -LiteralPath $uninstallScript -Destination $installedUninstallPath -Force
+    Write-InstallJournal "installing_signing_support"
+    Copy-Item -LiteralPath $signingScript -Destination $installedSigningPath -Force
     $script:installedUninstallSupport = $true
+    Write-InstallJournal "installing_uninstall_support"
+    Copy-Item -LiteralPath $uninstallScript -Destination $installedUninstallPath -Force
     foreach ($file in @($helper, $installedSigningPath, $installedUninstallPath)) {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $file -CertificateSha256 $signerSha
         if ($LASTEXITCODE) { throw "Installed support files could not be locally signed." }
@@ -222,8 +226,9 @@ try {
     Write-InstallJournal "payload_signed"
     Write-SetupProgress "signing" "complete" "SETUP-FILES-SIGNED"
 
-    Move-Item -LiteralPath $incomingCurrent -Destination $current
     $script:installedCurrent = $true
+    Write-InstallJournal "activating"
+    Move-Item -LiteralPath $incomingCurrent -Destination $current
     Remove-Item -LiteralPath $incoming -Force
     Write-InstallJournal "activated"
     $executable = Join-Path $current "GamGUI.exe"
