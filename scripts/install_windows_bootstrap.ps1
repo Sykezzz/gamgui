@@ -116,6 +116,14 @@ try {
     windows_installation_root = $installRoot
     pending_bundle = ""
     }
+    if (-not $NoShortcuts) {
+        $shell = New-Object -ComObject WScript.Shell
+        $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\GamGUI.lnk"
+        $shortcut = $shell.CreateShortcut($startMenu)
+        $shortcut.TargetPath = $executable
+        $shortcut.WorkingDirectory = $current
+        $shortcut.Save()
+    }
     $statePath = Join-Path $dataRoot "updates\state.json"
     New-Item -ItemType Directory -Path (Split-Path -Parent $statePath) -Force | Out-Null
     $stateTemporary = "$statePath.bootstrap"
@@ -125,21 +133,14 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
     Move-Item -LiteralPath $stateTemporary -Destination $statePath -Force
-
-    if (-not $NoShortcuts) {
-        $shell = New-Object -ComObject WScript.Shell
-        $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\GamGUI.lnk"
-        $shortcut = $shell.CreateShortcut($startMenu)
-        $shortcut.TargetPath = $executable
-        $shortcut.WorkingDirectory = $current
-        $shortcut.Save()
-    }
 } catch {
     if ($incoming -and (Test-Path -LiteralPath $incoming)) { Remove-Item -LiteralPath $incoming -Recurse -Force -ErrorAction SilentlyContinue }
     if ($installedCurrent -and (Test-Path -LiteralPath $current)) { Remove-Item -LiteralPath $current -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($installedCurrent -and (Test-Path -LiteralPath "$current.artifact.json")) { Remove-Item -LiteralPath "$current.artifact.json" -Force -ErrorAction SilentlyContinue }
     if ($installedHelper -and (Test-Path -LiteralPath $helper)) { Remove-Item -LiteralPath $helper -Force -ErrorAction SilentlyContinue }
     if ($installedSigningScript -and (Test-Path -LiteralPath $installedSigningPath)) { Remove-Item -LiteralPath $installedSigningPath -Force -ErrorAction SilentlyContinue }
     if ($stateTemporary -and (Test-Path -LiteralPath $stateTemporary)) { Remove-Item -LiteralPath $stateTemporary -Force -ErrorAction SilentlyContinue }
+    if ($startMenu -and (Test-Path -LiteralPath $startMenu)) { Remove-Item -LiteralPath $startMenu -Force -ErrorAction SilentlyContinue }
     if ($createdCertificate -and $signerSha) {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Remove -CertificateSha256 $signerSha
     } elseif ($addedTrust -and $signerSha) {
