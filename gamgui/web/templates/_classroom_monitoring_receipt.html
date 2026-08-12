@@ -1,0 +1,28 @@
+{% set progress = workspace.progress | default({}, true) %}
+{% set run = progress.run | default({}, true) %}
+{% set batch = progress.current_batch | default({}, true) %}
+<div class="p-5 sm:p-6">
+  <p class="eyebrow text-brand-blueink">Current run · read only</p>
+  <h2 id="monitoring-receipt-title" class="mt-1 font-serif text-2xl text-brand-black">Technical receipt</h2>
+  {% if not run %}
+  <p class="mt-3 text-sm text-brand-blueink">No execution receipt is available for this saved plan yet.</p>
+  {% else %}
+  <p class="mt-2 text-sm text-brand-blueink">Sanitized timing and protection signals for troubleshooting this run.</p>
+  <dl class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Automatic workers</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.worker_count | default(progress.worker_count | default(5)) }}</dd><span class="text-xs text-brand-blueink">not an operator setting</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Verification attempts</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.verification_attempts | default(0) }}</dd><span class="text-xs text-brand-blueink">latest batch</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Apply time</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.apply_seconds | default(0) | round(2) }} sec</dd><span class="text-xs text-brand-blueink">latest batch</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Verification</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.verification_seconds | default(0) | round(2) }} sec</dd><span class="text-xs text-brand-blueink">live reread</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Saving results</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.persistence_seconds | default(0) | round(3) }} sec</dd><span class="text-xs text-brand-blueink">atomic receipt</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Planning</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ run.planning_seconds | default(0) | round(2) }} sec</dd><span class="text-xs text-brand-blueink">fresh snapshots</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Throttling signals</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ batch.throttling_count | default(0) }}</dd><span class="text-xs text-brand-blueink">latest batch</span></div>
+    <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Elapsed</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ monitor.elapsed_label }}</dd><span class="text-xs text-brand-blueink">current run</span></div>
+  </dl>
+  {% set other = progress.phases | default([]) | selectattr("key", "equalto", "other") | list %}
+  {% if other %}<p class="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">Other checked work: {{ other[0].finished }} of {{ other[0].total }} finished. This category keeps future action kinds visible instead of silently dropping them.</p>{% endif %}
+  <p class="mt-4 text-sm text-brand-blueink">No tenant identifiers or raw GAM output are included.</p>
+  {% endif %}
+</div>
+<div class="flex justify-end border-t border-brand-gray/40 bg-paper px-5 py-4">
+  <button type="button" data-close-monitoring-dialog class="rounded-lg border border-brand-gray/60 bg-brand-white px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Close receipt</button>
+</div>

@@ -37,6 +37,7 @@ def test_classroom_text_and_button_pairs_meet_wcag_aa():
         ("#78350F", "#FFFBEB"),  # amber-900 on amber-50
         ("#991B1B", "#FEF2F2"),  # red-800 on red-50
         ("#065F46", "#ECFDF5"),  # emerald-800 on emerald-50
+        ("#52647B", "#DBE3EB"),  # monitoring phase progress graphic
     )
     assert all(_contrast(foreground, background) >= 4.5 for foreground, background in pairs)
 
@@ -69,10 +70,17 @@ def test_classroom_templates_do_not_use_low_contrast_brand_gray_for_live_text():
             assert not live_text_uses, path.name
 
 
-def test_monitoring_explains_adaptive_pacing_without_exposing_a_setting():
+def test_monitoring_keeps_pacing_details_optional_and_read_only():
     monitoring = (TEMPLATES / "classroom_monitoring.html").read_text(encoding="utf-8")
-    assert "Working normally" in monitoring
-    assert "Slowing down to protect Google" in monitoring
-    assert "actions/min" in monitoring
-    assert 'role="status"' in monitoring
+    live = (TEMPLATES / "_classroom_monitoring_live.html").read_text(encoding="utf-8")
+    receipt = (TEMPLATES / "_classroom_monitoring_receipt.html").read_text(
+        encoding="utf-8"
+    )
+    assert "Working normally" not in monitoring + live
+    assert "Technical receipt" in live
+    assert "local page checks about every three seconds" in live
+    assert "Open Recovery to pause" in monitoring
     assert "worker_count" not in monitoring
+    assert "worker_count" not in live
+    assert "worker_count" in receipt
+    assert "raw GAM output" in receipt

@@ -46,6 +46,41 @@ def main() -> int:
                     continue
                 page.locator("details").evaluate_all("items => items.forEach(item => item.open = true)")
                 page.wait_for_timeout(100)
+                if route == "/classroom/monitoring":
+                    receipt_button = page.locator("[data-open-monitoring-receipt]")
+                    receipt_button.click()
+                    receipt_dialog = page.locator("#monitoring-receipt")
+                    receipt_dialog.wait_for(state="visible")
+                    if "Technical receipt" not in receipt_dialog.inner_text():
+                        findings.append({"route": route, "viewport": [width, height], "control": "technical receipt did not populate"})
+                    page.keyboard.press("Escape")
+                    receipt_dialog.wait_for(state="hidden")
+                    if not receipt_button.evaluate("element => element === document.activeElement"):
+                        findings.append({"route": route, "viewport": [width, height], "control": "receipt focus did not return"})
+
+                    pause_button = page.locator("[data-open-monitoring-pause]")
+                    pause_button.click()
+                    pause_dialog = page.locator("#monitoring-pause-preview")
+                    pause_dialog.wait_for(state="visible")
+                    if "Open Recovery to pause" not in pause_dialog.inner_text():
+                        findings.append({"route": route, "viewport": [width, height], "control": "safe pause preview did not populate"})
+                    pause_dialog.locator("[data-close-monitoring-dialog]").click()
+                    if not pause_button.evaluate("element => element === document.activeElement"):
+                        findings.append({"route": route, "viewport": [width, height], "control": "pause focus did not return"})
+                    announcement = page.evaluate(
+                        """() => {
+                          const live = document.getElementById('monitoring-live');
+                          document.body.dispatchEvent(new CustomEvent('htmx:beforeSwap', {detail: {target: live}}));
+                          live.dataset.monitorState = 'delayed';
+                          live.dataset.monitorAnnouncement = 'The latest local check-in is delayed.';
+                          document.body.dispatchEvent(new CustomEvent('htmx:afterSwap', {detail: {target: live}}));
+                          live.dataset.monitorState = 'running';
+                          return document.getElementById('monitoring-announcer').textContent;
+                        }"""
+                    )
+                    if announcement != "The latest local check-in is delayed.":
+                        findings.append({"route": route, "viewport": [width, height], "control": "state transition was not announced"})
+                    page.wait_for_timeout(250)
                 overflow = page.evaluate(
                     """() => ({
                       client: document.documentElement.clientWidth,

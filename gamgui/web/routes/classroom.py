@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Optional
 
@@ -183,6 +184,130 @@ def _plain(value: Any) -> dict[str, Any]:
         for name in dir(value)
         if not name.startswith("_") and not callable(getattr(value, name, None))
     })
+
+
+def _duration_label(seconds: float) -> str:
+    value = max(0.0, float(seconds or 0))
+    if value < 60:
+        return f"{round(value)} sec"
+    if value < 3600:
+        return f"{round(value / 60)} min"
+    hours = int(value // 3600)
+    minutes = round((value % 3600) / 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
+def _clock_label(timestamp: float) -> str:
+    if not timestamp:
+        return ""
+    try:
+        value = datetime.fromtimestamp(float(timestamp)).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return ""
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def _monitoring_view(workspace: dict[str, Any]) -> dict[str, Any]:
+    manifest = _plain(workspace.get("manifest"))
+    progress = _plain(workspace.get("progress"))
+    run = _plain(progress.get("run"))
+    batch = _plain(progress.get("current_batch"))
+    manifest_status = str(manifest.get("status", "") or "").casefold()
+    run_status = str(run.get("status", "") or "").casefold()
+    heartbeat_state = str(progress.get("heartbeat_state", "current") or "current")
+    adaptive_state = str(progress.get("adaptive_state", "normal") or "normal")
+    failed = int(progress.get("failed", 0) or 0)
+
+    if heartbeat_state == "stale":
+        state = "stale"
+        announcement = "The import worker stopped checking in. Open Recovery before continuing."
+    elif manifest_status in {"recovery_required", "interrupted", "stale"}:
+        state = "recovery"
+        announcement = "This import needs protected recovery before it can continue."
+    elif manifest_status == "failed":
+        state = "failed"
+        announcement = "The import stopped with a saved failure. Open Recovery before continuing."
+    elif run_status == "pause_requested":
+        state = "pausing"
+        announcement = "A safe pause was requested. The active batch is still being checked."
+    elif manifest_status == "completed":
+        state = "completed"
+        announcement = "The import finished and its saved results are ready to review."
+    elif failed:
+        state = "issues"
+        announcement = f"{failed} checked change{'s' if failed != 1 else ''} need review."
+    elif heartbeat_state == "delayed":
+        state = "delayed"
+        announcement = "The latest local check-in is delayed. GamGUI is still watching it."
+    elif adaptive_state == "protecting_google":
+        state = "protecting"
+        announcement = "GamGUI slowed this run to protect Google and will adjust automatically."
+    elif run_status == "running":
+        state = "running"
+        announcement = "The import is moving through verified batches."
+    elif manifest_status == "paused":
+        state = "paused"
+        announcement = "The import is paused at a verified stopping point."
+    else:
+        state = manifest_status or "waiting"
+        announcement = "The latest saved import record is ready to review."
+
+    completed_batches = int(progress.get("completed_batches", 0) or 0)
+    eta_seconds = progress.get("eta_seconds")
+    elapsed_seconds = float(progress.get("elapsed_seconds", 0) or 0)
+    if state in {"stale", "recovery", "failed"}:
+        eta_value = "Review"
+        eta_caption = "Estimate unavailable"
+        eta_detail = "Reconcile the saved batch before estimating the remaining time."
+    elif state == "completed":
+        eta_value = _duration_label(elapsed_seconds)
+        eta_caption = "Total run time"
+        eta_detail = "Every terminal result shown here came from saved verification evidence."
+    elif completed_batches < 2 or eta_seconds is None:
+        eta_value = "Learning"
+        eta_caption = "Learning the pace…"
+        eta_detail = "A useful estimate appears after two batches finish and pass their checks."
+    else:
+        eta_minutes = max(1, round(float(eta_seconds) / 60))
+        eta_value = f"{eta_minutes} min"
+        eta_caption = f"About {eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
+        eta_detail = "Rounded from this run's verified batches, not from another import."
+
+    heartbeat_age = float(progress.get("heartbeat_age_seconds", 0) or 0)
+    return {
+        "state": state,
+        "announcement": announcement,
+        "polling": run_status in {"running", "pause_requested"},
+        "started_label": _clock_label(float(run.get("started_at", 0) or 0)),
+        "elapsed_label": _duration_label(elapsed_seconds),
+        "last_update_label": (
+            "Updated just now"
+            if heartbeat_age < 10
+            else f"Updated {round(heartbeat_age)} sec ago"
+            if heartbeat_age < 90
+            else f"Updated {round(heartbeat_age / 60)} min ago"
+        ),
+        "eta_value": eta_value,
+        "eta_caption": eta_caption,
+        "eta_detail": eta_detail,
+        "percent": max(0, min(100, round(float(progress.get("percent", 0) or 0)))),
+        "batch": batch,
+    }
+
+
+async def _monitoring_template_context(
+    request: Request,
+    *,
+    partial: bool = False,
+) -> dict[str, Any]:
+    service = _service(request)
+    workspace = await _classroom_workspace_context(request)
+    return {
+        "connected": service is not None,
+        "workspace": workspace,
+        "monitor": _monitoring_view(workspace),
+        "monitor_partial": partial,
+    }
 
 
 async def _classroom_workspace_context(request: Request) -> dict[str, Any]:
@@ -386,14 +511,28 @@ async def course_admin_page(
 
 @router.get("/monitoring", response_class=HTMLResponse)
 async def classroom_monitoring(request: Request) -> HTMLResponse:
-    service = _service(request)
     return TEMPLATES.TemplateResponse(
         request,
         "classroom_monitoring.html",
-        {
-            "connected": service is not None,
-            "workspace": await _classroom_workspace_context(request),
-        },
+        await _monitoring_template_context(request),
+    )
+
+
+@router.get("/monitoring/status", response_class=HTMLResponse)
+async def classroom_monitoring_status(request: Request) -> HTMLResponse:
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_classroom_monitoring_live.html",
+        await _monitoring_template_context(request, partial=True),
+    )
+
+
+@router.get("/monitoring/receipt", response_class=HTMLResponse)
+async def classroom_monitoring_receipt(request: Request) -> HTMLResponse:
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_classroom_monitoring_receipt.html",
+        await _monitoring_template_context(request, partial=True),
     )
 
 

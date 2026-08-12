@@ -4,52 +4,96 @@
 {% block content %}
 {% set classroom_section = "monitoring" %}
 {% include "_classroom_subnav.html" %}
-<div class="space-y-6">
-  <header>
-    <p class="eyebrow text-brand-blueink">Classroom monitoring</p>
-    <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Watch the work without guessing</h1>
-    <p class="mt-2 max-w-3xl text-sm text-brand-blueink">This page reads saved progress. It does not start, repeat, or change an import.</p>
+<div class="space-y-5">
+  <header class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <p class="eyebrow text-brand-blueink">Classroom monitoring · current run</p>
+      <h1 class="mt-1 font-serif text-3xl tracking-tight text-brand-black">Live import operations</h1>
+      <p class="mt-2 max-w-3xl text-sm text-brand-blueink">Time, checked progress, and the work still ahead—from GamGUI's saved local record.</p>
+    </div>
+    <a href="/classroom/recovery" class="rounded-lg border border-brand-gray/60 bg-brand-white px-3 py-2 text-sm font-semibold text-brand-blueink shadow-sm focus-visible:ring-2 focus-visible:ring-brand-blue">Recovery</a>
   </header>
-  {% if not connected or not workspace.available %}
-  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-6 shadow-sm">
-    <h2 class="font-serif text-xl text-brand-black">Monitoring is not ready yet</h2>
-    <p class="mt-2 text-sm text-brand-blueink">Connect a domain and enable OneRoster Classroom first.</p>
-  </section>
-  {% elif not workspace.manifest %}
-  <section class="rounded-2xl border border-dashed border-brand-gray/60 bg-brand-white p-8 text-center">
-    <h2 class="font-serif text-xl text-brand-black">No checked plan to watch</h2>
-    <p class="mt-2 text-sm text-brand-blueink">Start with Guided import. Monitoring appears after GamGUI has built a saved plan.</p>
-    <a href="/classroom/imports" class="mt-4 inline-flex rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open guided import</a>
-  </section>
-  {% else %}
-  {% set run = workspace.progress.run | default({}, true) %}
-  <section class="rounded-2xl border border-brand-gray/40 bg-brand-white p-5 shadow-sm" aria-labelledby="monitoring-status-heading">
-    <div class="flex flex-wrap items-start justify-between gap-3">
-      <div><p class="eyebrow text-brand-blueink">Current record</p><h2 id="monitoring-status-heading" class="mt-1 font-serif text-2xl text-brand-black">{{ workspace.risk_label }}</h2></div>
-      <span class="rounded-lg border border-brand-gray/50 bg-paper px-3 py-1.5 text-sm font-semibold text-brand-black">{{ workspace.manifest.status | replace("_", " ") | title }}</span>
-    </div>
-    <progress class="mt-5 h-3 w-full accent-brand-blue" max="100" value="{{ workspace.progress.percent | default(0) }}">{{ workspace.progress.percent | default(0) }}%</progress>
-    <p class="mt-2 text-sm tabular-nums text-brand-blueink">{{ workspace.progress.applied | default(0) }} applied · {{ workspace.progress.failed | default(0) }} failed · {{ workspace.progress.skipped | default(0) }} skipped · {{ workspace.progress.pending | default(0) }} waiting</p>
-    <p class="mt-4 rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-sm font-semibold text-brand-black" role="status">
-      {% if workspace.progress.adaptive_state | default("normal") == "protecting_google" %}
-      Slowing down to protect Google. GamGUI will speed up again after clean batches.
-      {% else %}
-      Working normally. GamGUI adjusts the pace automatically while keeping every safety check.
-      {% endif %}
-    </p>
-    <dl class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Checked batches</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.completed_batches | default(0) }} of about {{ workspace.progress.total_batches_estimate | default(0) }}</dd></div>
-      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Current batch</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ run.current_batch_sequence | default(0) }}</dd></div>
-      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Current pace</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.actions_per_minute | default(0) | round }} actions/min</dd></div>
-      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Elapsed</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ ((workspace.progress.elapsed_seconds | default(0)) / 60) | round(1) }} min</dd></div>
-      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Last check-in</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.heartbeat_age_seconds | default(0) | round }} sec ago</dd></div>
-    </dl>
-    {% if workspace.progress.heartbeat_stale %}<p class="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900" role="alert">The worker stopped checking in. Do not start another run. Open Recovery and reconcile the saved batch.</p>{% endif %}
-    <div class="mt-5 flex flex-wrap gap-3">
-      <a href="/classroom/imports/manifest/{{ workspace.manifest.id }}" class="rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open full activity</a>
-      {% if workspace.manifest.status in ("running", "pause_requested", "recovery_required") %}<a href="/classroom/recovery" class="rounded-lg border border-brand-gray/60 px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Open Recovery</a>{% endif %}
-    </div>
-  </section>
-  {% endif %}
+
+  <p id="monitoring-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+  {% include "_classroom_monitoring_live.html" %}
 </div>
+
+<dialog id="monitoring-receipt" aria-labelledby="monitoring-receipt-title" class="w-[min(46rem,calc(100%-2rem))] rounded-2xl border border-brand-gray/60 bg-brand-white p-0 text-ink shadow-2xl backdrop:bg-brand-black/30">
+  <div id="monitoring-receipt-content">
+    {% include "_classroom_monitoring_receipt.html" %}
+  </div>
+</dialog>
+
+<dialog id="monitoring-pause-preview" aria-labelledby="monitoring-pause-title" class="w-[min(38rem,calc(100%-2rem))] rounded-2xl border border-brand-gray/60 bg-brand-white p-0 text-ink shadow-2xl backdrop:bg-brand-black/30">
+  <div class="p-5 sm:p-6">
+    <p class="eyebrow text-brand-blueink">Safe pause preview</p>
+    <h2 id="monitoring-pause-title" class="mt-1 font-serif text-2xl text-brand-black">Pause after the active batch is checked</h2>
+    <p class="mt-3 text-sm text-brand-blueink">GamGUI will finish sending the current small group, reread the affected classes, and save the verified stopping point before it pauses.</p>
+    <ul class="mt-4 list-disc space-y-2 pl-5 text-sm text-brand-black">
+      <li>It will not stop halfway through the active batch.</li>
+      <li>Already confirmed work will not be repeated.</li>
+      <li>The next batch stays untouched until an operator resumes.</li>
+    </ul>
+  </div>
+  <div class="flex flex-wrap justify-end gap-3 border-t border-brand-gray/40 bg-paper px-5 py-4">
+    <button type="button" data-close-monitoring-dialog class="rounded-lg border border-brand-gray/60 bg-brand-white px-4 py-2 text-sm font-semibold text-brand-blueink focus-visible:ring-2 focus-visible:ring-brand-blue">Keep monitoring</button>
+    <a href="/classroom/recovery#running-work" class="rounded-lg bg-brand-blueink px-4 py-2 text-sm font-semibold text-white focus-visible:ring-2 focus-visible:ring-brand-blue">Open Recovery to pause</a>
+  </div>
+</dialog>
+
+<script>
+  (function () {
+    if (window.gamguiMonitoringBound) return;
+    window.gamguiMonitoringBound = true;
+    var lastDialogOpener = null;
+    var previousState = "";
+
+    function openDialog(dialog, opener) {
+      if (!dialog || typeof dialog.showModal !== "function") return;
+      lastDialogOpener = opener || null;
+      dialog.showModal();
+      var focusTarget = dialog.querySelector("button, a[href]");
+      if (focusTarget) focusTarget.focus();
+    }
+
+    document.addEventListener("click", function (event) {
+      var receipt = event.target.closest("[data-open-monitoring-receipt]");
+      if (receipt) lastDialogOpener = receipt;
+      var pause = event.target.closest("[data-open-monitoring-pause]");
+      if (pause) openDialog(document.getElementById("monitoring-pause-preview"), pause);
+      var close = event.target.closest("[data-close-monitoring-dialog]");
+      if (close) {
+        var dialog = close.closest("dialog");
+        if (dialog) dialog.close();
+      }
+    });
+
+    document.addEventListener("close", function (event) {
+      if (event.target.tagName === "DIALOG" && lastDialogOpener && lastDialogOpener.isConnected) {
+        lastDialogOpener.focus();
+      }
+    }, true);
+
+    document.body.addEventListener("htmx:beforeSwap", function (event) {
+      if (event.detail.target && event.detail.target.id === "monitoring-live") {
+        previousState = event.detail.target.dataset.monitorState || "";
+      }
+    });
+
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+      if (event.detail.target && event.detail.target.id === "monitoring-receipt-content") {
+        openDialog(document.getElementById("monitoring-receipt"), lastDialogOpener);
+        return;
+      }
+      var live = document.getElementById("monitoring-live");
+      if (!live || !previousState) return;
+      var nextState = live.dataset.monitorState || "";
+      if (nextState !== previousState) {
+        var announcer = document.getElementById("monitoring-announcer");
+        if (announcer) announcer.textContent = live.dataset.monitorAnnouncement || "Import status changed.";
+      }
+      previousState = "";
+    });
+  })();
+</script>
 {% endblock %}

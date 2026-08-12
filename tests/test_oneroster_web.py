@@ -342,24 +342,59 @@ class FakeOneRosterService:
         return SimpleNamespace(
             run=SimpleNamespace(
                 status="running",
-                phase="teachers",
-                current_batch_sequence=2,
+                phase="student_add",
+                current_batch_sequence=4,
+                started_at=time.time() - 420,
+                planning_seconds=18.4,
             ),
-            total=4,
-            pending=2,
-            applied=2,
+            total=432,
+            pending=232,
+            applied=200,
             failed=0,
             skipped=0,
-            percent=50.0,
-            completed_batches=1,
-            total_batches_estimate=2,
-            elapsed_seconds=30.0,
-            heartbeat_age_seconds=1.0,
+            percent=46.3,
+            completed_batches=3,
+            total_batches_estimate=9,
+            elapsed_seconds=420.0,
+            heartbeat_age_seconds=4.0,
             heartbeat_stale=False,
-            actions_per_minute=4.0,
-            eta_seconds=None,
-            worker_count=5,
+            heartbeat_delayed=False,
+            heartbeat_state="current",
+            actions_per_minute=112.0,
+            eta_seconds=720.0,
+            worker_count=8,
             adaptive_state="normal",
+            course_count=88,
+            remaining_course_count=41,
+            phases=(
+                SimpleNamespace(
+                    key="classes", label="Class setup", total=88, finished=88,
+                    applied=88, failed=0, skipped=0, pending=0,
+                ),
+                SimpleNamespace(
+                    key="teachers", label="Teacher access", total=84, finished=84,
+                    applied=84, failed=0, skipped=0, pending=0,
+                ),
+                SimpleNamespace(
+                    key="students", label="Student roster", total=260, finished=28,
+                    applied=28, failed=0, skipped=0, pending=232,
+                ),
+            ),
+            current_batch=SimpleNamespace(
+                sequence_number=4,
+                phase="student_add",
+                phase_key="students",
+                phase_label="Student roster",
+                action_count=50,
+                course_count=11,
+                status="running",
+                apply_seconds=23.6,
+                verification_seconds=12.0,
+                persistence_seconds=0.08,
+                verification_attempts=1,
+                worker_count=8,
+                throttling_count=0,
+            ),
         )
 
     async def retry_stabilization_read(self, connector, manifest_id):
@@ -1028,7 +1063,7 @@ def test_direct_manifest_page_wraps_activity_and_renders_durable_progress():
     assert response.status_code == 200
     assert "Review, run, and results" in response.text
     assert "Execution progress" in response.text
-    assert 'value="50.0"' in response.text
+    assert 'value="46.3"' in response.text
     assert ("get_execution_progress", manifest_id) in service.calls
 
 
