@@ -156,6 +156,7 @@ async def test_large_roster_planning_gate_improves_median_without_plan_drift(
     }
 
 
+@pytest.mark.timeout(180)
 def test_atomic_batch_persistence_gate_improves_median_with_identical_outcomes(
     tmp_path: Path,
 ):
