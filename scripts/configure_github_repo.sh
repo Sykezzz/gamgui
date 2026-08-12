@@ -27,12 +27,16 @@ gh api --method PUT "repos/$REPO/branches/district-main/protection" --input - <<
     "contexts": [
       "gam-compat (pinned binary)",
       "macOS application build smoke",
+      "Windows application build smoke",
       "test (ubuntu-latest, py3.10)",
       "test (ubuntu-latest, py3.12)",
       "test (ubuntu-latest, py3.14)",
       "test (macos-latest, py3.10)",
       "test (macos-latest, py3.12)",
-      "test (macos-latest, py3.14)"
+      "test (macos-latest, py3.14)",
+      "Windows test (py3.10)",
+      "Windows test (py3.12)",
+      "Windows test (py3.14)"
     ]
   },
   "enforce_admins": true,
