@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from gamgui.core.windows_acl import _dacl_is_protected
+
 
 def assert_current_user_only_acl(path: Path, *, directory: bool = False) -> None:
     script = r"""
@@ -41,7 +43,12 @@ $rules = @($acl.Access | ForEach-Object {
     rules = receipt["rules"]
     if isinstance(rules, dict):
         rules = [rules]
-    assert receipt["protected"] is True
+    # Query the persisted descriptor control through the same native Windows API
+    # that defines SE_DACL_PROTECTED.  PowerShell's managed FileSecurity wrapper
+    # reports AreAccessRulesProtected=False on GitHub's D: runner even when the
+    # underlying descriptor has SE_DACL_PROTECTED set; the native flag and the
+    # enumerated ACEs are the security properties this test needs to prove.
+    assert _dacl_is_protected(path) is True
     assert len(rules) == 1
     assert rules[0]["sid"] == receipt["current"]
     assert rules[0]["inherited"] is False
