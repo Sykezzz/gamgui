@@ -407,13 +407,20 @@ begin
   SilentSigner := '';
   if WizardSilent then
   begin
+    if DirExists(FixedCurrent) then
+    begin
+      Log('Refusing silent setup because GamGUI is already installed.');
+      Result := False;
+      Exit;
+    end;
     SelectedProfile := Lowercase(GetCommandValue('PROFILE'));
     SilentSigner := GetCommandValue('PINNEDSIGNERSHA256');
     if ((SelectedProfile <> 'core') and (SelectedProfile <> 'classroom-oneroster')) or
        (not IsHex64(SilentSigner)) then
     begin
-      MsgBox('Silent setup requires /PROFILE=core|classroom-oneroster and /PINNEDSIGNERSHA256=<64-hex>. Silent setup never creates or trusts a certificate.', mbError, MB_OK);
+      Log('Refusing silent setup because /PROFILE or /PINNEDSIGNERSHA256 is invalid. Silent setup never creates or trusts a certificate.');
       Result := False;
+      Exit;
     end;
   end;
 end;
