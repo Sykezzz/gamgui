@@ -37,7 +37,7 @@ def tree_datas(root, destination, *, exclude_oneroster=False):
     for path in sorted(item for item in root_path.rglob("*") if item.is_file()):
         relative = path.relative_to(root_path)
         if exclude_oneroster and (
-            path.name == "oneroster.html"
+            path.name.startswith("oneroster")
             or path.name.startswith("_oneroster_")
             or "oneroster" in {part.lower() for part in relative.parts}
         ):

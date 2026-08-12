@@ -1453,15 +1453,6 @@ async def upload_snapshot(
             error="The package exceeds the 250 MB upload limit.",
             error_code="OR-ZIP-INVALID",
         )
-    if await _local_history(feature["service"]) and replace_active != "yes":
-        return _status(
-            request,
-            error=(
-                "A guided import is already saved. Open 'Replace the current "
-                "roster' and confirm the replacement before choosing a new file."
-            ),
-            error_code="OR-ACTIVE-JOURNEY",
-        )
     state = request.app.state.gamgui
     lease = try_acquire_admin_activity(state, "oneroster-snapshot-upload")
     if lease is None:
@@ -1472,6 +1463,15 @@ async def upload_snapshot(
         )
     bounded_source = _BoundedUploadStream(package.file, _MAX_UPLOAD_BYTES)
     try:
+        if await _local_history(feature["service"]) and replace_active != "yes":
+            return _status(
+                request,
+                error=(
+                    "A guided import is already saved. Open 'Replace the current "
+                    "roster' and confirm the replacement before choosing a new file."
+                ),
+                error_code="OR-ACTIVE-JOURNEY",
+            )
         value = await _ingest_uploaded_stream(
             feature["service"],
             bounded_source,

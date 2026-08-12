@@ -70,6 +70,7 @@ def test_pyinstaller_profile_excludes_optional_code_and_assets_from_core():
     assert 'collect_submodules("gamgui.components.oneroster")' in spec
     assert 'hiddenimports.append("gamgui.web.routes.oneroster")' in spec
     assert 'excludes.append("gamgui.web.routes.oneroster")' in spec
+    assert 'path.name.startswith("oneroster")' in spec
     assert 'path.name.startswith("_oneroster_")' in spec
     assert '"resources/components"' in spec
     assert 'gam_executable = "gam.exe" if os.name == "nt" else "gam"' in spec
