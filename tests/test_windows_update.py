@@ -78,6 +78,8 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "if ($CiEphemeralCertificate)" in script
     assert "New-CiSigningCertificate" in script
     assert "CreateSelfSigned" in script and "AddDays(1)" in script
+    assert "Get-EnhancedKeyUsageOids" in script
+    assert "X509EnhancedKeyUsageExtension" in script
     assert "Test-SignatureStatus" in script
     assert '@("UnknownError", "NotTrusted")' in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script

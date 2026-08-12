@@ -22,6 +22,16 @@ function Get-LocalCertificates([string]$StoreName) {
     return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\$StoreName" | Where-Object { $_.Subject -eq $subject })
 }
 
+function Get-EnhancedKeyUsageOids([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
+    $extension = @($Certificate.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.37" })
+    if ($extension.Count -ne 1) { return @() }
+    $enhanced = [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
+        $extension[0],
+        $extension[0].Critical
+    )
+    return @($enhanced.EnhancedKeyUsages | ForEach-Object { $_.Value })
+}
+
 function Find-LocalCertificate([bool]$RequirePrivateKey) {
     $matches = @(Get-LocalCertificates "My" | Where-Object {
         (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant()
@@ -29,7 +39,7 @@ function Find-LocalCertificate([bool]$RequirePrivateKey) {
     if ($matches.Count -ne 1) { throw "The pinned GamGUI Local certificate was not found exactly once." }
     $certificate = $matches[0]
     if ($RequirePrivateKey -and -not $certificate.HasPrivateKey) { throw "The pinned GamGUI Local private key is unavailable." }
-    $eku = @($certificate.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value })
+    $eku = @(Get-EnhancedKeyUsageOids $certificate)
     if ($eku -notcontains $codeSigningOid) { throw "The pinned GamGUI Local certificate is not a code-signing identity." }
     if ($certificate.NotAfter -le (Get-Date)) { throw "The pinned GamGUI Local certificate has expired." }
     return $certificate
