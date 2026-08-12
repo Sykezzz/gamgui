@@ -7,9 +7,12 @@ import argparse
 import json
 import os
 import re
+import ssl
 import subprocess
 import urllib.request
 from pathlib import Path
+
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
@@ -84,7 +87,11 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
         f"https://api.github.com/repos/GAM-team/GAM/releases/tags/{tag}",
         headers=headers,
     )
-    with opener(request, timeout=30) as response:
+    # Python.org macOS interpreters do not always inherit the runner or system
+    # keychain.  Use the CA bundle shipped with our direct requests dependency
+    # so release metadata remains TLS-verified across supported Python builds.
+    tls_context = ssl.create_default_context(cafile=requests.certs.where())
+    with opener(request, timeout=30, context=tls_context) as response:
         payload = json.loads(response.read().decode("utf-8"))
     selected: dict[str, tuple[tuple[int, ...], str, str]] = {}
     for asset in payload.get("assets", ()) if isinstance(payload, dict) else ():
