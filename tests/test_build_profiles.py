@@ -134,6 +134,33 @@ def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
     assert "gamgui-windows-setup-release-v1" in build
 
 
+def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
+    workflow = (ROOT / ".github/workflows/windows-prerelease.yml").read_text(
+        encoding="utf-8"
+    )
+    exercise = (ROOT / "scripts/test_windows_setup.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "v0.0.1-windows.1" in workflow
+    assert "origin/district-main" in workflow
+    assert "origin/update-ready" in workflow
+    assert 'environment: windows-prerelease' in workflow
+    assert 'signing_status -ne "NotSigned"' in workflow
+    assert "actions/attest-build-provenance@" in workflow
+    assert "--prerelease" in workflow
+    assert "--verify-tag" in workflow
+    assert "SmartScreen" in workflow
+    assert "Windows offline suite (py${{ matrix.python }})" in workflow
+    assert '["3.10", "3.12", "3.14"]' in workflow
+    assert 'if (-not $env:CI)' in exercise
+    assert "unsafe Setup invocation unexpectedly succeeded" in exercise
+    assert 'Exercise-Profile "core"' in exercise
+    assert 'Exercise-Profile "classroom-oneroster"' in exercise
+    assert "Apps & Features" in exercise
+    assert "tampered bootstrap was accepted" in exercise
+
+
 def test_exact_sha_build_rejects_untracked_packaged_source():
     script = (ROOT / "scripts" / "build_app.sh").read_text(encoding="utf-8")
     assert "git status --porcelain --untracked-files=all" in script
