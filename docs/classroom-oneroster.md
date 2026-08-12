@@ -75,10 +75,15 @@ updater discover and build the revision.
 
 `update-ready` is the routine local-build channel. Official public macOS releases remain manual,
 tag-based, signed, and notarized. Windows routine installs are per-user and use the pinned local
-`GamGUI Local` certificate created during the first manual bootstrap; it provides user/machine
-continuity, not public SmartScreen reputation. The bootstrap consent, actual installed SHA, selected
+`GamGUI Local` certificate created by the consented Windows Setup wizard; it provides user/machine
+continuity, not public SmartScreen reputation. The Setup consent, actual installed SHA, selected
 profile, bundled GAM, local signature, self-test, runtime health, and preserved data must still be
 verified separately on each computer.
+
+The first Windows installer is the unsigned `v0.0.1-windows.1` GitHub prerelease. It can be
+published only when its tag equals both `district-main` and `update-ready`, and only after protected
+manual approval. The later stable macOS `v0.0.1` must use that same source SHA; otherwise both
+platforms advance to a new version. See [Windows setup, trust, and recovery](windows-setup.md).
 
 The local sketches under `.planning/sketches/` are disposable review artifacts and are not part of
 the application or release.

@@ -354,7 +354,7 @@ Macs, both profiles must be signed and notarized independently, including the em
 running them on the managed development Mac uses the stable local signing identity described
 below.
 
-### Build a Windows bundle or first bootstrap
+### Build a Windows bundle or Setup wizard
 
 Windows supports the same fixed `core` and `classroom-oneroster` profiles. A developer build uses
 the locked environment and checksum-pinned GAM payload:
@@ -365,24 +365,26 @@ uv sync --frozen --python (Get-Command python).Source --extra dev --extra deskto
 .\scripts\build_windows_release.ps1 -Profile classroom-oneroster
 ```
 
-The first per-user bootstrap additionally bundles the committed, checksum-pinned MinGit and uv
-archives. It installs the app under `%LOCALAPPDATA%\Programs\GamGUI\current`, keeps data under
+The first-install deliverable is one native, offline Inno Setup wizard containing both profiles and
+the committed, checksum-pinned MinGit and uv archives. Classroom + OneRoster is selected by default.
+It installs the app under `%LOCALAPPDATA%\Programs\GamGUI\current`, keeps data under
 `%LOCALAPPDATA%\GamGUI`, and copies `GamGUIUpdater.exe` outside the replaceable application
-directory. The bootstrap is a manual trust boundary because the project does not have a public
-Authenticode certificate. Run `install.ps1`; it creates a ten-year, non-exportable RSA-3072
-`GamGUI Local` identity in the current user's certificate store, then stops and asks before adding
-the public certificate to that user's Trusted Root and Trusted Publisher stores.
+directory. The Setup executable is an unsigned manual trust boundary: verify its release SHA-256
+before using SmartScreen's **More info > Run anyway** path. The wizard explains and requires
+consent before it creates the ten-year, non-exportable RSA-3072 `GamGUI Local` identity or adds its
+public certificate to the current user's Trusted Root and Trusted Publisher stores.
 
-After bootstrap, updates are automatic local builds signed by that pinned identity. The updater
+After Setup, updates are automatic local builds signed by that pinned identity. The updater
 will not accept a changed certificate, unsigned executable, altered bundle manifest, stale SHA, or
 backward/non-descendant revision. Do not delete or rotate `GamGUI Local` manually. Use the bundled
-`uninstall.ps1`; it removes the app, helper, toolchain, shortcuts, and local certificate while
-preserving `%LOCALAPPDATA%\GamGUI` data unless `-RemoveData` is explicitly supplied.
+Apps & Features uninstall removes the app, helper, toolchain, shortcuts, and local certificate while
+preserving application data unless **Also delete local application data** is explicitly selected.
 
-Bootstrap and update preparation need GitHub, Python-package, and GAM-release access. Allow enough
-disk space for the source checkout, build environment, current app, pending app, rollback copy, and
-an additional 256 MiB safety reserve; 4 GiB free is a practical minimum. A network, pin, signing,
-space, or self-test failure leaves the installed application unchanged.
+First install is offline. Later update preparation needs GitHub, Python-package, and GAM-release
+access. Allow enough disk space for the source checkout, build environment, current app, pending
+app, rollback copy, and an additional 256 MiB safety reserve; 4 GiB free is a practical minimum. A
+network, pin, signing, space, or self-test failure leaves the installed application unchanged. See
+the complete [Windows setup, SmartScreen, GPO, recovery, and release guide](docs/windows-setup.md).
 
 ### Stop the Keychain prompts
 
