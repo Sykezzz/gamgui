@@ -7,6 +7,10 @@ import os
 import sys
 from pathlib import Path
 
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SE_DACL_PROTECTED = 0x1000
+
 
 def restrict_owner_only(path: Path, *, directory: bool | None = None) -> None:
     """Apply 0700/0600 on POSIX or a protected current-user DACL on Windows."""
@@ -122,10 +126,14 @@ def _set_current_user_dacl(path: Path, *, directory: bool) -> None:
             ctypes.c_void_p,
         ]
         advapi32.SetNamedSecurityInfoW.restype = ctypes.c_uint32
+        security_information = (
+            _DACL_SECURITY_INFORMATION
+            | _PROTECTED_DACL_SECURITY_INFORMATION
+        )
         result = advapi32.SetNamedSecurityInfoW(
             str(path),
             1,
-            0x80000004,
+            security_information,
             None,
             None,
             dacl,
@@ -133,5 +141,84 @@ def _set_current_user_dacl(path: Path, *, directory: bool) -> None:
         )
         if result:
             raise ctypes.WinError(result)
+        if not _dacl_is_protected(path):
+            advapi32.SetSecurityDescriptorControl.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint16,
+                ctypes.c_uint16,
+            ]
+            advapi32.SetSecurityDescriptorControl.restype = ctypes.c_int
+            if not advapi32.SetSecurityDescriptorControl(
+                descriptor,
+                _SE_DACL_PROTECTED,
+                _SE_DACL_PROTECTED,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            advapi32.SetFileSecurityW.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            advapi32.SetFileSecurityW.restype = ctypes.c_int
+            if not advapi32.SetFileSecurityW(
+                str(path),
+                security_information,
+                descriptor,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        if not _dacl_is_protected(path):
+            raise OSError("Windows refused to protect the owner-only DACL.")
     finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _dacl_is_protected(path: Path) -> bool:
+    """Read the applied descriptor and confirm inheritance is disabled."""
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    result = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result:
+        raise ctypes.WinError(result)
+    try:
+        control = ctypes.c_uint16()
+        revision = ctypes.c_uint32()
+        advapi32.GetSecurityDescriptorControl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        advapi32.GetSecurityDescriptorControl.restype = ctypes.c_int
+        if not advapi32.GetSecurityDescriptorControl(
+            descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return bool(control.value & _SE_DACL_PROTECTED)
+    finally:
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(descriptor)

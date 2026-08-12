@@ -182,6 +182,8 @@ def _root_is_sane(root: Path, home: Optional[Path]) -> bool:
     ident = _fs_id(root)
     if ident is None:
         return False                            # missing, unreadable, or a broken link
+    if os.name == "nt" and root.resolve() == Path(root.anchor).resolve():
+        return False                            # never widen the bound to an entire Windows volume
     try:
         if not stat.S_ISDIR(os.stat(root).st_mode):
             return False                        # (a) a file (or device) is not a root
