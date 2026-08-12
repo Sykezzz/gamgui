@@ -1,5 +1,6 @@
 """Synthetic, non-tenant Classroom server for browser-level functional exercise."""
 
+import asyncio
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -49,6 +50,11 @@ def create_preview_app(root: Path) -> FastAPI:
             "deferred_courses": 18,
         },
     )
+    preview_plan = asyncio.run(
+        oneroster.build_live_plan(connector, "import-1")
+    )
+    active_manifest = oneroster.persist_live_plan(preview_plan).ordinary
+    active_manifest.status = "running"
     state = SimpleNamespace(
         connector=connector,
         audit_domain="example.com",

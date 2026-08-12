@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import secrets
+import time
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from gamgui.core.activity import ActivityBusyError, ActivityRegistry
 from gamgui.core.classroom.models import CourseRosterSnapshot
 from gamgui.core.gam.commands import GAMCommands
+from gamgui.core.gam.errors import GAMError, GAMErrorKind
+from gamgui.core.gam.models import BatchExecutionReceipt
 from gamgui.core.processes import current_process_identity
 
 from .models import (
@@ -30,6 +35,7 @@ from .store import OneRosterStore, action_sequence_hash
 
 
 MAX_BATCH_COMMANDS = 50
+ADAPTIVE_WORKER_LEVELS = (3, 5, 8, 10)
 STUDENT_ACTIONS = frozenset({"student_add", "student_remove"})
 ACTION_PRIORITIES = {
     "course_create": 10,
@@ -44,13 +50,56 @@ ACTION_PRIORITIES = {
 }
 
 
+@dataclass
+class _AdaptiveWorkerTuner:
+    level_index: int = 1
+    clean_batches: int = 0
+    best_seconds_per_action: float = 0.0
+
+    @property
+    def worker_count(self) -> int:
+        return ADAPTIVE_WORKER_LEVELS[self.level_index]
+
+    def observe(
+        self,
+        *,
+        action_count: int,
+        duration_seconds: float,
+        batch_failed: bool,
+        throttling_count: int,
+        verification_attempts: int,
+    ) -> None:
+        per_action = max(0.0, duration_seconds) / max(1, int(action_count))
+        latency_regressed = bool(
+            self.best_seconds_per_action
+            and per_action > self.best_seconds_per_action * 1.5
+        )
+        unhealthy = bool(
+            batch_failed
+            or throttling_count
+            or verification_attempts > 1
+            or latency_regressed
+        )
+        if unhealthy:
+            self.level_index = max(0, self.level_index - 1)
+            self.clean_batches = 0
+            return
+        if not self.best_seconds_per_action or per_action < self.best_seconds_per_action:
+            self.best_seconds_per_action = per_action
+        self.clean_batches += 1
+        if self.clean_batches >= 2 and self.level_index < len(ADAPTIVE_WORKER_LEVELS) - 1:
+            self.level_index += 1
+            self.clean_batches = 0
+
+
 class ExecutableClassroomConnector(Protocol):
     async def run_classroom_batch(
         self,
         commands: Sequence[Sequence[str]],
         *,
         max_commands: int = 50,
-    ) -> None: ...
+        worker_count: int = 5,
+    ) -> BatchExecutionReceipt: ...
 
     async def get_course(self, course_id: str, **kwargs: Any) -> Any: ...
 
@@ -89,16 +138,17 @@ class OneRosterExecutor:
         configured_delays = (
             stabilization_delays
             if stabilization_delays is not None
-            else getattr(connector, "oneroster_stabilization_delays", (3.0, 7.0))
+            else getattr(connector, "oneroster_stabilization_delays", (2.0, 5.0))
         )
         normalized_delays = tuple(max(0.0, float(item)) for item in configured_delays)
         self.stabilization_delays = (
             normalized_delays[:2]
             if len(normalized_delays) >= 2
-            else (3.0, 7.0)
+            else (2.0, 5.0)
         )
         self._operation_owner = f"{os.getpid()}:{secrets.token_urlsafe(12)}"
         self._operation_identity = current_process_identity()
+        self._adaptive_workers = _AdaptiveWorkerTuner()
 
     async def execute(
         self,
@@ -152,11 +202,39 @@ class OneRosterExecutor:
                 phase="preflight",
                 owner_id=self._operation_owner,
             )
+            self._adaptive_workers = _AdaptiveWorkerTuner()
             try:
                 planning = await OneRosterPlanner(self.store, self.connector).plan(
                     manifest.import_id,
                     limited_import=manifest.plan_kind == "limited",
                     now=now,
+                )
+                self.store.record_execution_planning_receipt(
+                    run.id,
+                    total_seconds=planning.performance.total_seconds,
+                    directory_snapshot_seconds=(
+                        planning.performance.directory_snapshot_seconds
+                    ),
+                    classroom_snapshot_seconds=(
+                        planning.performance.classroom_snapshot_seconds
+                    ),
+                )
+                self._record_performance_audit(
+                    "oneroster_planning_performance",
+                    target=f"{len(planning.actions_for(manifest.plan_kind))} actions",
+                    extra={
+                        "total_seconds": planning.performance.total_seconds,
+                        "source_seconds": planning.performance.source_seconds,
+                        "directory_snapshot_seconds": (
+                            planning.performance.directory_snapshot_seconds
+                        ),
+                        "classroom_snapshot_seconds": (
+                            planning.performance.classroom_snapshot_seconds
+                        ),
+                        "roster_snapshot_seconds": (
+                            planning.performance.roster_snapshot_seconds
+                        ),
+                    },
                 )
                 await self._validate_preflight(
                     manifest,
@@ -818,6 +896,7 @@ class OneRosterExecutor:
             return guarded_applied, guarded_failed
         chunk = guarded_chunk
         durable_batch = None
+        worker_count = self._adaptive_workers.worker_count
         if run_id:
             durable_batch = self.store.prepare_execution_batch(
                 run_id,
@@ -827,10 +906,14 @@ class OneRosterExecutor:
                 owner_id=self._operation_owner,
             )
             durable_batch = self.store.mark_execution_batch_started(
-                durable_batch.id
+                durable_batch.id,
+                worker_count=worker_count,
             )
         commands = [_command_for(action) for action in chunk]
         batch_failed = False
+        throttling_count = 0
+        apply_started = time.perf_counter()
+        batch_receipt: Optional[BatchExecutionReceipt] = None
         heartbeat_task: Optional[asyncio.Task[None]] = None
         if run_id:
             async def pulse() -> None:
@@ -844,45 +927,47 @@ class OneRosterExecutor:
 
             heartbeat_task = asyncio.create_task(pulse())
         try:
-            await self.connector.run_classroom_batch(
+            batch_receipt = await self._run_classroom_batch(
                 commands,
-                max_commands=self.batch_size,
+                worker_count=worker_count,
             )
-        except Exception:
+        except Exception as exc:
             batch_failed = True
+            throttling_count = int(
+                isinstance(exc, GAMError) and exc.kind is GAMErrorKind.RATE_LIMITED
+            )
         finally:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await heartbeat_task
-        verified = await self._verify(chunk, owner_ids)
+        apply_seconds = (
+            float(batch_receipt.duration_seconds)
+            if batch_receipt is not None
+            else time.perf_counter() - apply_started
+        )
+        if batch_receipt is not None:
+            throttling_count = int(batch_receipt.throttling_count)
+        verified, verification_attempts, verification_seconds = (
+            await self._verify_with_retries(chunk, owner_ids)
+        )
         applied = guarded_applied
         failed = guarded_failed
+        results: dict[str, tuple[str, str]] = {}
         for action in chunk:
             ok = bool(verified.get(action.id))
             if ok:
-                self.store.mark_action_result(
-                    manifest_id,
-                    action.id,
-                    status="applied",
-                    detail=(
+                results[action.id] = (
+                    "applied",
+                    (
                         "Verified live after GAM reported a batch error."
                         if batch_failed
                         else "Verified against live Classroom state."
                     ),
-                    load_manifest=False,
-                    owner_id=self._operation_owner,
                 )
                 applied += 1
             else:
-                self.store.mark_action_result(
-                    manifest_id,
-                    action.id,
-                    status="failed",
-                    detail="OR-BATCH-VERIFY-FAILED",
-                    load_manifest=False,
-                    owner_id=self._operation_owner,
-                )
+                results[action.id] = ("failed", "OR-BATCH-VERIFY-FAILED")
                 failed += 1
                 if action.kind in {
                     "course_create",
@@ -892,12 +977,137 @@ class OneRosterExecutor:
                 }:
                     blocked_courses.add(action.subject.casefold())
         if durable_batch is not None:
-            self.store.finish_execution_batch(
+            completed_batch = self.store.complete_verified_batch(
                 durable_batch.id,
-                status="failed" if failed else "completed",
-                error_code="OR-BATCH-VERIFY-FAILED" if failed else "",
+                manifest_id,
+                results,
+                owner_id=self._operation_owner,
+                apply_seconds=apply_seconds,
+                verification_seconds=verification_seconds,
+                verification_attempts=verification_attempts,
+                worker_count=worker_count,
+                throttling_count=throttling_count,
             )
+            persistence_seconds = completed_batch.persistence_seconds
+        else:
+            persistence_started = time.perf_counter()
+            for action_id, (status, detail) in results.items():
+                self.store.mark_action_result(
+                    manifest_id,
+                    action_id,
+                    status=status,
+                    detail=detail,
+                    load_manifest=False,
+                    owner_id=self._operation_owner,
+                )
+            persistence_seconds = time.perf_counter() - persistence_started
+        self._adaptive_workers.observe(
+            action_count=len(chunk),
+            duration_seconds=apply_seconds,
+            batch_failed=batch_failed,
+            throttling_count=throttling_count,
+            verification_attempts=verification_attempts,
+        )
+        self._record_performance_audit(
+            "oneroster_batch_performance",
+            target=f"{len(chunk)} actions",
+            extra={
+                "apply_seconds": apply_seconds,
+                "verification_seconds": verification_seconds,
+                "persistence_seconds": persistence_seconds,
+                "verification_attempts": verification_attempts,
+                "worker_count": worker_count,
+                "next_worker_count": self._adaptive_workers.worker_count,
+                "throttling_count": throttling_count,
+                "outcome": "failed" if failed else "completed",
+                "actions_per_minute": (
+                    len(chunk) * 60.0
+                    / max(0.001, apply_seconds + verification_seconds + persistence_seconds)
+                ),
+            },
+        )
         return applied, failed
+
+    async def _run_classroom_batch(
+        self,
+        commands: Sequence[Sequence[str]],
+        *,
+        worker_count: int,
+    ) -> BatchExecutionReceipt:
+        method = self.connector.run_classroom_batch
+        supports_worker_count = False
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            supports_worker_count = any(
+                parameter.name == "worker_count"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            pass
+        started = time.perf_counter()
+        kwargs: dict[str, Any] = {"max_commands": self.batch_size}
+        if supports_worker_count:
+            kwargs["worker_count"] = worker_count
+        receipt = await method(commands, **kwargs)
+        if isinstance(receipt, BatchExecutionReceipt):
+            return receipt
+        return BatchExecutionReceipt(
+            duration_seconds=time.perf_counter() - started,
+            worker_count=worker_count,
+            outcome="completed",
+        )
+
+    async def _verify_with_retries(
+        self,
+        actions: Sequence[ImportAction],
+        owner_ids: Optional[Mapping[str, str]],
+    ) -> tuple[dict[str, bool], int, float]:
+        started = time.perf_counter()
+        remaining = list(actions)
+        verified = {action.id: False for action in actions}
+        attempts = 0
+        retry_offsets = (0.0, *self.stabilization_delays)
+        for retry_offset in retry_offsets:
+            if not remaining:
+                break
+            wait_seconds = retry_offset - (time.perf_counter() - started)
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            result = await self._verify(remaining, owner_ids)
+            attempts += 1
+            next_remaining: list[ImportAction] = []
+            for action in remaining:
+                if bool(result.get(action.id)):
+                    verified[action.id] = True
+                else:
+                    next_remaining.append(action)
+            remaining = next_remaining
+        return verified, attempts, time.perf_counter() - started
+
+    def _record_performance_audit(
+        self,
+        action: str,
+        *,
+        target: str,
+        extra: Mapping[str, Any],
+    ) -> None:
+        audit = getattr(self.connector, "audit", None)
+        record = getattr(audit, "record", None)
+        if not callable(record):
+            return
+        sanitized = {
+            str(key): round(value, 3) if isinstance(value, float) else value
+            for key, value in extra.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        record(
+            action,
+            target=target,
+            argv=("oneroster", "performance"),
+            ok=True,
+            extra=sanitized,
+        )
 
     async def _guard_course_creates(
         self,

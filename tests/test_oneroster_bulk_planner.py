@@ -112,6 +112,24 @@ class BulkLookupFailureConnector(BulkPlannerConnector):
         )
 
 
+class ConcurrentSnapshotConnector(BulkPlannerConnector):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.directory_started = asyncio.Event()
+        self.courses_started = asyncio.Event()
+
+    async def list_oneroster_directory(self):
+        self.calls["directory"] += 1
+        self.directory_started.set()
+        await asyncio.wait_for(self.courses_started.wait(), timeout=0.5)
+        return dict(self.users)
+
+    async def list_oneroster_managed_courses(self, aliases):
+        self.calls["courses"] += 1
+        self.courses_started.set()
+        await asyncio.wait_for(self.directory_started.wait(), timeout=0.5)
+        return []
+
 def _ready_service(tmp_path: Path) -> tuple[OneRosterService, str]:
     service = OneRosterService("example.org", tmp_path / "component")
     snapshot = service.upload(zip_bytes(valid_files()))
@@ -134,6 +152,23 @@ def _managed_course(
         course_state=state,
         aliases=(alias,),
     )
+
+
+@pytest.mark.asyncio
+async def test_directory_and_classroom_snapshots_begin_concurrently(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    connector = ConcurrentSnapshotConnector()
+
+    planning = await asyncio.wait_for(
+        service.build_live_plan(connector, import_id),
+        timeout=1.0,
+    )
+
+    assert connector.calls["directory"] == 1
+    assert connector.calls["courses"] == 1
+    assert planning.performance.total_seconds > 0
+    assert planning.performance.directory_snapshot_seconds > 0
+    assert planning.performance.classroom_snapshot_seconds > 0
 
 
 @pytest.mark.asyncio

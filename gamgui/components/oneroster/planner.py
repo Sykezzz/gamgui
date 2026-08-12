@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import time
 from collections import Counter, defaultdict
 from contextlib import closing
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from .models import (
     IssueSeverity,
     LivePlanningResult,
     OneRosterError,
+    PlanningPerformanceReceipt,
     canonical_hash,
 )
 from .store import OneRosterStore
@@ -146,6 +148,7 @@ class OneRosterPlanner:
         limited_import: bool = False,
         now: Optional[datetime] = None,
     ) -> LivePlanningResult:
+        planning_started = time.perf_counter()
         snapshot = self.store.refresh_schedule_scope(
             import_id,
             today=district_roster_date(now),
@@ -157,6 +160,7 @@ class OneRosterPlanner:
             )
 
         normalized_path = self.store.normalized_path(import_id)
+        source_started = time.perf_counter()
         await asyncio.to_thread(
             _enforce_planning_source_limits,
             normalized_path,
@@ -175,6 +179,7 @@ class OneRosterPlanner:
             ),
         )
         desired, issues = desired_result
+        source_seconds = time.perf_counter() - source_started
         protected_aliases = {
             alias.casefold() for alias in protected_alias_values
         }
@@ -186,10 +191,24 @@ class OneRosterPlanner:
                 key=str.casefold,
             )
         )
-        directory_snapshot = await self._read_directory_snapshot()
-        managed_courses = await self._read_managed_course_snapshot(
-            relevant_aliases
+        async def timed_directory_snapshot() -> tuple[Optional[dict[str, Any]], float]:
+            started = time.perf_counter()
+            value = await self._read_directory_snapshot()
+            return value, time.perf_counter() - started
+
+        async def timed_classroom_snapshot() -> tuple[Optional[dict[str, Any]], float]:
+            started = time.perf_counter()
+            value = await self._read_managed_course_snapshot(relevant_aliases)
+            return value, time.perf_counter() - started
+
+        # Independent live reads use separate private GAMCFGDIRs. GAMRunner
+        # serializes only refreshed-token persistence, not the read processes.
+        directory_result, classroom_result = await asyncio.gather(
+            timed_directory_snapshot(),
+            timed_classroom_snapshot(),
         )
+        directory_snapshot, directory_snapshot_seconds = directory_result
+        managed_courses, classroom_snapshot_seconds = classroom_result
         resolved, resolution_issues = await self._resolve_directory(
             desired,
             directory_snapshot,
@@ -203,6 +222,7 @@ class OneRosterPlanner:
         )
         issues.extend(course_issues)
 
+        roster_started = time.perf_counter()
         live_courses = await self._read_live_courses(
             eligible,
             managed_courses,
@@ -214,6 +234,7 @@ class OneRosterPlanner:
             directory_snapshot,
         )
         issues.extend(live_resolution_issues)
+        roster_snapshot_seconds = time.perf_counter() - roster_started
 
         archive_actions, archive_basis, archive_issues = await self._archive_actions(
             import_id,
@@ -266,6 +287,13 @@ class OneRosterPlanner:
             owner_ids=action_payload.owner_ids,
             scope_hash=canonical_hash(schedule_scope),
             live_evidence=action_payload.live_evidence,
+            performance=PlanningPerformanceReceipt(
+                total_seconds=time.perf_counter() - planning_started,
+                source_seconds=source_seconds,
+                directory_snapshot_seconds=directory_snapshot_seconds,
+                classroom_snapshot_seconds=classroom_snapshot_seconds,
+                roster_snapshot_seconds=roster_snapshot_seconds,
+            ),
         )
     async def _read_directory_snapshot(self) -> Optional[dict[str, Any]]:
         bulk = getattr(self.connector, "list_oneroster_directory", None)

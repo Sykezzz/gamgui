@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -16,7 +17,7 @@ from gamgui.components.oneroster import (
     OneRosterService,
     ThresholdProfile,
 )
-from gamgui.components.oneroster.executor import OneRosterExecutor
+from gamgui.components.oneroster.executor import OneRosterExecutor, _AdaptiveWorkerTuner
 from gamgui.components.oneroster.models import ImportAction
 from gamgui.core.audit import AuditLog
 from gamgui.core.activity import ActivityRegistry
@@ -311,6 +312,223 @@ def test_execution_batches_persist_exact_membership_and_progress(tmp_path: Path)
     assert progress.pending == 2
     assert progress.percent == 0
     assert progress.heartbeat_age_seconds == 10
+
+
+def test_complete_verified_batch_is_atomic_and_records_sanitized_receipt(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction("a-1", "student_add", "Section_102", "one@example.org"),
+            ImportAction("a-2", "student_add", "Section_101", "two@example.org"),
+        ),
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    packed = service.store.get_pending_action_batch(
+        manifest.id,
+        kinds=("student_add",),
+        limit=50,
+    )
+    assert [action.subject for action in packed] == ["Section_101", "Section_102"]
+    batch = service.store.prepare_execution_batch(
+        run.id,
+        manifest.id,
+        packed,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    service.store.mark_execution_batch_started(batch.id, worker_count=8)
+
+    completed = service.store.complete_verified_batch(
+        batch.id,
+        manifest.id,
+        {
+            "a-1": ("applied", "Verified against live Classroom state."),
+            "a-2": ("failed", "OR-BATCH-VERIFY-FAILED"),
+        },
+        owner_id=executor._operation_owner,
+        apply_seconds=1.25,
+        verification_seconds=0.5,
+        verification_attempts=2,
+        worker_count=8,
+    )
+
+    assert completed.status == "failed"
+    assert completed.worker_count == 8
+    assert completed.verification_attempts == 2
+    assert completed.apply_seconds == pytest.approx(1.25)
+    assert completed.verification_seconds == pytest.approx(0.5)
+    assert completed.persistence_seconds >= 0
+    progress = service.store.get_execution_progress(manifest.id)
+    assert progress.applied == 1
+    assert progress.failed == 1
+    assert progress.worker_count == 8
+    assert progress.adaptive_state == "protecting_google"
+    assert progress.actions_per_minute > 0
+
+
+def test_complete_verified_batch_rejects_inexact_membership_without_partial_writes(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction("a-1", "student_add", "Section_101", "one@example.org"),
+            ImportAction("a-2", "student_add", "Section_101", "two@example.org"),
+        ),
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    batch = service.store.prepare_execution_batch(
+        run.id,
+        manifest.id,
+        manifest.actions,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+    )
+    service.store.mark_execution_batch_started(batch.id)
+
+    with pytest.raises(OneRosterError) as mismatch:
+        service.store.complete_verified_batch(
+            batch.id,
+            manifest.id,
+            {"a-1": ("applied", "verified")},
+            owner_id=executor._operation_owner,
+            apply_seconds=1,
+            verification_seconds=1,
+            verification_attempts=1,
+            worker_count=5,
+        )
+
+    assert mismatch.value.code == "OR-BATCH-ACTIONS-CHANGED"
+    assert service.store.get_execution_progress(manifest.id).pending == 2
+
+
+@pytest.mark.asyncio
+async def test_verification_retries_only_unresolved_actions(tmp_path: Path):
+    executor = OneRosterExecutor(
+        OneRosterService("example.org", tmp_path / "component").store,
+        FakeClassroom(),
+        stabilization_delays=(0.0, 0.0),
+    )
+    actions = (
+        ImportAction("a-1", "student_add", "Section_101", "one@example.org"),
+        ImportAction("a-2", "student_add", "Section_102", "two@example.org"),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def verify(selected, _owner_ids):
+        calls.append(tuple(action.id for action in selected))
+        return {
+            action.id: action.id == "a-1" or len(calls) > 1
+            for action in selected
+        }
+
+    executor._verify = verify  # type: ignore[method-assign]
+    verified, attempts, _seconds = await executor._verify_with_retries(actions, {})
+
+    assert verified == {"a-1": True, "a-2": True}
+    assert attempts == 2
+    assert calls == [("a-1", "a-2"), ("a-2",)]
+
+
+def test_adaptive_workers_increase_after_clean_batches_and_back_off_on_risk():
+    tuner = _AdaptiveWorkerTuner()
+    assert tuner.worker_count == 5
+    for _ in range(2):
+        tuner.observe(
+            action_count=50,
+            duration_seconds=10,
+            batch_failed=False,
+            throttling_count=0,
+            verification_attempts=1,
+        )
+    assert tuner.worker_count == 8
+    tuner.observe(
+        action_count=50,
+        duration_seconds=10,
+        batch_failed=False,
+        throttling_count=1,
+        verification_attempts=1,
+    )
+    assert tuner.worker_count == 5
+    tuner.observe(
+        action_count=50,
+        duration_seconds=10,
+        batch_failed=False,
+        throttling_count=0,
+        verification_attempts=2,
+    )
+    assert tuner.worker_count == 3
+
+
+@pytest.mark.parametrize(
+    ("profile", "batch_failed", "throttling_count", "attempts", "duration"),
+    (
+        ("high-latency", False, 0, 1, 30.0),
+        ("throttled", False, 1, 1, 10.0),
+        ("partial-failure", True, 0, 1, 10.0),
+        ("delayed-consistency", False, 0, 2, 10.0),
+    ),
+)
+def test_adaptive_workers_back_off_for_each_risk_profile(
+    profile: str,
+    batch_failed: bool,
+    throttling_count: int,
+    attempts: int,
+    duration: float,
+):
+    tuner = _AdaptiveWorkerTuner()
+    tuner.best_seconds_per_action = 0.2
+    tuner.level_index = 2
+
+    tuner.observe(
+        action_count=50,
+        duration_seconds=duration,
+        batch_failed=batch_failed,
+        throttling_count=throttling_count,
+        verification_attempts=attempts,
+    )
+
+    assert tuner.worker_count == 5, profile
+
+
+@pytest.mark.asyncio
+async def test_execution_persists_fresh_planning_performance_receipt(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    manifest = service.persist_live_plan(
+        await service.build_live_plan(connector, import_id)
+    ).ordinary
+
+    await service.execute_manifest(
+        connector,
+        manifest.id,
+        typed_import_id=import_id,
+    )
+    progress = service.get_execution_progress(manifest.id)
+
+    assert progress.run is not None
+    assert progress.run.planning_seconds > 0
+    assert progress.run.directory_snapshot_seconds >= 0
+    assert progress.run.classroom_snapshot_seconds >= 0
+    assert progress.actions_per_minute > 0
 
 
 def test_latest_manifest_header_prefers_the_actionable_journey_step(tmp_path: Path):
@@ -1607,7 +1825,7 @@ async def test_connector_batch_is_private_bounded_and_removed(tmp_path: Path):
         "example.org",
         AuditLog(tmp_path / "audit.jsonl"),
     )
-    await connector.run_classroom_batch(
+    receipt = await connector.run_classroom_batch(
         [
             GAMCommands.add_course_participant(
                 "d:Section_1",
@@ -1623,6 +1841,53 @@ async def test_connector_batch_is_private_bounded_and_removed(tmp_path: Path):
     assert runner.batch_path is not None
     assert runner.batch_path.parent == tmp_path / "spool"
     assert not runner.batch_path.exists()
+    assert receipt.worker_count == 5
+    assert receipt.outcome == "completed"
+    assert receipt.duration_seconds >= 0
+
+
+@pytest.mark.asyncio
+async def test_connector_passes_adaptive_workers_only_to_the_child_gam_call(tmp_path: Path):
+    class Runner:
+        timeout = 120.0
+        base_dir = tmp_path
+
+        def __init__(self):
+            self.gam_threads = None
+
+        async def run_authenticated(
+            self,
+            _domain,
+            _argv,
+            *,
+            timeout=None,
+            serialize=False,
+            gam_threads=None,
+        ):
+            assert serialize is True
+            self.gam_threads = gam_threads
+            return ""
+
+    runner = Runner()
+    connector = GAMConnector(
+        runner,  # type: ignore[arg-type]
+        "example.org",
+        AuditLog(tmp_path / "audit.jsonl"),
+    )
+    receipt = await connector.run_classroom_batch(
+        [
+            GAMCommands.add_course_participant(
+                "d:Section_1",
+                "students",
+                "student@example.org",
+            )
+        ],
+        worker_count=8,
+    )
+
+    assert runner.gam_threads == 8
+    assert receipt.worker_count == 8
+    assert "GAM_THREADS" not in os.environ
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,17 @@ _EMAIL_KEY = "email"
 _SUBJECT_PREFIX = "Subject:"
 
 
+@dataclass(frozen=True)
+class BatchExecutionReceipt:
+    """Sanitized outcome metadata for one bounded GAM batch process."""
+
+    duration_seconds: float
+    worker_count: int
+    outcome: str
+    retry_count: int = 0
+    throttling_count: int = 0
+
+
 def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     """Return the first present key (GAM varies between e.g. ``primaryEmail``/``email``)."""
     for k in keys:

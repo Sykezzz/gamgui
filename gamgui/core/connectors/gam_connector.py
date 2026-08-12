@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import csv
 import heapq
+import inspect
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Set, Tuple
@@ -31,6 +33,7 @@ from ..directory_index import DirectoryIndex, Page
 from ..gam.commands import GAMCommands, SIGNATURE_USER_FIELDS, build_user_query
 from ..gam.errors import GAMError, GAMErrorKind
 from ..gam.models import (
+    BatchExecutionReceipt,
     CalendarACL,
     CalendarEvent,
     GAMGroup,
@@ -869,7 +872,7 @@ class GAMConnector(Connector):
                 self.domain,
                 GAMCommands.print_oneroster_courses_file(str(selector_path)),
                 timeout=timeout,
-                serialize=True,
+                serialize=False,
             ) as result:
                 courses = await _parse_private_spool_off_loop(
                     _read_oneroster_course_lookup_spool,
@@ -1117,7 +1120,8 @@ class GAMConnector(Connector):
         commands: Sequence[Sequence[str]],
         *,
         max_commands: int = 50,
-    ) -> None:
+        worker_count: int = 5,
+    ) -> BatchExecutionReceipt:
         """Execute one bounded, allowlisted OneRoster mutation batch.
 
         The batch exists only as an owner-readable temporary file. GAM's opaque
@@ -1130,6 +1134,9 @@ class GAMConnector(Connector):
             raise ValueError(f"Classroom batch must contain between 1 and {cap} commands.")
         if not all(_is_allowed_classroom_batch_command(command) for command in selected):
             raise ValueError("Classroom batch contains a non-allowlisted GAM mutation.")
+        workers = int(worker_count)
+        if workers not in {3, 5, 8, 10}:
+            raise ValueError("Classroom batch worker count must be 3, 5, 8, or 10.")
 
         fd, raw_path = tempfile.mkstemp(
             prefix="gamgui-oneroster-",
@@ -1142,6 +1149,7 @@ class GAMConnector(Connector):
         )
         batch_path = Path(raw_path)
         operation_succeeded = False
+        started = time.perf_counter()
         try:
             os.chmod(batch_path, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
@@ -1152,26 +1160,61 @@ class GAMConnector(Connector):
                 os.fsync(stream.fileno())
             fd = -1
             timeout = min(1800.0, max(float(self.runner.timeout), 30.0 * len(selected)))
-            await self.runner.run_authenticated(
+            run_authenticated = self.runner.run_authenticated
+            try:
+                parameters = inspect.signature(run_authenticated).parameters.values()
+                supports_threads = any(
+                    parameter.name == "gam_threads"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+            except (TypeError, ValueError):
+                supports_threads = False
+            kwargs = {"timeout": timeout, "serialize": True}
+            if supports_threads:
+                kwargs["gam_threads"] = workers
+            await run_authenticated(
                 self.domain,
                 GAMCommands.batch_file(str(batch_path), show_commands=False),
-                timeout=timeout,
-                serialize=True,
+                **kwargs,
+            )
+            receipt = BatchExecutionReceipt(
+                duration_seconds=time.perf_counter() - started,
+                worker_count=workers,
+                outcome="completed",
             )
             self.audit.record(
                 "oneroster_classroom_batch",
                 target=f"{len(selected)} actions",
                 argv=GAMCommands.batch_file("<private-batch>", show_commands=False),
                 ok=True,
+                extra={
+                    "duration_seconds": round(receipt.duration_seconds, 3),
+                    "worker_count": receipt.worker_count,
+                    "outcome": receipt.outcome,
+                    "retry_count": receipt.retry_count,
+                    "throttling_count": receipt.throttling_count,
+                },
             )
             operation_succeeded = True
         except Exception as exc:
+            error_code = str(getattr(exc, "error_code", "GAM-BATCH-FAILED"))
+            throttling_count = int(
+                isinstance(exc, GAMError) and exc.kind is GAMErrorKind.RATE_LIMITED
+            )
             self.audit.record(
                 "oneroster_classroom_batch",
                 target=f"{len(selected)} actions",
                 argv=GAMCommands.batch_file("<private-batch>", show_commands=False),
                 ok=False,
-                extra={"error": str(exc)},
+                extra={
+                    "duration_seconds": round(time.perf_counter() - started, 3),
+                    "worker_count": workers,
+                    "outcome": "failed",
+                    "retry_count": 0,
+                    "throttling_count": throttling_count,
+                    "error_code": error_code,
+                },
             )
             raise
         finally:
@@ -1182,6 +1225,7 @@ class GAMConnector(Connector):
                 raise RuntimeError(
                     "Private Classroom batch could not be removed securely."
                 )
+        return receipt
 
     async def create_course(
         self,

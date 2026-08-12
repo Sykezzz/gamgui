@@ -358,6 +358,8 @@ class FakeOneRosterService:
             heartbeat_stale=False,
             actions_per_minute=4.0,
             eta_seconds=None,
+            worker_count=5,
+            adaptive_state="normal",
         )
 
     async def retry_stabilization_read(self, connector, manifest_id):

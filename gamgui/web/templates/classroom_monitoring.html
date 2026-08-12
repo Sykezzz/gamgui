@@ -30,9 +30,17 @@
     </div>
     <progress class="mt-5 h-3 w-full accent-brand-blue" max="100" value="{{ workspace.progress.percent | default(0) }}">{{ workspace.progress.percent | default(0) }}%</progress>
     <p class="mt-2 text-sm tabular-nums text-brand-blueink">{{ workspace.progress.applied | default(0) }} applied · {{ workspace.progress.failed | default(0) }} failed · {{ workspace.progress.skipped | default(0) }} skipped · {{ workspace.progress.pending | default(0) }} waiting</p>
-    <dl class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <p class="mt-4 rounded-lg border border-brand-gray/40 bg-paper px-3 py-2 text-sm font-semibold text-brand-black" role="status">
+      {% if workspace.progress.adaptive_state | default("normal") == "protecting_google" %}
+      Slowing down to protect Google. GamGUI will speed up again after clean batches.
+      {% else %}
+      Working normally. GamGUI adjusts the pace automatically while keeping every safety check.
+      {% endif %}
+    </p>
+    <dl class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
       <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Checked batches</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.completed_batches | default(0) }} of about {{ workspace.progress.total_batches_estimate | default(0) }}</dd></div>
       <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Current batch</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ run.current_batch_sequence | default(0) }}</dd></div>
+      <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Current pace</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.actions_per_minute | default(0) | round }} actions/min</dd></div>
       <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Elapsed</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ ((workspace.progress.elapsed_seconds | default(0)) / 60) | round(1) }} min</dd></div>
       <div class="rounded-lg bg-paper p-3"><dt class="text-xs text-brand-blueink">Last check-in</dt><dd class="mt-1 font-semibold tabular-nums text-brand-black">{{ workspace.progress.heartbeat_age_seconds | default(0) | round }} sec ago</dd></div>
     </dl>

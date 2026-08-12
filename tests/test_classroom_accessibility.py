@@ -67,3 +67,12 @@ def test_classroom_templates_do_not_use_low_contrast_brand_gray_for_live_text():
             assert text.count("text-brand-gray") == text.count("disabled:text-brand-gray")
         else:
             assert not live_text_uses, path.name
+
+
+def test_monitoring_explains_adaptive_pacing_without_exposing_a_setting():
+    monitoring = (TEMPLATES / "classroom_monitoring.html").read_text(encoding="utf-8")
+    assert "Working normally" in monitoring
+    assert "Slowing down to protect Google" in monitoring
+    assert "actions/min" in monitoring
+    assert 'role="status"' in monitoring
+    assert "worker_count" not in monitoring
