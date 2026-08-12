@@ -8,13 +8,13 @@ substitution (so the preview is exactly what each user gets); apply sets each us
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .gam.models import GAMUser
 from .paths import app_data_dir
+from .windows_acl import restrict_owner_only
 
 # Curly ("smart") quotes INSIDE a tag — pasted from Word/Mail/chat, they don't close HTML attributes,
 # so the parser swallows everything after them (including {variables}) into the attribute value.
@@ -212,15 +212,9 @@ class SignatureStore:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
+        restrict_owner_only(self.path.parent, directory=True)
         self.path.write_text(json.dumps(self._data, indent=2))
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+        restrict_owner_only(self.path, directory=False)
 
     def names(self) -> List[str]:
         return sorted(self._data["templates"].keys())

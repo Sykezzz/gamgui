@@ -15,6 +15,8 @@ from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 from gamgui.core.signatures import _DEFAULT_TEMPLATES, SignatureStore
 from gamgui.web.server import AppState, create_app
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
+from tests.windows_acl_assertions import assert_current_user_only_acl
 
 FIXTURES = Path(__file__).parent / "fixtures"
 DOMAIN = "example.com"
@@ -25,7 +27,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("GAM_MOCK_FIXTURES", str(FIXTURES))
     vault = SecretsVault(InMemoryBackend())
     vault.set_all(DOMAIN, {"client_secrets": "{}", "oauth2": "tok", "oauth2service": '{"client_id": "x"}'})
-    runner = GAMRunner(vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path)
+    runner = GAMRunner(vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path, command_prefix=MOCK_GAM_COMMAND_PREFIX)
     conn = GAMConnector(runner=runner, domain=DOMAIN, audit=AuditLog(tmp_path / "audit.jsonl"))
     state = AppState(vault=vault, runner=runner, audit_domain=DOMAIN, connector=conn, token="t")
     state.sig_templates = SignatureStore(tmp_path / "signatures.json")  # isolated store, not the real ~/Library file
@@ -65,7 +67,10 @@ def test_store_corrupt_file_falls_back_to_seed(tmp_path):
 def test_store_file_is_owner_only(tmp_path):
     p = tmp_path / "sig.json"
     SignatureStore(p).save("X", "<div>{name}</div>")
-    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    if os.name == "nt":
+        assert_current_user_only_acl(p)
+    else:
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
 def test_store_rejects_blank_name(tmp_path):

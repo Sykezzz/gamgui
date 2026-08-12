@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -12,8 +11,7 @@ from gamgui.core.connectors.gam_connector import GAMConnector
 from gamgui.core.gam.runner import GAMRunner
 from gamgui.core.secrets.vault import InMemoryBackend, SecretsVault
 
-FIXTURES = Path(__file__).parent / "fixtures"
-MOCK_GAM = FIXTURES / ("mock_gam.cmd" if os.name == "nt" else "mock_gam.sh")
+from tests.platform_fixtures import FIXTURES, MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
 DOMAIN = "example.com"
 
 
@@ -45,7 +43,13 @@ def vault() -> SecretsVault:
 def runner(vault: SecretsVault, tmp_path: Path, monkeypatch) -> GAMRunner:
     # The mock gam reads its canned responses from this directory.
     monkeypatch.setenv("GAM_MOCK_FIXTURES", str(FIXTURES))
-    return GAMRunner(vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path, timeout=15)
+    return GAMRunner(
+        vault=vault,
+        gam_binary=MOCK_GAM,
+        base_dir=tmp_path,
+        timeout=15,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
+    )
 
 
 @pytest.fixture

@@ -56,6 +56,18 @@ source = source_sha()
 minimum_macos = os.environ.get("GAMGUI_MINIMUM_MACOS", "12.0")
 packaging_revision = os.environ.get("GAMGUI_PACKAGING_REVISION", "1")
 architecture = os.environ.get("GAMGUI_BUILD_ARCH", platform.machine())
+artifact_platform = os.environ.get(
+    "GAMGUI_BUILD_PLATFORM",
+    "macos" if platform.system() == "Darwin" else "windows",
+)
+bundle_format = os.environ.get(
+    "GAMGUI_BUNDLE_FORMAT",
+    "app-bundle" if artifact_platform == "macos" else "onedir",
+)
+signer_thumbprint = os.environ.get("GAMGUI_SIGNER_THUMBPRINT", "")
+toolchain_manifest_digest = os.environ.get(
+    "GAMGUI_TOOLCHAIN_MANIFEST_DIGEST", ""
+)
 metadata_dir = Path(os.environ.get("GAMGUI_BUILD_METADATA_DIR", "build/profile-metadata"))
 metadata_dir.mkdir(parents=True, exist_ok=True)
 profile_metadata = metadata_dir / "profile.json"
@@ -68,6 +80,10 @@ profile_metadata.write_text(
             architecture=architecture,
             minimum_macos_version=minimum_macos,
             packaging_revision=packaging_revision,
+            platform_name=artifact_platform,
+            bundle_format=bundle_format,
+            signer_thumbprint=signer_thumbprint,
+            toolchain_manifest_digest=toolchain_manifest_digest,
         ),
         sort_keys=True,
         indent=2,
@@ -88,6 +104,16 @@ datas += tree_datas(
     exclude_oneroster=exclude_oneroster,
 )
 datas.append((str(profile_metadata), "resources/components"))
+toolchain_manifest = Path("gamgui/resources/updater/windows-toolchain.json")
+if toolchain_manifest.is_file():
+    datas.append((str(toolchain_manifest), "resources/updater"))
+windows_signing_script = Path("scripts/windows_local_signing.ps1")
+if windows_signing_script.is_file():
+    datas.append((str(windows_signing_script), "resources/updater"))
+toolchain_bundle_dir = Path(os.environ.get("GAMGUI_TOOLCHAIN_BUNDLE_DIR", ""))
+if str(toolchain_bundle_dir) and toolchain_bundle_dir.is_dir():
+    for archive in sorted(toolchain_bundle_dir.glob("*.zip")):
+        datas.append((str(archive), "resources/updater/toolchain"))
 binaries = []
 hiddenimports = (
     collect_submodules("uvicorn")

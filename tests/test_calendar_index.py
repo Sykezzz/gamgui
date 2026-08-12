@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 
 import pytest
 
 from gamgui.core.calendar_index import CalendarIndex, IndexedCalendar
+from tests.windows_acl_assertions import assert_current_user_only_acl
 
 
 def test_index_crud_and_status(tmp_path):
@@ -48,8 +50,12 @@ def test_index_file_is_owner_only(tmp_path):
     # Calendar names + owner emails are domain-sensitive — keep them off other local accounts.
     idx = CalendarIndex(tmp_path / "sub" / "c.db")
     idx.replace_all("d.com", [IndexedCalendar("c_x@group.calendar.google.com", "X", "o@d.com", "secondary", 1)])
-    assert stat.S_IMODE(os.stat(idx.path).st_mode) & 0o077 == 0      # file: no group/other access
-    assert stat.S_IMODE(os.stat(idx.path.parent).st_mode) & 0o077 == 0  # dir: 0700
+    if sys.platform == "win32":
+        assert_current_user_only_acl(idx.path)
+        assert_current_user_only_acl(idx.path.parent, directory=True)
+    else:
+        assert stat.S_IMODE(os.stat(idx.path).st_mode) & 0o077 == 0
+        assert stat.S_IMODE(os.stat(idx.path.parent).st_mode) & 0o077 == 0
 
 
 def test_search_treats_like_wildcards_literally(tmp_path):

@@ -1,0 +1,25 @@
+{
+  "revision": "windows-local-build-v1",
+  "assets": [
+    {
+      "name": "mingit",
+      "version": "2.55.0.windows.4",
+      "archive": "MinGit-2.55.0.4-64-bit.zip",
+      "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.4/MinGit-2.55.0.4-64-bit.zip",
+      "sha256": "4e03f94c2ffbf70be337e005cee02661c732dbfc81031a078bda9299b9a7d644",
+      "executable": "cmd/git.exe",
+      "version_argument": "--version",
+      "version_contains": "2.55.0.windows.4"
+    },
+    {
+      "name": "uv",
+      "version": "0.11.7",
+      "archive": "uv-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-x86_64-pc-windows-msvc.zip",
+      "sha256": "fe0c7815acf4fc45f8a5eff58ed3cf7ae2e15c3cf1dceadbd10c816ec1690cc1",
+      "executable": "uv.exe",
+      "version_argument": "--version",
+      "version_contains": "0.11.7"
+    }
+  ]
+}

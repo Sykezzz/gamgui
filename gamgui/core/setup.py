@@ -18,6 +18,9 @@ import json
 import os
 import re
 import stat
+import sys
+import ctypes
+from ctypes import POINTER, Structure, byref, c_uint32, c_void_p, c_wchar_p
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +30,7 @@ from .gam.errors import GAMError
 from .gam.runner import GAMRunner
 from .secrets.ephemeral import app_runtime_dir
 from .secrets.vault import FILENAMES, SecretsVault
+from .windows_acl import restrict_owner_only
 
 _WIPE_CHUNK = 1 << 16
 
@@ -41,6 +45,38 @@ _SENSITIVE_DIRS = ("/etc", "/var", "/usr", "/System", "/Library", "/dev")
 # Where macOS mounts its volumes. Read to enumerate the *other* spelling of a system directory —
 # see :func:`_spellings`.
 _VOLUMES_DIR = Path("/System/Volumes")
+
+
+@dataclass(frozen=True)
+class _WindowsPinnedDirectory:
+    """A Windows directory handle held without delete sharing.
+
+    Keeping this handle open prevents the selected credential directory from
+    being renamed or replaced while its fixed child files are inspected.
+    """
+
+    path: Path
+    handle: int
+    identity: Tuple[int, int]
+
+
+if sys.platform == "win32":
+    class _WindowsFileInformation(Structure):
+        _fields_ = [
+            ("dwFileAttributes", c_uint32),
+            ("ftCreationTimeLow", c_uint32),
+            ("ftCreationTimeHigh", c_uint32),
+            ("ftLastAccessTimeLow", c_uint32),
+            ("ftLastAccessTimeHigh", c_uint32),
+            ("ftLastWriteTimeLow", c_uint32),
+            ("ftLastWriteTimeHigh", c_uint32),
+            ("dwVolumeSerialNumber", c_uint32),
+            ("nFileSizeHigh", c_uint32),
+            ("nFileSizeLow", c_uint32),
+            ("nNumberOfLinks", c_uint32),
+            ("nFileIndexHigh", c_uint32),
+            ("nFileIndexLow", c_uint32),
+        ]
 
 
 def _fs_id(path) -> Optional[Tuple[int, int]]:
@@ -146,6 +182,8 @@ def _root_is_sane(root: Path, home: Optional[Path]) -> bool:
     ident = _fs_id(root)
     if ident is None:
         return False                            # missing, unreadable, or a broken link
+    if os.name == "nt" and root.resolve() == Path(root.anchor).resolve():
+        return False                            # never widen the bound to an entire Windows volume
     try:
         if not stat.S_ISDIR(os.stat(root).st_mode):
             return False                        # (a) a file (or device) is not a root
@@ -156,7 +194,13 @@ def _root_is_sane(root: Path, home: Optional[Path]) -> bool:
     return not any(_reaches(ident, sensitive) for sensitive in _SENSITIVE_DIRS)
 
 
-def _close(fd: int) -> None:
+def _close(fd: int | _WindowsPinnedDirectory) -> None:
+    if isinstance(fd, _WindowsPinnedDirectory):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [c_void_p]
+        kernel32.CloseHandle.restype = c_uint32
+        kernel32.CloseHandle(c_void_p(fd.handle))
+        return
     try:
         os.close(fd)
     except OSError:
@@ -197,7 +241,10 @@ def _fd_within_roots(dir_fd: int, root_ids: set) -> bool:
             _close(cur)
 
 
-def _pin_bounded_dir(p: Path, root_ids: set) -> Optional[int]:
+def _pin_bounded_dir(
+    p: Path,
+    root_ids: set,
+) -> Optional[int | _WindowsPinnedDirectory]:
     """A descriptor for the credentials directory *p*, pinned and proven to be inside the roots.
 
     This is the one place the bound has to be established, and everything after it is then race-free:
@@ -210,6 +257,8 @@ def _pin_bounded_dir(p: Path, root_ids: set) -> Optional[int]:
     that a symlink *at* *p* is followed here (``resolve_dir`` has already resolved the operator's
     input): what matters is that whatever it lands on is proven in bounds by descriptor.
     """
+    if os.name == "nt":
+        return _pin_bounded_windows_dir(p, root_ids)
     try:
         dir_fd = os.open(p, os.O_RDONLY | os.O_DIRECTORY)
     except (OSError, ValueError):
@@ -220,7 +269,93 @@ def _pin_bounded_dir(p: Path, root_ids: set) -> Optional[int]:
     return dir_fd
 
 
-def _open_in_dir(dir_fd: int, fname: str, flags: int) -> Optional[Tuple[int, Tuple[int, int]]]:
+def _pin_bounded_windows_dir(
+    p: Path,
+    root_ids: set,
+) -> Optional[_WindowsPinnedDirectory]:
+    """Pin a non-reparse Windows directory and prove its held identity in bounds."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        c_wchar_p,
+        c_uint32,
+        c_uint32,
+        c_void_p,
+        c_uint32,
+        c_uint32,
+        c_void_p,
+    ]
+    kernel32.CreateFileW.restype = c_void_p
+    handle = kernel32.CreateFileW(
+        str(p),
+        0x80,  # FILE_READ_ATTRIBUTES
+        0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deliberately not DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = c_void_p(-1).value
+    if handle in {None, invalid_handle}:
+        return None
+    pinned: Optional[_WindowsPinnedDirectory] = None
+    try:
+        info = _WindowsFileInformation()
+        kernel32.GetFileInformationByHandle.argtypes = [
+            c_void_p,
+            POINTER(_WindowsFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = c_uint32
+        if not kernel32.GetFileInformationByHandle(c_void_p(handle), byref(info)):
+            return None
+        if info.dwFileAttributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+            return None
+        final_path = _windows_final_path(int(handle))
+        identity = _fs_id(final_path) if final_path is not None else None
+        if identity is None or not _within_roots(final_path, root_ids):
+            return None
+        current = _fs_id(final_path)
+        if current != identity:
+            return None
+        pinned = _WindowsPinnedDirectory(final_path, int(handle), identity)
+        return pinned
+    finally:
+        if pinned is None:
+            kernel32.CloseHandle.argtypes = [c_void_p]
+            kernel32.CloseHandle.restype = c_uint32
+            kernel32.CloseHandle(c_void_p(handle))
+
+
+def _windows_final_path(handle: int) -> Optional[Path]:
+    """Return the current filesystem path named by an already-open handle."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        c_void_p,
+        c_wchar_p,
+        c_uint32,
+        c_uint32,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = c_uint32
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        c_void_p(handle), buffer, len(buffer), 0
+    )
+    if not length or length >= len(buffer):
+        return None
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _open_in_dir(
+    dir_fd: int | _WindowsPinnedDirectory,
+    fname: str,
+    flags: int,
+) -> Optional[Tuple[int, Tuple[int, int]]]:
     """``(fd, identity)`` for the regular file *fname* directly inside the pinned *dir_fd*, or ``None``.
 
     Only one name is resolved — a single component, relative to a directory that is already proven in
@@ -238,6 +373,8 @@ def _open_in_dir(dir_fd: int, fname: str, flags: int) -> Optional[Tuple[int, Tup
     operator's home requires local write access as that user, at which point the attacker can simply
     write the credential file's contents directly and has better options than this.
     """
+    if isinstance(dir_fd, _WindowsPinnedDirectory):
+        return _open_in_windows_dir(dir_fd, fname, flags)
     try:
         fd = os.open(fname, flags | os.O_NOFOLLOW, dir_fd=dir_fd)
     except (OSError, ValueError, NotImplementedError):
@@ -253,7 +390,79 @@ def _open_in_dir(dir_fd: int, fname: str, flags: int) -> Optional[Tuple[int, Tup
     return fd, (st.st_dev, st.st_ino)
 
 
-def _read_credential(dir_fd: int, fname: str) -> Optional[Tuple[str, Tuple[int, int]]]:
+def _open_in_windows_dir(
+    pinned: _WindowsPinnedDirectory,
+    fname: str,
+    flags: int,
+) -> Optional[Tuple[int, Tuple[int, int]]]:
+    """Open one fixed child without following a Windows reparse point."""
+
+    import msvcrt
+
+    current_dir = _windows_final_path(pinned.handle)
+    if current_dir is None or _fs_id(current_dir) != pinned.identity:
+        return None
+    target = current_dir / fname
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        c_wchar_p,
+        c_uint32,
+        c_uint32,
+        c_void_p,
+        c_uint32,
+        c_uint32,
+        c_void_p,
+    ]
+    kernel32.CreateFileW.restype = c_void_p
+    writing = bool(flags & os.O_WRONLY or flags & os.O_RDWR)
+    handle = kernel32.CreateFileW(
+        str(target),
+        0x40000000 if writing else 0x80000000,  # GENERIC_WRITE / GENERIC_READ
+        0 if writing else 0x1,  # a read may be shared for read, never delete or write
+        None,
+        3,
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = c_void_p(-1).value
+    if handle in {None, invalid_handle}:
+        return None
+    transferred = False
+    fd: Optional[int] = None
+    try:
+        info = _WindowsFileInformation()
+        kernel32.GetFileInformationByHandle.argtypes = [
+            c_void_p,
+            POINTER(_WindowsFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = c_uint32
+        if not kernel32.GetFileInformationByHandle(c_void_p(handle), byref(info)):
+            return None
+        if info.dwFileAttributes & (0x10 | 0x400):  # DIRECTORY | REPARSE_POINT
+            return None
+        crt_flags = (os.O_WRONLY if writing else os.O_RDONLY) | os.O_BINARY
+        fd = msvcrt.open_osfhandle(int(handle), crt_flags)
+        transferred = True
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            _close(fd)
+            return None
+        return fd, (st.st_dev, st.st_ino)
+    except (OSError, ValueError):
+        if fd is not None:
+            _close(fd)
+        return None
+    finally:
+        if not transferred:
+            kernel32.CloseHandle.argtypes = [c_void_p]
+            kernel32.CloseHandle.restype = c_uint32
+            kernel32.CloseHandle(c_void_p(handle))
+
+
+def _read_credential(
+    dir_fd: int | _WindowsPinnedDirectory,
+    fname: str,
+) -> Optional[Tuple[str, Tuple[int, int]]]:
     """The credential text in *fname*, plus the identity of the inode it actually came from.
 
     Read from the descriptor that was checked — never re-opened by name — so the bytes that reach the
@@ -279,9 +488,16 @@ def _read_credential(dir_fd: int, fname: str) -> Optional[Tuple[str, Tuple[int, 
         return None
 
 
-def _file_present(dir_fd: int, fname: str) -> bool:
+def _file_present(dir_fd: int | _WindowsPinnedDirectory, fname: str) -> bool:
     """Is there a plain regular file called *fname* in the pinned directory? (No symlinks — those are
     not importable, so reporting them as present would promise something the import won't do.)"""
+    if isinstance(dir_fd, _WindowsPinnedDirectory):
+        opened = _open_in_dir(dir_fd, fname, os.O_RDONLY)
+        if opened is None:
+            return False
+        fd, _ = opened
+        _close(fd)
+        return True
     try:
         st = os.stat(fname, dir_fd=dir_fd, follow_symlinks=False)
     except (OSError, ValueError, NotImplementedError):
@@ -289,7 +505,11 @@ def _file_present(dir_fd: int, fname: str) -> bool:
     return stat.S_ISREG(st.st_mode)
 
 
-def _wipe_file(dir_fd: int, fname: str, expect: Tuple[int, int]) -> None:
+def _wipe_file(
+    dir_fd: int | _WindowsPinnedDirectory,
+    fname: str,
+    expect: Tuple[int, int],
+) -> None:
     """Best-effort overwrite-then-unlink of the plaintext credential file whose inode is *expect*.
 
     APFS makes true secure-erase unreliable, so the overwrite is defence-in-depth, not a guarantee.
@@ -324,9 +544,20 @@ def _wipe_file(dir_fd: int, fname: str, expect: Tuple[int, int]) -> None:
     finally:
         _close(fd)
     try:
-        st = os.stat(fname, dir_fd=dir_fd, follow_symlinks=False)
+        if isinstance(dir_fd, _WindowsPinnedDirectory):
+            current_dir = _windows_final_path(dir_fd.handle)
+            if current_dir is None or _fs_id(current_dir) != dir_fd.identity:
+                return
+            target = current_dir / fname
+            st = os.lstat(target)
+        else:
+            target = fname
+            st = os.stat(fname, dir_fd=dir_fd, follow_symlinks=False)
         if (st.st_dev, st.st_ino) == expect:
-            os.unlink(fname, dir_fd=dir_fd)
+            if isinstance(dir_fd, _WindowsPinnedDirectory):
+                os.unlink(target)
+            else:
+                os.unlink(fname, dir_fd=dir_fd)
     except (OSError, ValueError, NotImplementedError):
         pass
 
@@ -417,7 +648,7 @@ class SetupService:
         """A private dir the 'fresh setup' commands write into, which we then import from."""
         d = app_runtime_dir().parent / "setup"
         d.mkdir(parents=True, exist_ok=True)
-        os.chmod(d, 0o700)
+        restrict_owner_only(d, directory=True)
         return d
 
     def candidate_dirs(self) -> List[DirInspection]:
@@ -504,6 +735,17 @@ class SetupService:
         home = _home_root()
         if home is not None:
             roots.append(home)
+        try:
+            managed = self.managed_setup_dir().resolve()
+        except (OSError, RuntimeError, ValueError):
+            managed = None
+        home_id = _fs_id(home) if home is not None else None
+        if (
+            managed is not None
+            and managed not in roots
+            and (home_id is None or not _within_roots(managed, {home_id}))
+        ):
+            roots.append(managed)
         raw = (os.environ.get("GAMCFGDIR") or "").strip()
         if not raw:
             return roots    # an unset/blank $GAMCFGDIR must never become "/" and allow the disk
@@ -552,16 +794,11 @@ class SetupService:
         # probe what does or doesn't exist outside the roots.
         if not _within_roots(p, self._allowed_root_ids()):
             # The advice has to be advice that works. Moving the folder under home always works.
-            # $GAMCFGDIR is a real root, but only for a GamGUI that can SEE it: the .app has no
-            # LSEnvironment in its Info.plist, so an app launched from Finder/Spotlight/Dock does
-            # not inherit shell environment variables at all — only a launch from the same shell
-            # that exported the variable does. Saying "point $GAMCFGDIR at it and relaunch GamGUI"
-            # without that caveat sends the operator in circles.
             raise ValueError(
                 f"That folder is outside the places GamGUI can import credentials from: {p} — "
                 "move it under your home folder (that always works). Alternatively GamGUI also "
-                "accepts $GAMCFGDIR, but only when it is launched from the same terminal session "
-                "that exported it — opened from Finder, the app does not see shell variables."
+                "accepts $GAMCFGDIR when the application is launched from the same environment "
+                "that defines it."
             )
         if not p.exists():
             raise ValueError(f"No such folder: {p}")
@@ -622,7 +859,11 @@ class SetupService:
             _close(dir_fd)
         return imported
 
-    def _is_managed(self, p: Path, dir_fd: Optional[int] = None) -> bool:
+    def _is_managed(
+        self,
+        p: Path,
+        dir_fd: Optional[int | _WindowsPinnedDirectory] = None,
+    ) -> bool:
         """True only for our own staging dir — never a user's ~/.gam or another chosen path.
 
         By ``(st_dev, st_ino)``, not by string: ``resolve()`` does not correct case (nor Unicode
@@ -644,6 +885,8 @@ class SetupService:
         if managed is None:
             return False
         if dir_fd is not None:
+            if isinstance(dir_fd, _WindowsPinnedDirectory):
+                return dir_fd.identity == managed
             try:
                 st = os.fstat(dir_fd)
             except OSError:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import os
 import re
@@ -28,6 +29,14 @@ from .core.activity import activity_registry
 from .core.activation_lock import ActivationLockError, OwnerOnlyActivationLock
 from .core.components import ComponentManager
 from .core.paths import APP_DATA_ENV, app_data_dir
+from .core.update_platform import (
+    WindowsNamedMutex,
+    bundle_executable,
+    bundle_is_complete,
+    windows_installation_root,
+    windows_mutex_name,
+    windows_updater_helper_path,
+)
 from .core.persisted_activity import inspect_persisted_operations
 from .core.secrets.ephemeral import sweep_stale_configs, wipe_live_configs
 from .core.updater import (
@@ -109,6 +118,7 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--canary", action="store_true")
+    parser.add_argument("--write-artifact-sidecar", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--apply-update-helper", action="store_true")
     parser.add_argument("--recover-update-helper", action="store_true")
@@ -118,6 +128,9 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--current-app", default="")
     parser.add_argument("--activation-lock-fd", type=int, default=-1)
     parser.add_argument("--activation-transaction", default="")
+    parser.add_argument("--activation-mutex-handle", type=int, default=0)
+    parser.add_argument("--activation-mutex-name", default="")
+    parser.add_argument("--promote-helper", default="")
     parser.add_argument("--headless-task", default="")
     parser.add_argument("--policy-id", default="")
     parser.add_argument("--scheduled", action="store_true")
@@ -165,7 +178,7 @@ def _active_admin_jobs(state: AppState, *, include_registry: bool = True) -> boo
 
 def _start_update_preparation(state: AppState) -> None:
     if (
-        sys.platform != "darwin"
+        sys.platform not in {"darwin", "win32"}
         or installed_app_path() is None
         or os.environ.get(ACTIVATION_PROBE_ENV) == "1"
         or os.environ.get("GAMGUI_UPDATE_HEALTH_MARKER")
@@ -225,6 +238,22 @@ def _confirm_automatic_update(state) -> bool:
         return True
     artifact = getattr(state, "candidate_artifact", None)
     version = str(getattr(artifact, "version", "") or "").strip()
+    if sys.platform == "win32":
+        try:
+            version_text = f" {version}" if version else ""
+            message = (
+                f"GamGUI{version_text} is ready to install.\n\n"
+                "GamGUI will close, verify the update, and reopen. Your saved "
+                "Workspace data stays in place. Install and restart now?"
+            )
+            return ctypes.windll.user32.MessageBoxW(
+                None,
+                message,
+                "GamGUI update ready",
+                0x00000004 | 0x00000040,
+            ) == 6
+        except (AttributeError, OSError):
+            return False
     script = """
 on run argv
     set candidateVersion to item 1 of argv
@@ -251,7 +280,7 @@ end run
 
 
 def _handoff_pending_update() -> bool:
-    if sys.platform != "darwin":
+    if sys.platform not in {"darwin", "win32"}:
         return False
     if os.environ.get("GAMGUI_SKIP_UPDATE_ONCE") == "1":
         # Candidate health startup must retain this flag until the component
@@ -295,6 +324,21 @@ def _handoff_pending_update() -> bool:
         # Another launcher/helper owns the complete activation transaction.
         return True
 
+    named_mutex = None
+    if sys.platform == "win32":
+        try:
+            named_mutex = WindowsNamedMutex.acquire(
+                windows_mutex_name(app_data_dir())
+            )
+        except (OSError, ValueError):
+            named_mutex = None
+        if named_mutex is None:
+            try:
+                lock.release()
+            except ActivationLockError:
+                pass
+            return True
+
     handed_off = False
     try:
         state = store.load()
@@ -323,8 +367,13 @@ def _handoff_pending_update() -> bool:
             transaction = ""
             expected_sha = state.candidate_sha
             pending = Path(state.pending_app) if state.pending_app else None
+        candidate_platform = (
+            state.candidate_artifact.platform
+            if state.candidate_artifact is not None
+            else ("windows" if sys.platform == "win32" else "macos")
+        )
         executable = (
-            pending / "Contents" / "MacOS" / "GamGUI"
+            bundle_executable(pending, candidate_platform)
             if pending is not None
             else None
         )
@@ -394,10 +443,34 @@ def _handoff_pending_update() -> bool:
                 store.save(state)
             except (OSError, TypeError, ValueError):
                 return False
-        helper_arguments = [
-            sys.executable,
-            "--apply-update-helper",
-        ]
+        helper_program = sys.executable
+        if sys.platform == "win32":
+            installed_helper = windows_updater_helper_path(app_data_dir())
+            staged_helper = pending.parent / "GamGUIUpdater.exe"
+            helper_program = str(staged_helper)
+            try:
+                from .core.windows_update import verify_windows_file
+
+                verify_windows_file(
+                    installed_helper,
+                    state.local_signer_thumbprint,
+                )
+                verify_windows_file(
+                    staged_helper,
+                    state.local_signer_thumbprint,
+                )
+            except Exception:
+                _record_activation_deferred(
+                    store,
+                    transaction=transaction,
+                    code="CMP-VERIFY-FAILED",
+                    message=(
+                        "The standalone updater helper is missing, unsigned, or changed; "
+                        "the current version was kept."
+                    ),
+                )
+                return False
+        helper_arguments = [helper_program, "--apply-update-helper"]
         if recovering:
             helper_arguments.append("--recover-update-helper")
         helper_arguments.extend(
@@ -411,17 +484,40 @@ def _handoff_pending_update() -> bool:
                 "--current-app",
                 str(current),
                 "--activation-lock-fd",
-                str(lock.fileno),
+                str(lock.fileno if sys.platform == "darwin" else -1),
                 "--activation-transaction",
                 transaction,
             ]
         )
-        try:
-            subprocess.Popen(
-                helper_arguments,
-                close_fds=True,
-                pass_fds=(lock.fileno,),
+        if sys.platform == "win32":
+            helper_arguments.extend(
+                ["--promote-helper", str(installed_helper)]
             )
+        if named_mutex is not None:
+            helper_arguments.extend(
+                [
+                    "--activation-mutex-handle",
+                    str(named_mutex.handle),
+                    "--activation-mutex-name",
+                    named_mutex.name,
+                ]
+            )
+        try:
+            if sys.platform == "win32" and named_mutex is not None:
+                startup = subprocess.STARTUPINFO()
+                startup.lpAttributeList = {"handle_list": [named_mutex.handle]}
+                subprocess.Popen(
+                    helper_arguments,
+                    close_fds=True,
+                    startupinfo=startup,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                subprocess.Popen(
+                    helper_arguments,
+                    close_fds=True,
+                    pass_fds=(lock.fileno,),
+                )
         except (OSError, TypeError, ValueError, subprocess.SubprocessError):
             _record_activation_deferred(
                 store,
@@ -439,7 +535,10 @@ def _handoff_pending_update() -> bool:
                 os.environ[ACTIVATION_PROBE_ENV] = "1"
             return False
         try:
-            lock.close_after_handoff()
+            if sys.platform == "win32":
+                lock.release()
+            else:
+                lock.close_after_handoff()
         except ActivationLockError:
             # The helper was already spawned with its inherited descriptor.
             # Exiting this launcher remains the only safe continuation.
@@ -453,6 +552,11 @@ def _handoff_pending_update() -> bool:
                 lock.release()
             except ActivationLockError:
                 pass
+        if named_mutex is not None:
+            try:
+                named_mutex.close()
+            except OSError:
+                pass
 
 
 def _run_helper(args: argparse.Namespace) -> int:
@@ -460,15 +564,47 @@ def _run_helper(args: argparse.Namespace) -> int:
     lock_path = app_data_dir() / "updates" / "activation.lock"
     requested_app = Path(args.current_app)
     actual_app = installed_app_path()
+    state_at_entry = store.load()
+    if sys.platform == "win32":
+        expected_root = Path(
+            state_at_entry.windows_installation_root
+            or windows_installation_root()
+        )
+        try:
+            expected_current = (expected_root / "current").resolve()
+            if (
+                requested_app.resolve() == expected_current
+                and bundle_is_complete(requested_app, "windows")
+            ):
+                actual_app = requested_app
+            else:
+                actual_app = None
+        except OSError:
+            actual_app = None
     recovery_requested = bool(
         getattr(args, "recover_update_helper", False)
     )
+    named_mutex = None
     try:
-        lock = OwnerOnlyActivationLock.adopt(
-            lock_path,
-            args.activation_lock_fd,
-        )
+        if sys.platform == "win32":
+            named_mutex = WindowsNamedMutex.adopt(
+                args.activation_mutex_handle,
+                args.activation_mutex_name,
+            )
+            lock = OwnerOnlyActivationLock.try_acquire(lock_path)
+            if lock is None:
+                raise ActivationLockError("The updater activation lock is busy.")
+        else:
+            lock = OwnerOnlyActivationLock.adopt(
+                lock_path,
+                args.activation_lock_fd,
+            )
     except (ActivationLockError, OSError, TypeError, ValueError):
+        if named_mutex is not None:
+            try:
+                named_mutex.close()
+            except OSError:
+                pass
         if actual_app is not None and wait_for_process_exit(args.parent_pid):
             _launch_existing_app(
                 actual_app,
@@ -655,6 +791,11 @@ def _run_helper(args: argparse.Namespace) -> int:
                 lock.release()
             except ActivationLockError:
                 pass
+        if named_mutex is not None:
+            try:
+                named_mutex.close()
+            except OSError:
+                pass
 
 
 def _record_activation_deferred(
@@ -705,7 +846,7 @@ def _launch_existing_app(
     recovery_pending: bool = False,
     candidate_sha: str = "",
 ) -> None:
-    executable = Path(app_path) / "Contents" / "MacOS" / "GamGUI"
+    executable = bundle_executable(Path(app_path))
     if not executable.is_file():
         return
     env = os.environ.copy()
@@ -756,6 +897,35 @@ def _run_canary(json_output: bool = False) -> int:
     return 0 if result["ok"] else 1
 
 
+def _write_windows_artifact_sidecar() -> int:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return 2
+    bundle = installed_app_path()
+    if bundle is None or not bundle_is_complete(bundle, "windows"):
+        return 2
+    try:
+        from .core.components import load_bundle_embedded_profile, write_artifact_sidecar
+
+        embedded = load_bundle_embedded_profile(bundle)
+        if (
+            embedded.artifact.platform != "windows"
+            or not re.fullmatch(r"[0-9a-f]{64}", embedded.artifact.signer_thumbprint)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                embedded.artifact.toolchain_manifest_digest,
+            )
+        ):
+            return 1
+        write_artifact_sidecar(
+            bundle,
+            signing_channel="local",
+            signing_authority="GamGUI Local",
+        )
+    except Exception:
+        return 1
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _arguments(argv)
     if args.headless_task:
@@ -772,6 +942,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run_self_test(args.json_output)
     if args.canary:
         return _run_canary(args.json_output)
+    if args.write_artifact_sidecar:
+        return _write_windows_artifact_sidecar()
     if _handoff_pending_update():
         return 0
 

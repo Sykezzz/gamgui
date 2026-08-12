@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.platform_fixtures import MOCK_GAM, MOCK_GAM_COMMAND_PREFIX
+
 from gamgui.core.drive.models import OperationManifest, OperationTarget
 from gamgui.core.drive.operations import DriveOperationStore
 from gamgui.core.gam.runner import GAMRunner
@@ -20,7 +22,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 @pytest.fixture
 def client(tmp_path) -> TestClient:
     vault = SecretsVault(backend=InMemoryBackend())
-    runner = GAMRunner(vault=vault, gam_binary=FIXTURES / "mock_gam.sh", base_dir=tmp_path)
+    runner = GAMRunner(vault=vault, gam_binary=MOCK_GAM, base_dir=tmp_path, command_prefix=MOCK_GAM_COMMAND_PREFIX)
     state = AppState(vault=vault, runner=runner, audit_domain="", connector=None, token="testtoken")
     return TestClient(create_app(state))
 
@@ -53,8 +55,9 @@ async def test_app_state_close_cancels_drive_job_tasks(tmp_path):
     vault = SecretsVault(backend=InMemoryBackend())
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / "mock_gam.sh",
+        gam_binary=MOCK_GAM,
         base_dir=tmp_path,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     state = AppState(vault=vault, runner=runner)
     cancelled = asyncio.Event()
@@ -78,8 +81,9 @@ async def test_connector_reactivation_cannot_interrupt_live_drive_manifest(tmp_p
     vault = SecretsVault(backend=InMemoryBackend())
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / "mock_gam.sh",
+        gam_binary=MOCK_GAM,
         base_dir=tmp_path,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     state = AppState(vault=vault, runner=runner)
     store = DriveOperationStore(tmp_path / "drive_operations.db")
@@ -139,8 +143,9 @@ async def test_connector_activation_failure_preserves_complete_old_binding(
     vault = SecretsVault(backend=InMemoryBackend())
     runner = GAMRunner(
         vault=vault,
-        gam_binary=FIXTURES / "mock_gam.sh",
+        gam_binary=MOCK_GAM,
         base_dir=tmp_path,
+        command_prefix=MOCK_GAM_COMMAND_PREFIX,
     )
     state = AppState(vault=vault, runner=runner)
     old_connector = SimpleNamespace(domain="example.com")

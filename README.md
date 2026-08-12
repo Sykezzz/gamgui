@@ -1,9 +1,10 @@
 
 # GamGUI
 
-A free, local, open-source **macOS GUI for [GAM7](https://github.com/GAM-team/GAM)** — administer
+A free, local, open-source **macOS and Windows GUI for [GAM7](https://github.com/GAM-team/GAM)** — administer
 Google Workspace (users, groups, signatures, delegates, vacation responders, reports, and more)
-without memorizing CLI commands, with your credentials kept in the macOS **Keychain**.
+without memorizing CLI commands, with credentials kept in the operating system's user credential
+store.
 
 > GAM exposes far more of Google Workspace than the Admin Console surfaces (Gmail
 > signatures/delegates/forwarding, advanced group settings, bulk operations, reporting). GamGUI
@@ -64,9 +65,11 @@ Actively developed and used against live Google Workspace tenants. Working today
   Google Sheet export for complete results.
 - **Reports and audit** — 2SV gaps, inactive or suspended accounts, admins, missing recovery,
   storage/mail usage, directory completeness, and an incrementally indexed local audit trail.
-- **Local updater** — on an installed macOS app, prepares only an exact `district-main` commit that
-  has the `update-ready` check, verifies the sealed signed bundle and its self-test without reading
-  Workspace credentials, and rolls back the app and local databases if activation health fails.
+- **Cross-platform local updater** — an installed macOS or per-user Windows app prepares only an
+  exact `district-main` commit that also owns `update-ready`. Both platforms must pass the same
+  exact-SHA promotion gate. Each updater verifies its locally signed bundle and offline self-test
+  without reading Workspace credentials, then rolls back the app and local databases if activation
+  health fails.
 
 You build and run it yourself; it is not yet notarized for distribution to other Macs.
 
@@ -104,10 +107,11 @@ abort the sweep.
 
 ## Design goals
 
-- **Local & native** — a single bundled `.app`; no cloud service, nothing leaves your machine. The
+- **Local & native** — a bundled `.app` on macOS or per-user application directory on Windows; no
+  cloud service. The
   UI is served by a loopback-only local server on a random port, gated by a per-launch token (see
   [Security model](#security-model)).
-- **Secure** — secrets live in the macOS Keychain; GAM's plaintext credential files are
+- **Secure** — secrets live in the operating system's user credential store; GAM's plaintext files are
   materialized into a locked-down temporary directory only for the duration of each `gam`
   invocation, then wiped. ([details](#security-model))
 - **Easy but powerful** — form/table UI for the common painful tasks, full GAM power underneath.
@@ -207,7 +211,7 @@ is a separate typed-confirmation action.
 
 See [Classroom OneRoster guided operations](docs/classroom-oneroster.md) for the guided flow,
 verified-step Monitoring behavior, heartbeat escalation, safe pause, Recovery, sanitized receipts,
-and the exact-SHA Mac update boundary.
+and the cross-platform exact-SHA update boundary.
 
 ### Enforced bounds and confirmation rules
 
@@ -314,8 +318,8 @@ This is the handoff order for a new administrator. Do not skip the approval chec
 
 ## Build from source
 
-Requirements: **Python 3.10+**, **uv 0.11.7**, and **macOS** (to run the native window; the test
-suite itself runs on Linux too). No Google credentials are needed to build or test. The exact
+Requirements: **Python 3.10+** and **uv 0.11.7** on macOS or Windows (the test suite also runs on
+Linux). No Google credentials are needed to build or test. The exact
 Python dependency graph, including PyInstaller 6.20.0, is committed in `uv.lock`; `make setup`
 fails rather than silently updating it.
 
@@ -349,6 +353,36 @@ Each command builds `dist/GamGUI.app` from the selected sealed profile. For dist
 Macs, both profiles must be signed and notarized independently, including the embedded GAM binary;
 running them on the managed development Mac uses the stable local signing identity described
 below.
+
+### Build a Windows bundle or first bootstrap
+
+Windows supports the same fixed `core` and `classroom-oneroster` profiles. A developer build uses
+the locked environment and checksum-pinned GAM payload:
+
+```powershell
+uv sync --frozen --python (Get-Command python).Source --extra dev --extra desktop --extra build
+.\scripts\build_windows_release.ps1 -Profile core
+.\scripts\build_windows_release.ps1 -Profile classroom-oneroster
+```
+
+The first per-user bootstrap additionally bundles the committed, checksum-pinned MinGit and uv
+archives. It installs the app under `%LOCALAPPDATA%\Programs\GamGUI\current`, keeps data under
+`%LOCALAPPDATA%\GamGUI`, and copies `GamGUIUpdater.exe` outside the replaceable application
+directory. The bootstrap is a manual trust boundary because the project does not have a public
+Authenticode certificate. Run `install.ps1`; it creates a ten-year, non-exportable RSA-3072
+`GamGUI Local` identity in the current user's certificate store, then stops and asks before adding
+the public certificate to that user's Trusted Root and Trusted Publisher stores.
+
+After bootstrap, updates are automatic local builds signed by that pinned identity. The updater
+will not accept a changed certificate, unsigned executable, altered bundle manifest, stale SHA, or
+backward/non-descendant revision. Do not delete or rotate `GamGUI Local` manually. Use the bundled
+`uninstall.ps1`; it removes the app, helper, toolchain, shortcuts, and local certificate while
+preserving `%LOCALAPPDATA%\GamGUI` data unless `-RemoveData` is explicitly supplied.
+
+Bootstrap and update preparation need GitHub, Python-package, and GAM-release access. Allow enough
+disk space for the source checkout, build environment, current app, pending app, rollback copy, and
+an additional 256 MiB safety reserve; 4 GiB free is a practical minimum. A network, pin, signing,
+space, or self-test failure leaves the installed application unchanged.
 
 ### Stop the Keychain prompts
 
@@ -396,10 +430,11 @@ sync and GAM-pin maintenance share the `district-maintenance` concurrency group,
 run serially.
 
 CI runs on integration PRs. A push to `district-main` dispatches post-merge validation for the exact
-40-character commit SHA. That workflow rejects a moving/mismatched branch, runs the full Linux and
-macOS test matrix, checks pinned/latest GAM command contracts, builds and self-tests the macOS app,
-and publishes `update-ready` only when every required job passes. A green PR check alone is not
-local-update evidence; the updater requires `update-ready` on the exact current
+40-character commit SHA. That workflow rejects a moving/mismatched branch, runs Linux, macOS, and
+Windows tests on Python 3.10/3.12/3.14, checks GAM contracts, and builds/self-tests both profiles on
+macOS and Windows. Windows validation uses an ephemeral runner certificate and labels its bundles
+validation-only. It publishes `update-ready` only when every platform gate passes. A green PR check
+alone is not local-update evidence; the updater requires `update-ready` on the exact current
 `district-main` SHA.
 
 ### Staying current with GAM (and not breaking on updates)
@@ -431,28 +466,31 @@ or substitutes an unpinned GAM binary:
 5. Open the scoped PR to `district-main`; do not bypass protected-branch CI or exact-SHA post-merge
    validation.
 
-### Fail-closed local updater
+### Fail-closed cross-platform local updater
 
-The updater runs only from an installed macOS `GamGUI.app`; a source checkout or headless
-development server does not self-update.
+The updater runs only from an installed macOS `GamGUI.app` or Windows
+`%LOCALAPPDATA%\Programs\GamGUI\current`; a source checkout or headless development server does not
+self-update.
 
 1. At app startup, a background worker checks the head of `district-main`. It defers while an
    administrative job or Classroom/Drive manifest is active.
 2. It accepts only a new, non-blocklisted 40-character SHA whose completed check runs include a
    successful `update-ready` for that same SHA.
 3. It clones and checks out that exact SHA detached, requires exactly `uv 0.11.7`, synchronizes the
-   committed frozen lock through `make setup`, then runs `make gam` and builds the currently
-   selected profile. It never falls back from `classroom-oneroster` to `core` because one profile
-   failed validation. It requires the local `GamGUI Local` signing identity, verifies the signature,
-   and runs the bundled self-test.
+   committed frozen lock, fetches checksum-pinned GAM, and builds the selected profile. Windows uses
+   the bundled, version-checked MinGit and uv toolchain; macOS uses its existing local builder. It
+   never falls back from `classroom-oneroster` to `core`. It requires the pinned local `GamGUI Local`
+   signing identity, verifies the signature and complete bundle manifest, and runs the offline
+   self-test.
 4. Exact-SHA CI, the sealed artifact identity, local signing verification, and the bundled offline
    self-test establish automatic-update readiness. The automatic startup path does not run the live
-   Workspace canary or read Keychain credentials.
+   Workspace canary or read operating-system credentials.
 5. A passing build is staged while the current app keeps running. On the next launch, a native
    dialog explains the restart and lets the administrator install now or defer. If accepted, a
    helper snapshots the current app and all local SQLite databases, tests schema preparation on a
    copy, swaps the bundle, and obtains a startup health marker from a hidden verification window
-   within 45 seconds before reopening the normal app.
+   within 45 seconds before reopening the normal app. Windows uses a per-user named mutex and a
+   detached helper so no process inside `current` replaces itself.
 6. If the helper's migration-copy self-test, bundle swap, or startup health check fails, it restores
    the prior app and database snapshot, relaunches the old app, and blocklists that SHA. Successful
    activation keeps at most two rollback backups, and backups older than 30 days are pruned.
@@ -464,10 +502,20 @@ bounded, read-only canary probes in a disposable app-data directory and requires
 approval for the configured canary subject. The updater never changes OAuth/DWD scopes, Admin Console
 policy, or tenant data, and it never treats a missing/failed required canary as approval to proceed.
 
+After `update-ready` advances, verify an actual computer separately. On Windows, inspect
+`%LOCALAPPDATA%\GamGUI\updates\state.json` and `%LOCALAPPDATA%\Programs\GamGUI\current.artifact.json`,
+run `GamGUI.exe --self-test --json`, confirm `gam.exe version`, and use `Get-AuthenticodeSignature`
+plus the pinned signer SHA-256. On macOS, inspect the corresponding Application Support state and
+artifact receipt, run the bundle self-test and bundled GAM version, and verify `codesign`. In both
+cases the installed source SHA, profile, component digest, architecture, GAM version, signature,
+self-test, runtime health, and preserved application data must agree before calling the machine
+updated.
+
 ### Tests & CI
 
-`pytest` is fully offline (mock gam + in-memory Keychain). CI runs it on Ubuntu and macOS across
-Python 3.10, 3.12, and 3.14 — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+`pytest` is fully offline (mock GAM + in-memory secret store). CI runs it on Ubuntu, macOS, and
+Windows across Python 3.10, 3.12, and 3.14 — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 **Static analysis.** CodeQL runs on every push and PR to `main`, plus weekly, over both the Python
 code and the workflows themselves — configured in-tree so it is reviewable rather than hidden in

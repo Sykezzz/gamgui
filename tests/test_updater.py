@@ -71,7 +71,7 @@ def test_managed_mac_build_environment_includes_gui_missing_tool_paths():
         {"PATH": "/custom/bin"},
         home=Path("/Users/admin"),
     )
-    paths = environment["PATH"].split(os.pathsep)
+    paths = environment["PATH"].split(":")
 
     assert paths[:3] == [
         "/Users/admin/.local/bin",
@@ -119,6 +119,24 @@ def test_update_state_round_trip(tmp_path):
     assert store.load() == state
     if os.name != "nt":
         assert store.path.stat().st_mode & 0o777 == 0o600
+
+
+def test_update_state_migrates_platform_neutral_pending_path(tmp_path):
+    path = tmp_path / "updates" / "state.json"
+    path.parent.mkdir(parents=True)
+    pending = tmp_path / "pending" / "GamGUI.app"
+    path.write_text(
+        json.dumps({"candidate_sha": SHA, "pending_app": str(pending)}),
+        encoding="utf-8",
+    )
+
+    state = UpdateStateStore(path).load()
+    assert state.pending_app == str(pending)
+    assert state.pending_bundle == str(pending)
+
+    UpdateStateStore(path).save(state)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["pending_bundle"] == str(pending)
 
 
 def test_update_state_round_trips_durable_activation_journal(tmp_path):

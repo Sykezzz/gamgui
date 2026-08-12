@@ -19,6 +19,7 @@ from gamgui.core.secrets.ephemeral import (
     wipe_live_configs,
 )
 from gamgui.core.secrets.vault import FILENAMES, InMemoryBackend, SecretsVault
+from tests.windows_acl_assertions import assert_current_user_only_acl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -45,11 +46,17 @@ def _backdate(d: Path, seconds: float) -> None:
 
 def test_materialize_writes_files_with_restrictive_perms(vault, domain, tmp_path):
     with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
-        assert (os.stat(cfgdir).st_mode & 0o777) == 0o700
+        if sys.platform == "win32":
+            assert_current_user_only_acl(cfgdir, directory=True)
+        else:
+            assert (os.stat(cfgdir).st_mode & 0o777) == 0o700
         for fname in FILENAMES.values():
             f = cfgdir / fname
             assert f.exists(), f"{fname} not materialized"
-            assert (os.stat(f).st_mode & 0o777) == 0o600
+            if sys.platform == "win32":
+                assert_current_user_only_acl(f)
+            else:
+                assert (os.stat(f).st_mode & 0o777) == 0o600
         saved = cfgdir
     # dir wiped after the block
     assert not saved.exists()
@@ -59,7 +66,10 @@ def test_owner_pid_marker_is_written_and_does_not_disturb_the_lifecycle(vault, d
     with EphemeralConfig(vault, domain, base_dir=tmp_path) as cfgdir:
         marker = cfgdir / _PID_FILENAME
         assert marker.read_text(encoding="utf-8") == str(os.getpid())
-        assert (os.stat(marker).st_mode & 0o777) == 0o600
+        if sys.platform == "win32":
+            assert_current_user_only_acl(marker)
+        else:
+            assert (os.stat(marker).st_mode & 0o777) == 0o600
         assert os.path.realpath(cfgdir) in _LIVE
         saved = cfgdir
     assert not saved.exists()

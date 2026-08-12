@@ -83,6 +83,8 @@ def test_windows_bundle_profile_location_is_supported(tmp_path):
                 architecture="x86_64",
                 minimum_macos_version="10.0",
                 packaging_revision="1-windows",
+                platform_name="windows",
+                bundle_format="onedir",
             )
         ),
         encoding="utf-8",
@@ -94,6 +96,33 @@ def test_windows_bundle_profile_location_is_supported(tmp_path):
 
     assert verified.artifact.profile == ONEROSTER_PROFILE
     assert verified.artifact.architecture == "x86_64"
+    assert verified.artifact.platform == "windows"
+    assert verified.artifact.bundle_format == "onedir"
+
+
+def test_legacy_platform_migration_requires_signed_app_shape(tmp_path):
+    bundle = _embedded_bundle(tmp_path, CORE_PROFILE)
+    metadata = bundle / "Contents" / "Resources" / "resources" / "components" / "profile.json"
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["artifact"].pop("platform")
+    payload["artifact"].pop("bundle_format")
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    sidecar = write_artifact_sidecar(
+        bundle,
+        signing_channel="local",
+        signing_authority="GamGUI Local",
+    )
+    sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    sidecar_payload["artifact"].pop("platform")
+    sidecar_payload["artifact"].pop("bundle_format")
+    sidecar.write_text(json.dumps(sidecar_payload), encoding="utf-8")
+
+    assert verify_bundle_artifact(bundle).artifact.platform == "macos"
+
+    sidecar_payload["signing_channel"] = ""
+    sidecar.write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    with pytest.raises(ComponentError, match="could not be proven"):
+        verify_bundle_artifact(bundle)
 
 
 def test_profiles_are_fixed_and_have_distinct_digests():

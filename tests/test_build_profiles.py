@@ -29,11 +29,54 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "write_artifact_sidecar" in script
     assert "GAMGUI_SELF_TEST_OUTPUT" in script
     assert "Compress-Archive" in script
-    assert "unsigned local artifact" in script
+    assert "CertificateSha256" in script
+    assert "gamgui-updater.spec" in script
+    assert "GamGUIUpdater.exe" in script
+    assert "bootstrap-manifest.json" in script
+    assert "ToolchainBundleDir" in script
+    assert "embedded Windows artifact identity" in script
+    assert "0x8664" in script
+    assert "helper accepted an ordinary application launch" in script
     assert "Get-FileHash" in fetch
     assert "Checksum mismatch" in fetch
     assert "gam.exe" in fetch
     assert "gam-7.47.02-windows-x86_64.zip" in checksums
+
+
+def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
+    install = (ROOT / "scripts" / "install_windows_bootstrap.ps1").read_text(
+        encoding="utf-8"
+    )
+    uninstall = (ROOT / "scripts" / "uninstall_windows_bootstrap.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "TRUST GAMGUI LOCAL" in install
+    assert "-TrustLocalCertificate" in install
+    assert "RemoveTrust" in install
+    assert "$createdCertificate" in install
+    assert "$installedCurrent" in install
+    assert '"$current.artifact.json"' in install
+    assert "A bootstrap file failed its SHA-256 receipt" in install
+    assert "GamGUIUpdater.exe" in install
+    assert '$shortcut.TargetPath = $helper' in install
+    assert '$shortcut.Arguments = "--launch-installed"' in install
+    assert "--write-artifact-sidecar" in install
+    assert "--self-test" in install
+    assert "RemoveData" in uninstall
+    assert 'if ($RemoveData' in uninstall
+
+
+def test_windows_updater_helper_is_built_outside_the_application_bundle():
+    spec = (ROOT / "gamgui-updater.spec").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "gamgui" / "windows_updater.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'name="GamGUIUpdater"' in spec
+    assert "windows-toolchain.json" in spec
+    assert "windows_local_signing.ps1" in spec
+    assert '"--apply-update-helper" not in sys.argv[1:]' in entrypoint
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():

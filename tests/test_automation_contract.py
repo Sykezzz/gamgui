@@ -72,7 +72,13 @@ def test_post_merge_validation_is_exact_sha_and_update_ready_is_last():
     assert "profile: [core, classroom-oneroster]" in workflow
     assert 'make app PROFILE="${{ matrix.profile }}"' in workflow
     assert "name: update-ready" in workflow
-    assert "needs: [verify-sha, test, gam-contracts, updater-and-build]" in workflow
+    assert "needs: [verify-sha, test, windows-test, gam-contracts, updater-and-build, windows-updater-and-build]" in workflow
+    assert "Windows updater, bootstrap, and rollback contracts" in workflow
+    assert 'python: ["3.10", "3.12", "3.14"]' in workflow
+    assert "windows-latest" in workflow
+    assert "-Bootstrap" in workflow
+    assert "validation-only-windows-bootstrap" in workflow
+    assert "windows-x86_64-${{ matrix.profile }}-bootstrap-*" in workflow
     assert '"$VALIDATED_SHA:refs/heads/update-ready"' in workflow
     assert "group: post-merge-update-ready" in workflow
     assert "cancel-in-progress: true" in workflow
@@ -105,6 +111,10 @@ def test_ci_dispatches_post_merge_validation_only_for_district_main_push():
     assert "needs: macos-build-smoke" in workflow
     assert "MATRIX_RESULT: ${{ needs.macos-build-smoke.result }}" in workflow
     assert 'test "$MATRIX_RESULT" = "success"' in workflow
+    assert "windows-build-smoke-required:" in workflow
+    assert "name: Windows application build smoke\n" in workflow
+    assert "needs: windows-build-smoke" in workflow
+    assert "needs.windows-test.result" in workflow
 
 
 def test_post_merge_latest_contract_is_pinned_before_download():
@@ -123,6 +133,8 @@ def test_repository_activation_script_enables_only_required_maintenance_settings
     assert '"allow_deletions": false' in script
     assert "gh repo sync" not in script
     assert '"macOS application build smoke"' in script
+    assert '"Windows application build smoke"' in script
+    assert '"Windows test (py3.10)"' in script
 
     workflow = _workflow("ci.yml")
     assert "macos-build-smoke-required:" in workflow
