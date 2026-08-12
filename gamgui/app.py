@@ -130,6 +130,7 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--activation-transaction", default="")
     parser.add_argument("--activation-mutex-handle", type=int, default=0)
     parser.add_argument("--activation-mutex-name", default="")
+    parser.add_argument("--promote-helper", default="")
     parser.add_argument("--headless-task", default="")
     parser.add_argument("--policy-id", default="")
     parser.add_argument("--scheduled", action="store_true")
@@ -444,12 +445,18 @@ def _handoff_pending_update() -> bool:
                 return False
         helper_program = sys.executable
         if sys.platform == "win32":
-            helper_program = str(windows_updater_helper_path(app_data_dir()))
+            installed_helper = windows_updater_helper_path(app_data_dir())
+            staged_helper = pending.parent / "GamGUIUpdater.exe"
+            helper_program = str(staged_helper)
             try:
                 from .core.windows_update import verify_windows_file
 
                 verify_windows_file(
-                    Path(helper_program),
+                    installed_helper,
+                    state.local_signer_thumbprint,
+                )
+                verify_windows_file(
+                    staged_helper,
                     state.local_signer_thumbprint,
                 )
             except Exception:
@@ -482,6 +489,10 @@ def _handoff_pending_update() -> bool:
                 transaction,
             ]
         )
+        if sys.platform == "win32":
+            helper_arguments.extend(
+                ["--promote-helper", str(installed_helper)]
+            )
         if named_mutex is not None:
             helper_arguments.extend(
                 [

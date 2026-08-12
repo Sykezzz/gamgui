@@ -59,6 +59,8 @@ def test_windows_bootstrap_requires_explicit_local_trust_and_preserves_data():
     assert '"$current.artifact.json"' in install
     assert "A bootstrap file failed its SHA-256 receipt" in install
     assert "GamGUIUpdater.exe" in install
+    assert '$shortcut.TargetPath = $helper' in install
+    assert '$shortcut.Arguments = "--launch-installed"' in install
     assert "--write-artifact-sidecar" in install
     assert "--self-test" in install
     assert "RemoveData" in uninstall

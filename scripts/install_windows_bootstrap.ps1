@@ -120,8 +120,9 @@ try {
         $shell = New-Object -ComObject WScript.Shell
         $startMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs\GamGUI.lnk"
         $shortcut = $shell.CreateShortcut($startMenu)
-        $shortcut.TargetPath = $executable
-        $shortcut.WorkingDirectory = $current
+        $shortcut.TargetPath = $helper
+        $shortcut.Arguments = "--launch-installed"
+        $shortcut.WorkingDirectory = $updaterRoot
         $shortcut.Save()
     }
     $statePath = Join-Path $dataRoot "updates\state.json"

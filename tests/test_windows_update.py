@@ -117,6 +117,22 @@ def _windows_bundle(path: Path, content: bytes, *, source_sha: str = SHA) -> Pat
     return path
 
 
+def test_windows_builder_stages_the_signed_helper_with_the_candidate(tmp_path):
+    bundle = _windows_bundle(tmp_path / "built" / "GamGUI", b"candidate")
+    helper = tmp_path / "built" / "GamGUIUpdater.exe"
+    helper.write_bytes(b"signed-helper")
+    envelope = verify_bundle_artifact(bundle)
+    builder = WindowsLocalUpdateBuilder(
+        root=tmp_path / "updates",
+        signer_thumbprint="c" * 64,
+    )
+
+    pending = builder._stage(bundle, helper, envelope)
+
+    assert (pending.parent / "GamGUIUpdater.exe").read_bytes() == b"signed-helper"
+    assert verify_bundle_artifact(pending).artifact == envelope.artifact
+
+
 class _Process:
     def __init__(self):
         self.returncode = None

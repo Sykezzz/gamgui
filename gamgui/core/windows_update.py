@@ -313,6 +313,16 @@ class WindowsLocalUpdateBuilder:
         bundle = checkout / "dist" / "GamGUI"
         if not bundle_executable(bundle, "windows").is_file():
             raise RuntimeError("The update build did not produce GamGUI.exe.")
+        helper_dist = checkout / "dist" / "updater-helper"
+        self._command([
+            str(uv), "run", "--frozen", "--extra", "desktop", "--extra", "build",
+            "python", "-m", "PyInstaller", "--noconfirm", "--clean",
+            "--distpath", str(helper_dist), "--workpath", str(checkout / "build" / "updater-helper"),
+            "gamgui-updater.spec",
+        ], cwd=checkout, env=environment)
+        helper = helper_dist / "GamGUIUpdater.exe"
+        if not helper.is_file():
+            raise RuntimeError("The update build did not produce GamGUIUpdater.exe.")
         signing_script = checkout / "scripts" / "windows_local_signing.ps1"
         self._command([
             "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -320,9 +330,19 @@ class WindowsLocalUpdateBuilder:
             "-CertificateSha256", self.signer_thumbprint,
         ], cwd=checkout)
         self._command([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(signing_script), "-Action", "SignFile", "-Path", str(helper),
+            "-CertificateSha256", self.signer_thumbprint,
+        ], cwd=checkout)
+        self._command([
             str(uv), "run", "--frozen", "--extra", "desktop", "--extra", "build", "python", "-c",
             "import sys; from pathlib import Path; from gamgui.core.components import write_artifact_sidecar; write_artifact_sidecar(Path(sys.argv[1]), signing_channel='local', signing_authority='GamGUI Local')",
             str(bundle),
+        ], cwd=checkout)
+        self._command([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(signing_script), "-Action", "VerifyFile", "-Path", str(helper),
+            "-CertificateSha256", self.signer_thumbprint,
         ], cwd=checkout)
         self._command([
             "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -344,15 +364,16 @@ class WindowsLocalUpdateBuilder:
             or envelope.artifact.toolchain_manifest_digest != self.toolchain.manifest_digest
         ):
             raise RuntimeError("The built Windows artifact identity did not match the validated inputs.")
-        return self._stage(bundle, envelope)
+        return self._stage(bundle, helper, envelope)
 
-    def _stage(self, bundle: Path, envelope: ArtifactEnvelope) -> Path:
+    def _stage(self, bundle: Path, helper: Path, envelope: ArtifactEnvelope) -> Path:
         pending = self.root / "pending" / envelope.artifact.source_sha / envelope.artifact.profile / "GamGUI"
         if pending.exists():
             shutil.rmtree(pending)
         pending.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(bundle, pending)
         shutil.copy2(artifact_sidecar_path(bundle), artifact_sidecar_path(pending))
+        shutil.copy2(helper, pending.parent / "GamGUIUpdater.exe")
         verify_bundle_artifact(pending, expected_artifact=envelope.artifact)
         return pending
 

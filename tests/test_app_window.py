@@ -322,6 +322,8 @@ def test_windows_pending_update_hands_off_to_signed_detached_helper(
     helper = data_root / "updater" / "GamGUIUpdater.exe"
     helper.parent.mkdir(parents=True)
     helper.write_bytes(b"helper")
+    staged_helper = pending.parent / "GamGUIUpdater.exe"
+    staged_helper.write_bytes(b"staged-helper")
     artifact = ComponentArtifactId(
         source_sha=sha,
         version="0.0.1",
@@ -378,11 +380,12 @@ def test_windows_pending_update_hands_off_to_signed_detached_helper(
 
     assert _handoff_pending_update()
     arguments, options = launched[0]
-    assert arguments[0] == str(helper)
+    assert arguments[0] == str(staged_helper)
+    assert arguments[arguments.index("--promote-helper") + 1] == str(helper)
     assert "--activation-mutex-handle" in arguments
     assert options["close_fds"] is True
     assert options["startupinfo"].lpAttributeList == {"handle_list": [1234]}
-    assert verified == [(helper, "c" * 64)]
+    assert verified == [(helper, "c" * 64), (staged_helper, "c" * 64)]
 
 
 def test_corrupt_existing_update_state_enters_local_recovery_probe(
