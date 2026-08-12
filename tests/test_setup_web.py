@@ -673,7 +673,12 @@ def test_home_is_allowed_even_when_the_sanity_rules_would_drop_it(ctx, monkeypat
     assert not _root_is_sane(root_home, root_home)             # the rules would indeed drop it…
     roots = svc.allowed_roots()
     assert root_home in roots                                 # …but home is a root regardless
-    anywhere = tmp_path_factory.mktemp("under-the-root")
+    # A hosted Windows runner can keep pytest's temp directory on C: while the
+    # synthetic home resolves to D:.  Exercise the admitted root itself there;
+    # POSIX keeps the stronger arbitrary-child assertion on its single root.
+    anywhere = (
+        root_home if os.name == "nt" else tmp_path_factory.mktemp("under-the-root")
+    )
     assert svc.resolve_dir(anywhere) == anywhere.resolve()    # so nothing is refused outright
 
 
