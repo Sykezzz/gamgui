@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import os
 import plistlib
+import posixpath
 import re
 import secrets
 import shutil
@@ -715,19 +716,23 @@ def _managed_mac_build_environment(
     """Return a deterministic toolchain PATH for a Finder-launched managed app."""
 
     result = dict(os.environ if environment is None else environment)
-    resolved_home = Path(home) if home is not None else Path.home()
+    resolved_home = str(Path(home) if home is not None else Path.home()).replace(
+        "\\", "/"
+    )
+    if resolved_home.startswith("/") is False:
+        resolved_home = "/" + resolved_home.lstrip("/")
     preferred = (
-        resolved_home / ".local" / "bin",
-        Path("/opt/homebrew/bin"),
-        Path("/usr/local/bin"),
-        Path("/usr/bin"),
-        Path("/bin"),
-        Path("/usr/sbin"),
-        Path("/sbin"),
+        posixpath.join(resolved_home, ".local", "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
     )
     current = [
-        Path(item)
-        for item in result.get("PATH", "").split(os.pathsep)
+        item
+        for item in result.get("PATH", "").split(":")
         if item
     ]
     ordered: list[str] = []
@@ -735,12 +740,12 @@ def _managed_mac_build_environment(
         value = str(candidate)
         if value not in ordered:
             ordered.append(value)
-    result["PATH"] = os.pathsep.join(ordered)
+    result["PATH"] = ":".join(ordered)
     return result
 
 
 class LocalUpdateBuilder:
-    """Build and stage an exact commit using the admin Mac's local signing identity."""
+    """Build and stage an exact commit using the platform-local signing identity."""
 
     def __init__(
         self,
@@ -748,6 +753,7 @@ class LocalUpdateBuilder:
         repository_url: str = "https://github.com/Sykezzz/gamgui.git",
         run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         trusted_local_bundle: Optional[Path] = None,
+        local_signer_thumbprint: str = "",
     ) -> None:
         self.root = root or app_data_dir() / "updates"
         self.repository_url = repository_url
@@ -757,6 +763,7 @@ class LocalUpdateBuilder:
             if trusted_local_bundle is not None
             else None
         )
+        self.local_signer_thumbprint = local_signer_thumbprint.lower()
 
     def prepare(
         self,
@@ -764,8 +771,17 @@ class LocalUpdateBuilder:
         profile: str = CORE_PROFILE,
         installed_sha: str = "",
     ) -> Path:
+        if sys.platform == "win32":
+            from .windows_update import WindowsLocalUpdateBuilder
+
+            return WindowsLocalUpdateBuilder(
+                root=self.root,
+                repository_url=self.repository_url,
+                signer_thumbprint=self.local_signer_thumbprint,
+                run=self._run,
+            ).prepare(candidate, profile, installed_sha)
         if sys.platform != "darwin":
-            raise RuntimeError("Automatic application builds are supported only on macOS.")
+            raise RuntimeError("Automatic application builds are unsupported on this platform.")
         profile = normalize_profile(profile)
         command_env = _managed_mac_build_environment()
         checkout = self.root / "source" / candidate.sha
@@ -1104,7 +1120,7 @@ class LocalUpdateBuilder:
             / "pending"
             / artifact.source_sha
             / artifact.profile
-            / "GamGUI.app"
+            / ("GamGUI" if artifact.platform == "windows" else "GamGUI.app")
         )
         if pending.exists():
             _remove_tree(pending, self.root)
@@ -1151,7 +1167,15 @@ class LocalUpdateBuilder:
             raise RuntimeError(
                 "The read-only canary subject is not configured. Re-run Workspace setup."
             )
-        executable = pending_app / "Contents" / "MacOS" / "GamGUI"
+        staged_envelope = _load_staged_envelope(pending_app)
+        executable = bundle_executable(
+            pending_app,
+            (
+                staged_envelope.artifact.platform
+                if staged_envelope is not None
+                else runtime_platform()
+            ),
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix="canary-",
@@ -1213,7 +1237,9 @@ class UpdateCoordinator:
     ) -> None:
         self.store = store or UpdateStateStore()
         self.source = source or GitHubUpdateSource()
-        self.builder = builder or LocalUpdateBuilder()
+        self.builder = builder or LocalUpdateBuilder(
+            local_signer_thumbprint=self.store.load().local_signer_thumbprint
+        )
         self.active_jobs = active_jobs
         self.activity_registry = activity_registry
 
@@ -1293,6 +1319,7 @@ class UpdateCoordinator:
                 )
             state.candidate_sha = candidate.sha
             state.pending_app = str(pending)
+            state.pending_bundle = str(pending)
             # Exact-SHA CI, sealed artifact identity, and the staged bundle's
             # offline self-test establish automatic-update readiness. A live
             # Workspace canary would prompt for Keychain access during startup,
@@ -1302,6 +1329,7 @@ class UpdateCoordinator:
             state.desired_profile = profile
             state.desired_components = list(component_ids_for_profile(profile))
             state.candidate_artifact = envelope.artifact
+            state.candidate_platform = envelope.artifact.platform
             state.candidate_signing_channel = envelope.signing_channel
             state.candidate_signing_authority = envelope.signing_authority
             state.candidate_migration_team_id = ""
@@ -1427,7 +1455,9 @@ class UpdateCoordinator:
                 raise ActivityBusyError("administrative-operation")
             state.candidate_sha = candidate_sha
             state.pending_app = str(pending)
+            state.pending_bundle = str(pending)
             state.candidate_artifact = envelope.artifact
+            state.candidate_platform = envelope.artifact.platform
             state.candidate_signing_channel = envelope.signing_channel
             state.candidate_signing_authority = envelope.signing_authority
             state.candidate_migration_team_id = (
@@ -1543,7 +1573,9 @@ class UpdateCoordinator:
                 )
             state.candidate_sha = state.installed_sha
             state.pending_app = str(pending)
+            state.pending_bundle = str(pending)
             state.candidate_artifact = envelope.artifact
+            state.candidate_platform = envelope.artifact.platform
             state.candidate_signing_channel = envelope.signing_channel
             state.candidate_signing_authority = envelope.signing_authority
             state.candidate_migration_team_id = ""
@@ -1639,7 +1671,9 @@ class UpdateCoordinator:
                 require_component_policy(envelope)
             state.candidate_sha = envelope.artifact.source_sha
             state.pending_app = str(pending)
+            state.pending_bundle = str(pending)
             state.candidate_artifact = envelope.artifact
+            state.candidate_platform = envelope.artifact.platform
             state.candidate_signing_channel = envelope.signing_channel
             state.candidate_signing_authority = envelope.signing_authority
             state.candidate_migration_team_id = (

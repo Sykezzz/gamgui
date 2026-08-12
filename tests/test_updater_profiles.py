@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -36,6 +37,11 @@ from gamgui.core.updater import (
 )
 
 SHA = "b" * 40
+OTHER_ARCH = (
+    "arm64"
+    if platform.machine().lower() in {"amd64", "x86_64", "x64"}
+    else "x86_64"
+)
 
 
 def _signed_bundle_run(argv, **kwargs):
@@ -57,7 +63,7 @@ def _bundle(
     *,
     source_sha: str = SHA,
     version: str = "1",
-    architecture: str = "arm64",
+    architecture: str | None = None,
     minimum_macos_version: str = "12.0",
     packaging_revision: str = "1",
 ) -> Path:
@@ -76,7 +82,7 @@ def _bundle(
                 profile,
                 source_sha=source_sha,
                 version=version,
-                architecture=architecture,
+                architecture=architecture or platform.machine(),
                 minimum_macos_version=minimum_macos_version,
                 packaging_revision=packaging_revision,
             )
@@ -233,7 +239,7 @@ def test_app_update_activation_requires_exact_artifact_profile_and_sha(tmp_path)
     ("field", "value"),
     (
         ("version", "2"),
-        ("architecture", "x86_64"),
+        ("architecture", OTHER_ARCH),
         ("minimum_macos_version", "13.0"),
         ("packaging_revision", "2"),
     ),
@@ -322,7 +328,13 @@ def test_component_verified_file_refuses_unpaired_platform_metadata(tmp_path):
 def test_component_verified_file_blocklist_rejects_before_self_test(
     tmp_path,
     block_kind,
+    monkeypatch,
 ):
+    monkeypatch.setattr("gamgui.core.components.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "gamgui.core.components.platform.mac_ver",
+        lambda: ("13.0", ("", "", ""), ""),
+    )
     installed = verify_bundle_artifact(
         _bundle(tmp_path / "installed" / "GamGUI.app", CORE_PROFILE)
     ).artifact
@@ -672,7 +684,12 @@ def test_missing_staged_bundle_recovers_profile_swap_and_app_update_for_retry(
     assert not coordinator.recover_missing_pending(missing)
 
 
-def test_verified_file_seam_rehashes_the_staged_copy(tmp_path):
+def test_verified_file_seam_rehashes_the_staged_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr("gamgui.core.components.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "gamgui.core.components.platform.mac_ver",
+        lambda: ("13.0", ("", "", ""), ""),
+    )
     source = _bundle(tmp_path / "source" / "GamGUI.app", ONEROSTER_PROFILE)
     trusted = _bundle(tmp_path / "installed" / "GamGUI.app", CORE_PROFILE)
     commands = []
@@ -700,7 +717,12 @@ def test_verified_file_seam_rehashes_the_staged_copy(tmp_path):
     ] == [[str(source / "Contents" / "MacOS" / "GamGUI"), "--self-test"]]
 
 
-def test_verified_file_policy_runs_before_candidate_self_test(tmp_path):
+def test_verified_file_policy_runs_before_candidate_self_test(tmp_path, monkeypatch):
+    monkeypatch.setattr("gamgui.core.components.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "gamgui.core.components.platform.mac_ver",
+        lambda: ("13.0", ("", "", ""), ""),
+    )
     source = _bundle(tmp_path / "source" / "GamGUI.app", ONEROSTER_PROFILE)
     trusted = _bundle(tmp_path / "installed" / "GamGUI.app", CORE_PROFILE)
     events: list[object] = []

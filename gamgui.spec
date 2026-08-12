@@ -104,6 +104,13 @@ datas += tree_datas(
     exclude_oneroster=exclude_oneroster,
 )
 datas.append((str(profile_metadata), "resources/components"))
+toolchain_manifest = Path("gamgui/resources/updater/windows-toolchain.json")
+if toolchain_manifest.is_file():
+    datas.append((str(toolchain_manifest), "resources/updater"))
+toolchain_bundle_dir = Path(os.environ.get("GAMGUI_TOOLCHAIN_BUNDLE_DIR", ""))
+if str(toolchain_bundle_dir) and toolchain_bundle_dir.is_dir():
+    for archive in sorted(toolchain_bundle_dir.glob("*.zip")):
+        datas.append((str(archive), "resources/updater/toolchain"))
 binaries = []
 hiddenimports = (
     collect_submodules("uvicorn")

@@ -71,7 +71,7 @@ def test_managed_mac_build_environment_includes_gui_missing_tool_paths():
         {"PATH": "/custom/bin"},
         home=Path("/Users/admin"),
     )
-    paths = environment["PATH"].split(os.pathsep)
+    paths = environment["PATH"].split(":")
 
     assert paths[:3] == [
         "/Users/admin/.local/bin",
