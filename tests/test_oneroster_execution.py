@@ -312,6 +312,169 @@ def test_execution_batches_persist_exact_membership_and_progress(tmp_path: Path)
     assert progress.pending == 2
     assert progress.percent == 0
     assert progress.heartbeat_age_seconds == 10
+    assert progress.heartbeat_state == "current"
+    assert progress.current_batch is not None
+    assert progress.current_batch.course_count == 1
+
+
+def test_execution_progress_projects_operator_phases_and_unknown_work(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    actions = (
+        ImportAction("course", "course_update", "Section_101", "course"),
+        ImportAction("teacher", "owner_transfer", "Section_102", "owner@example.org"),
+        ImportAction("student", "student_add", "Section_103", "student@example.org"),
+        ImportAction("other", "future_action", "Section_104", "safe-value"),
+        ImportAction("waiting", "student_add", "Section_105", "waiting@example.org"),
+    )
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=actions,
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="course_update",
+        owner_id=executor._operation_owner,
+        now=100.0,
+    )
+    batch = service.store.prepare_execution_batch(
+        run.id,
+        manifest.id,
+        actions[:4],
+        phase="course_update",
+        owner_id=executor._operation_owner,
+        now=101.0,
+    )
+    service.store.mark_execution_batch_started(batch.id, now=102.0)
+    service.store.complete_verified_batch(
+        batch.id,
+        manifest.id,
+        {
+            "course": ("applied", "verified"),
+            "teacher": ("failed", "OR-BATCH-VERIFY-FAILED"),
+            "student": ("applied", "verified"),
+            "other": ("skipped", "not required"),
+        },
+        owner_id=executor._operation_owner,
+        apply_seconds=2.0,
+        verification_seconds=1.0,
+        verification_attempts=2,
+        worker_count=3,
+        throttling_count=1,
+        now=105.0,
+    )
+
+    progress = service.store.get_execution_progress(manifest.id, now=110.0)
+    phases = {phase.key: phase for phase in progress.phases}
+
+    assert progress.total == 5
+    assert progress.course_count == 5
+    assert progress.remaining_course_count == 1
+    assert phases["classes"].applied == 1
+    assert phases["teachers"].failed == 1
+    assert phases["students"].applied == 1
+    assert phases["students"].pending == 1
+    assert phases["other"].skipped == 1
+    assert progress.current_batch is not None
+    assert progress.current_batch.phase_key == "classes"
+    assert progress.current_batch.action_count == 4
+    assert progress.current_batch.course_count == 4
+    assert progress.current_batch.verification_attempts == 2
+    assert progress.adaptive_state == "protecting_google"
+
+
+def test_execution_progress_uses_two_stage_heartbeat_thresholds(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(ImportAction("a-1", "student_add", "Section_101", "one@example.org"),),
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+        now=100.0,
+    )
+
+    current = service.store.get_execution_progress(manifest.id, now=129.999)
+    delayed = service.store.get_execution_progress(manifest.id, now=130.0)
+    stale = service.store.get_execution_progress(manifest.id, now=280.0)
+
+    assert current.heartbeat_state == "current"
+    assert current.heartbeat_delayed is False
+    assert delayed.heartbeat_state == "delayed"
+    assert delayed.heartbeat_delayed is True
+    assert delayed.heartbeat_stale is False
+    assert stale.heartbeat_state == "stale"
+    assert stale.heartbeat_stale is True
+
+
+def test_execution_eta_waits_for_two_verified_batches(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    actions = tuple(
+        ImportAction(
+            f"a-{number}",
+            "student_add",
+            f"Section_10{number}",
+            f"student-{number}@example.org",
+        )
+        for number in range(1, 4)
+    )
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=actions,
+    )
+    executor = OneRosterExecutor(service.store, FakeClassroom())
+    _claim_for_executor(service, manifest, executor)
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="student_add",
+        owner_id=executor._operation_owner,
+        now=100.0,
+    )
+    for index, action in enumerate(actions[:2], start=1):
+        batch = service.store.prepare_execution_batch(
+            run.id,
+            manifest.id,
+            (action,),
+            phase="student_add",
+            owner_id=executor._operation_owner,
+            now=100.0 + index,
+        )
+        service.store.mark_execution_batch_started(
+            batch.id,
+            now=102.0 + index,
+        )
+        service.store.complete_verified_batch(
+            batch.id,
+            manifest.id,
+            {action.id: ("applied", "verified")},
+            owner_id=executor._operation_owner,
+            apply_seconds=1.0,
+            verification_seconds=1.0,
+            verification_attempts=1,
+            worker_count=5,
+            now=104.0 + index,
+        )
+        progress = service.store.get_execution_progress(
+            manifest.id,
+            now=105.0 + index,
+        )
+        if index == 1:
+            assert progress.completed_batches == 1
+            assert progress.eta_seconds is None
+
+    assert progress.completed_batches == 2
+    assert progress.eta_seconds is not None
 
 
 def test_complete_verified_batch_is_atomic_and_records_sanitized_receipt(tmp_path: Path):

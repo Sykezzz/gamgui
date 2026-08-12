@@ -36,6 +36,8 @@ from .models import (
     DEFAULT_COURSE_NAME_TEMPLATE,
     DashboardStatus,
     ExecutionBatch,
+    ExecutionBatchProgress,
+    ExecutionPhaseProgress,
     ExecutionProgress,
     ExecutionRun,
     GateState,
@@ -70,6 +72,38 @@ from .thresholds import evaluation_hash
 
 def default_component_data_root() -> Path:
     return app_data_dir() / "components" / "classroom-oneroster"
+
+
+_PROGRESS_PHASES = (
+    (
+        "classes",
+        "Class setup",
+        frozenset({
+            "course_create",
+            "course_update",
+            "course_activate",
+            "course_archive",
+        }),
+    ),
+    (
+        "teachers",
+        "Teacher access",
+        frozenset({"teacher_add", "teacher_remove", "owner_transfer"}),
+    ),
+    (
+        "students",
+        "Student roster",
+        frozenset({"student_add", "student_remove"}),
+    ),
+)
+
+
+def _progress_phase(kind: str) -> tuple[str, str]:
+    normalized = str(kind or "").casefold()
+    for key, label, kinds in _PROGRESS_PHASES:
+        if normalized in kinds:
+            return key, label
+    return "other", "Other checked work"
 
 
 class OneRosterStore:
@@ -1707,13 +1741,26 @@ class OneRosterStore:
             ).fetchone()
             if manifest is None:
                 raise KeyError("OneRoster import manifest not found.")
-            counts = conn.execute(
+            action_rows = conn.execute(
                 """
-                SELECT COUNT(*) AS total,
-                    COALESCE(SUM(status = 'pending'), 0) AS pending,
-                    COALESCE(SUM(status = 'applied'), 0) AS applied,
-                    COALESCE(SUM(status = 'failed'), 0) AS failed,
-                    COALESCE(SUM(status = 'skipped'), 0) AS skipped
+                SELECT kind, COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)
+                        AS pending,
+                    COALESCE(SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END), 0)
+                        AS applied,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+                        AS failed,
+                    COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0)
+                        AS skipped
+                FROM manifest_actions WHERE manifest_id = ? GROUP BY kind
+                """,
+                (manifest_id,),
+            ).fetchall()
+            course_counts = conn.execute(
+                """
+                SELECT COUNT(DISTINCT subject) AS total,
+                    COUNT(DISTINCT CASE WHEN status = 'pending' THEN subject END)
+                        AS pending
                 FROM manifest_actions WHERE manifest_id = ?
                 """,
                 (manifest_id,),
@@ -1731,6 +1778,7 @@ class OneRosterStore:
             batch_seconds = 0.0
             worker_count = 5
             adaptive_state = "normal"
+            latest_batch = None
             if run_row is not None:
                 batch_row = conn.execute(
                     """
@@ -1753,9 +1801,16 @@ class OneRosterStore:
                 batch_seconds = float(batch_row["seconds"] or 0)
                 latest_batch = conn.execute(
                     """
-                    SELECT worker_count, throttling_count, verification_attempts, status
-                    FROM execution_batches
-                    WHERE run_id = ? ORDER BY sequence_number DESC LIMIT 1
+                    SELECT b.*, COUNT(DISTINCT actions.subject) AS course_count
+                    FROM execution_batches AS b
+                    LEFT JOIN execution_batch_actions AS membership
+                        ON membership.batch_id = b.id
+                    LEFT JOIN manifest_actions AS actions
+                        ON actions.manifest_id = b.manifest_id
+                        AND actions.action_id = membership.action_id
+                    WHERE b.run_id = ?
+                    GROUP BY b.id
+                    ORDER BY b.sequence_number DESC LIMIT 1
                     """,
                     (run_row["id"],),
                 ).fetchone()
@@ -1769,12 +1824,53 @@ class OneRosterStore:
                         or str(latest_batch["status"]) == "failed"
                         else "normal"
                     )
-        assert counts is not None
-        total = int(counts["total"] or 0)
-        pending = int(counts["pending"] or 0)
-        applied = int(counts["applied"] or 0)
-        failed = int(counts["failed"] or 0)
-        skipped = int(counts["skipped"] or 0)
+        phase_totals: dict[str, dict[str, int | str]] = {
+            key: {
+                "key": key,
+                "label": label,
+                "total": 0,
+                "pending": 0,
+                "applied": 0,
+                "failed": 0,
+                "skipped": 0,
+            }
+            for key, label, _kinds in _PROGRESS_PHASES
+        }
+        for row in action_rows:
+            phase_key, phase_label = _progress_phase(str(row["kind"] or ""))
+            bucket = phase_totals.setdefault(
+                phase_key,
+                {
+                    "key": phase_key,
+                    "label": phase_label,
+                    "total": 0,
+                    "pending": 0,
+                    "applied": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+            )
+            for field_name in ("total", "pending", "applied", "failed", "skipped"):
+                bucket[field_name] = int(bucket[field_name]) + int(row[field_name] or 0)
+        phases = tuple(
+            ExecutionPhaseProgress(
+                key=str(bucket["key"]),
+                label=str(bucket["label"]),
+                total=int(bucket["total"]),
+                finished=(int(bucket["total"]) - int(bucket["pending"])),
+                applied=int(bucket["applied"]),
+                failed=int(bucket["failed"]),
+                skipped=int(bucket["skipped"]),
+                pending=int(bucket["pending"]),
+            )
+            for bucket in phase_totals.values()
+            if int(bucket["total"]) > 0
+        )
+        total = sum(phase.total for phase in phases)
+        pending = sum(phase.pending for phase in phases)
+        applied = sum(phase.applied for phase in phases)
+        failed = sum(phase.failed for phase in phases)
+        skipped = sum(phase.skipped for phase in phases)
         complete = applied + failed + skipped
         run = _execution_run_from_row(run_row) if run_row is not None else None
         elapsed = max(0.0, timestamp - run.started_at) if run else 0.0
@@ -1783,9 +1879,41 @@ class OneRosterStore:
             if batch_actions and batch_seconds > 0
             else (complete * 60.0 / elapsed if complete and elapsed > 0 else 0.0)
         )
-        eta = (pending * 60.0 / rate) if pending and rate > 0 else None
+        eta = (
+            pending * 60.0 / rate
+            if completed_batches >= 2 and pending and rate > 0
+            else None
+        )
         effective_batch_size = max(1, min(int(batch_size or 50), 50))
         estimated_batches = (total + effective_batch_size - 1) // effective_batch_size
+        heartbeat_age = max(0.0, timestamp - run.last_heartbeat_at) if run else 0.0
+        heartbeat_active = bool(
+            run and run.status in {"running", "pause_requested"}
+        )
+        heartbeat_stale = bool(heartbeat_active and heartbeat_age >= 180.0)
+        heartbeat_delayed = bool(heartbeat_active and heartbeat_age >= 30.0)
+        batch_progress = None
+        if latest_batch is not None:
+            phase_key, phase_label = _progress_phase(str(latest_batch["phase"] or ""))
+            batch_progress = ExecutionBatchProgress(
+                sequence_number=int(latest_batch["sequence_number"] or 0),
+                phase=str(latest_batch["phase"] or ""),
+                phase_key=phase_key,
+                phase_label=phase_label,
+                action_count=int(latest_batch["action_count"] or 0),
+                course_count=int(latest_batch["course_count"] or 0),
+                status=str(latest_batch["status"] or ""),
+                apply_seconds=float(latest_batch["apply_seconds"] or 0),
+                verification_seconds=float(
+                    latest_batch["verification_seconds"] or 0
+                ),
+                persistence_seconds=float(latest_batch["persistence_seconds"] or 0),
+                verification_attempts=int(
+                    latest_batch["verification_attempts"] or 0
+                ),
+                worker_count=int(latest_batch["worker_count"] or 5),
+                throttling_count=int(latest_batch["throttling_count"] or 0),
+            )
         return ExecutionProgress(
             run=run,
             total=total,
@@ -1797,18 +1925,22 @@ class OneRosterStore:
             completed_batches=completed_batches,
             total_batches_estimate=estimated_batches,
             elapsed_seconds=elapsed,
-            heartbeat_age_seconds=(
-                max(0.0, timestamp - run.last_heartbeat_at) if run else 0.0
-            ),
-            heartbeat_stale=bool(
-                run
-                and run.status in {"running", "pause_requested"}
-                and timestamp - run.last_heartbeat_at > 30.0
-            ),
+            heartbeat_age_seconds=heartbeat_age,
+            heartbeat_stale=heartbeat_stale,
             actions_per_minute=rate,
             eta_seconds=eta,
             worker_count=worker_count,
             adaptive_state=adaptive_state,
+            heartbeat_delayed=heartbeat_delayed,
+            heartbeat_state=(
+                "stale" if heartbeat_stale else "delayed" if heartbeat_delayed else "current"
+            ),
+            course_count=int(course_counts["total"] or 0) if course_counts else 0,
+            remaining_course_count=(
+                int(course_counts["pending"] or 0) if course_counts else 0
+            ),
+            phases=phases,
+            current_batch=batch_progress,
         )
 
     def mark_running_interrupted(self) -> int:

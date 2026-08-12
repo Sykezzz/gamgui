@@ -539,6 +539,39 @@ class ExecutionBatch:
 
 
 @dataclass(frozen=True)
+class ExecutionPhaseProgress:
+    """Sanitized progress for one operator-facing group of action kinds."""
+
+    key: str
+    label: str
+    total: int
+    finished: int
+    applied: int
+    failed: int
+    skipped: int
+    pending: int
+
+
+@dataclass(frozen=True)
+class ExecutionBatchProgress:
+    """Sanitized receipt for the newest immutable execution batch."""
+
+    sequence_number: int
+    phase: str
+    phase_key: str
+    phase_label: str
+    action_count: int
+    course_count: int
+    status: str
+    apply_seconds: float = 0.0
+    verification_seconds: float = 0.0
+    persistence_seconds: float = 0.0
+    verification_attempts: int = 0
+    worker_count: int = 5
+    throttling_count: int = 0
+
+
+@dataclass(frozen=True)
 class ExecutionProgress:
     """SQL-derived progress projection; manifest actions remain authoritative."""
 
@@ -558,6 +591,12 @@ class ExecutionProgress:
     eta_seconds: Optional[float]
     worker_count: int = 5
     adaptive_state: str = "normal"
+    heartbeat_delayed: bool = False
+    heartbeat_state: str = "current"
+    course_count: int = 0
+    remaining_course_count: int = 0
+    phases: Tuple[ExecutionPhaseProgress, ...] = ()
+    current_batch: Optional[ExecutionBatchProgress] = None
 
 
 @dataclass(frozen=True)
