@@ -231,7 +231,7 @@ if ($Action -eq "Enroll") {
         $certificate = $existing[0]
     }
     $CertificateSha256 = Get-CertificateSha256 $certificate
-    if ($TrustLocalCertificate -and -not $CiEphemeralCertificate) { Add-Trust $certificate }
+    if ($TrustLocalCertificate) { Add-Trust $certificate }
     [ordered]@{
         certificate_sha256 = $CertificateSha256
         store_thumbprint = $certificate.Thumbprint.ToLowerInvariant()
