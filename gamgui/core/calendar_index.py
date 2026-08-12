@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .paths import app_data_dir
+from .windows_acl import restrict_owner_only
 
 
 def default_index_path() -> Path:
@@ -60,13 +61,13 @@ class CalendarIndex:
 
         Mirrors core/secrets/ephemeral.py: dir 0700, files 0600 (incl. the -wal/-shm siblings)."""
         try:
-            os.chmod(self.path.parent, 0o700)
+            restrict_owner_only(self.path.parent, directory=True)
         except OSError:
             pass
         for p in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
             try:
                 if p.exists():
-                    os.chmod(p, 0o600)
+                    restrict_owner_only(p, directory=False)
             except OSError:
                 pass
 

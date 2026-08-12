@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .paths import app_data_dir
+from .windows_acl import restrict_owner_only
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # gam argument keys whose following value must be masked in the log.
@@ -271,7 +272,7 @@ class AuditIndex:
         ):
             try:
                 if path.exists():
-                    os.chmod(path, 0o600)
+                    restrict_owner_only(path, directory=False)
             except OSError:
                 pass
 
@@ -611,7 +612,7 @@ class AuditLog:
         self._lock = threading.Lock()
         try:
             if self.path.exists():
-                os.chmod(self.path, 0o600)
+                restrict_owner_only(self.path, directory=False)
         except OSError:
             pass
 
@@ -654,7 +655,7 @@ class AuditLog:
             finally:
                 os.close(fd)
             try:
-                os.chmod(self.path, 0o600)
+                restrict_owner_only(self.path, directory=False)
             except OSError:
                 pass
         return entry

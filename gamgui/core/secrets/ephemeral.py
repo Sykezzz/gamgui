@@ -20,9 +20,11 @@ owning process (recorded in a ``.pid`` file) is gone — or that have outlived a
 from __future__ import annotations
 
 import atexit
+import ctypes
 import hashlib
 import os
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -33,6 +35,7 @@ from keyring.errors import KeyringError
 
 from ..gam.errors import TokenPersistenceError
 from ..paths import app_data_dir
+from ..windows_acl import restrict_owner_only
 from .vault import FILENAMES, SecretsVault
 
 _REQUIRED = ("oauth2service", "oauth2")
@@ -60,7 +63,7 @@ def app_runtime_dir() -> Path:
     """Private base directory for transient runtime files (created ``0700``)."""
     base = app_data_dir() / "run"
     base.mkdir(parents=True, exist_ok=True)
-    os.chmod(base, 0o700)
+    restrict_owner_only(base, directory=True)
     return base
 
 
@@ -70,7 +73,7 @@ def private_runtime_spool_dir(base_dir: Optional[Path] = None) -> Path:
     base = Path(base_dir) if base_dir else app_runtime_dir()
     spool = base / "spool"
     spool.mkdir(parents=True, exist_ok=True)
-    os.chmod(spool, 0o700)
+    restrict_owner_only(spool, directory=True)
     return spool
 
 
@@ -121,6 +124,27 @@ def _owner_pid(child: Path) -> Optional[int]:
 
 
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = ctypes.c_uint32()
+            kernel32.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            kernel32.GetExitCodeProcess.restype = ctypes.c_int
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -230,7 +254,7 @@ class EphemeralConfig:
         # never run __exit__, which would strand a half-populated dir on disk (and in _LIVE) for the
         # rest of the process lifetime.
         try:
-            os.chmod(self.path, 0o700)
+            restrict_owner_only(self.path, directory=True)
             # Register before writing anything, so the atexit backstop can't miss a populated dir.
             _LIVE.add(_key(self.path))
             self._write_secret(self.path / _PID_FILENAME, str(os.getpid()))
@@ -279,7 +303,7 @@ class EphemeralConfig:
             os.write(fd, value.encode("utf-8"))
         finally:
             os.close(fd)
-        os.chmod(target, 0o600)
+        restrict_owner_only(target, directory=False)
 
     def _write_back_refreshed_token(self) -> None:
         """GAM rewrites oauth2.txt when it refreshes the access token; persist the change."""

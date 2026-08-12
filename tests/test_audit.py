@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from gamgui.core.audit import AuditLog, redact_argv
+from tests.windows_acl_assertions import assert_current_user_only_acl
 
 
 def test_redact_masks_password_value():
@@ -38,5 +40,8 @@ def test_record_and_tail(tmp_path):
 def test_audit_file_permissions_are_600(tmp_path):
     path = tmp_path / "audit.jsonl"
     AuditLog(path).record("noop", ok=True)
-    mode = os.stat(path).st_mode & 0o777
-    assert mode == 0o600
+    if sys.platform == "win32":
+        assert_current_user_only_acl(path)
+    else:
+        mode = os.stat(path).st_mode & 0o777
+        assert mode == 0o600
