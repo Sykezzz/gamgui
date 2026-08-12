@@ -63,7 +63,10 @@ def _ready_service(root: Path) -> tuple[OneRosterService, str]:
 async def _timed_plan(root: Path, *, serialize_snapshots: bool):
     service, import_id = _ready_service(root)
     connector = _DelayedLiveSnapshots(
-        delay=0.25,
+        # Keep the deterministic network signal materially above hosted-runner
+        # scheduling and filesystem jitter. The 30% gate remains unchanged; this
+        # makes it measure concurrent snapshots instead of transient CPU noise.
+        delay=0.5,
         serialize_snapshots=serialize_snapshots,
     )
     started = time.perf_counter()
