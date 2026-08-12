@@ -74,6 +74,7 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "TrustedPublisher" in script and "CurrentUser\\Root" in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script
     assert "Get-AuthenticodeSignature" in script
+    assert '"RemoveTrust"' in script
 
 
 def _windows_bundle(path: Path, content: bytes, *, source_sha: str = SHA) -> Path:

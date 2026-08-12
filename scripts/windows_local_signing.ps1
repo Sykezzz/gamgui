@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Enroll", "Inspect", "Sign", "Verify", "SignFile", "VerifyFile", "Remove")]
+    [ValidateSet("Enroll", "Inspect", "Sign", "Verify", "SignFile", "VerifyFile", "Remove", "RemoveTrust")]
     [string]$Action,
     [string]$Path = "",
     [string]$CertificateSha256 = "",
@@ -130,7 +130,8 @@ function Assert-DetachedManifest([System.IO.DirectoryInfo]$Root, [System.Securit
 if ($Action -eq "Enroll") {
     $existing = @(Get-LocalCertificates "My")
     if ($existing.Count -gt 1) { throw "More than one GamGUI Local certificate exists; refusing silent rotation." }
-    if ($existing.Count -eq 0) {
+    $created = $existing.Count -eq 0
+    if ($created) {
         $certificate = New-SelfSignedCertificate `
             -Subject $subject `
             -CertStoreLocation "Cert:\CurrentUser\My" `
@@ -151,6 +152,7 @@ if ($Action -eq "Enroll") {
         certificate_sha256 = $CertificateSha256
         store_thumbprint = $certificate.Thumbprint.ToLowerInvariant()
         trust_required = -not (Test-Trusted $certificate)
+        created = $created
         ci_ephemeral = [bool]$CiEphemeralCertificate
     } | ConvertTo-Json -Compress
     exit 0
@@ -159,6 +161,14 @@ if ($Action -eq "Enroll") {
 if (-not ($CertificateSha256 -match '^[0-9a-fA-F]{64}$')) { throw "A pinned certificate SHA-256 is required." }
 if ($Action -eq "Remove") {
     foreach ($store in @("My", "Root", "TrustedPublisher")) {
+        foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
+            Remove-Item -LiteralPath $match.PSPath -Force
+        }
+    }
+    exit 0
+}
+if ($Action -eq "RemoveTrust") {
+    foreach ($store in @("Root", "TrustedPublisher")) {
         foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
             Remove-Item -LiteralPath $match.PSPath -Force
         }
