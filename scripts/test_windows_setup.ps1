@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SetupPath,
     [Parameter(Mandatory = $true)]
-    [string]$ExpectedSha
+    [string]$ExpectedSha,
+    [switch]$SkipTamperedBootstrap
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,18 +106,20 @@ Invoke-SetupFailure @(
     "/PINNEDSIGNERSHA256=0000000000000000000000000000000000000000000000000000000000000000"
 )
 
-$tamperSigner = New-TrustedIdentity
-try {
-    $tamperedBootstrap = Join-Path $repoRoot "dist\bootstrap-core"
-    Add-Content -LiteralPath (Join-Path $tamperedBootstrap "licenses\GamGUI-LICENSE.txt") -Value "tamper-test"
-    $tampered = Start-Process -FilePath powershell.exe -ArgumentList @(
-        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-        (Join-Path $tamperedBootstrap "install.ps1"), "-NoShortcuts", "-TrustMode", "Pretrusted",
-        "-PretrustedSignerSha256", $tamperSigner
-    ) -Wait -PassThru -WindowStyle Hidden
-    if ($tampered.ExitCode -eq 0 -or (Test-Path -LiteralPath $current)) { throw "A tampered bootstrap was accepted." }
-} finally {
-    Remove-IdentityIfPresent $tamperSigner
+if (-not $SkipTamperedBootstrap) {
+    $tamperSigner = New-TrustedIdentity
+    try {
+        $tamperedBootstrap = Join-Path $repoRoot "dist\bootstrap-core"
+        Add-Content -LiteralPath (Join-Path $tamperedBootstrap "licenses\GamGUI-LICENSE.txt") -Value "tamper-test"
+        $tampered = Start-Process -FilePath powershell.exe -ArgumentList @(
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+            (Join-Path $tamperedBootstrap "install.ps1"), "-NoShortcuts", "-TrustMode", "Pretrusted",
+            "-PretrustedSignerSha256", $tamperSigner
+        ) -Wait -PassThru -WindowStyle Hidden
+        if ($tampered.ExitCode -eq 0 -or (Test-Path -LiteralPath $current)) { throw "A tampered bootstrap was accepted." }
+    } finally {
+        Remove-IdentityIfPresent $tamperSigner
+    }
 }
 
 Exercise-Profile "core"
