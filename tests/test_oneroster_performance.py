@@ -122,6 +122,7 @@ def _prepared_execution_batch(root: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)
 async def test_large_roster_planning_gate_improves_median_without_plan_drift(
     tmp_path: Path,
 ):
