@@ -176,12 +176,19 @@ def test_windows_installer_uses_shared_journal_and_exact_health_marker(tmp_path,
             )
         return _Process()
 
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
     installer = LocalUpdateInstaller(
         store=store,
         root=update_root,
         data_root=data_root,
         run=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
         popen=popen,
+        sleep=sleep,
+        clock=lambda: now[0],
     )
 
     assert installer.install(SHA, pending, current, health_timeout=0.1)
