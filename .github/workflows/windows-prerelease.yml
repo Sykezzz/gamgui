@@ -218,3 +218,52 @@ jobs:
             release-assets/GamGUI-Setup-0.0.1-windows-x86_64.exe.sha256 \
             release-assets/windows-bootstrap-manifest.json \
             release-assets/windows-bootstrap-manifest.json.sha256
+
+  verify-hosted:
+    name: download and install the hosted prerelease
+    needs: publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Download the public GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path hosted-release | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --dir hosted-release `
+            --pattern "GamGUI-Setup-0.0.1-windows-x86_64.exe" `
+            --pattern "GamGUI-Setup-0.0.1-windows-x86_64.exe.sha256" `
+            --pattern "windows-bootstrap-manifest.json" `
+            --pattern "windows-bootstrap-manifest.json.sha256"
+      - name: Recheck hosted bytes and unsigned boundary
+        shell: pwsh
+        run: |
+          $root = "hosted-release"
+          $setup = Join-Path $root "GamGUI-Setup-0.0.1-windows-x86_64.exe"
+          $manifestPath = Join-Path $root "windows-bootstrap-manifest.json"
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $expectedSetup = (Get-Content -Raw -LiteralPath "$setup.sha256").Split()[0]
+          $actualSetup = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedManifest = (Get-Content -Raw -LiteralPath "$manifestPath.sha256").Split()[0]
+          $actualManifest = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSetup -ne $expectedSetup -or $actualSetup -ne $manifest.setup.sha256) { throw "Hosted Setup checksum mismatch." }
+          if ($actualManifest -ne $expectedManifest) { throw "Hosted manifest checksum mismatch." }
+          if ($manifest.source_sha -ne "${{ inputs.sha }}") { throw "Hosted manifest SHA mismatch." }
+          if ($manifest.setup.signing_status -ne "NotSigned") { throw "Hosted manifest crossed the unsigned boundary." }
+          if ((Get-AuthenticodeSignature -LiteralPath $setup).Status -ne "NotSigned") { throw "Hosted Setup signing status changed." }
+      - name: Repeat packaged installation verification from hosted bytes
+        shell: pwsh
+        run: |
+          .\scripts\test_windows_setup.ps1 `
+            -SetupPath "hosted-release\GamGUI-Setup-0.0.1-windows-x86_64.exe" `
+            -ExpectedSha "${{ inputs.sha }}" `
+            -SkipTamperedBootstrap
