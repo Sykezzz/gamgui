@@ -57,7 +57,11 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
 }
 
 function Invoke-SetupFailure([string[]]$Arguments) {
-    $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    if (-not $process.WaitForExit(30000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        throw "A rejected Setup invocation did not fail closed within 30 seconds."
+    }
     if ($process.ExitCode -eq 0) { throw "An unsafe Setup invocation unexpectedly succeeded." }
     if (Test-Path -LiteralPath $current) { throw "A rejected Setup invocation created an installation." }
 }
@@ -129,7 +133,9 @@ function Exercise-Profile([string]$Profile) {
 }
 
 if (Test-Path -LiteralPath $current) { throw "The disposable runner was not clean before Setup verification." }
+Write-Host "Setup exercise: rejecting missing signer input"
 Invoke-SetupFailure @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/PROFILE=core")
+Write-Host "Setup exercise: rejecting untrusted signer input"
 Invoke-SetupFailure @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/PROFILE=core",
     "/PINNEDSIGNERSHA256=0000000000000000000000000000000000000000000000000000000000000000"

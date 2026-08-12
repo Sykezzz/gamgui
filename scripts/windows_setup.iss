@@ -176,6 +176,34 @@ begin
     end;
 end;
 
+function SilentSignerIsAvailable: Boolean;
+var
+  Script, TrustChecks: String;
+  ResultCode: Integer;
+begin
+  TrustChecks := '';
+  if not CiEphemeralSigner then
+    TrustChecks :=
+      'if ((-not (Find-Certificate ''Cert:\CurrentUser\Root'' $false)) -or ' +
+      '(-not (Find-Certificate ''Cert:\CurrentUser\TrustedPublisher'' $false))) { exit 1 };';
+  Script :=
+    '$ErrorActionPreference=''Stop'';' +
+    '$expected=''' + Lowercase(SilentSigner) + ''';' +
+    '$algorithm=[System.Security.Cryptography.HashAlgorithmName]::SHA256;' +
+    'function Find-Certificate([string]$store,[bool]$privateKey) {' +
+    '$matches=@(Get-ChildItem -LiteralPath $store | Where-Object {' +
+    '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected) -and ' +
+    '((-not $privateKey) -or $_.HasPrivateKey)' +
+    '}); return $matches.Count -eq 1 };' +
+    'if (-not (Find-Certificate ''Cert:\CurrentUser\My'' $true)) { exit 1 };' +
+    TrustChecks + 'exit 0';
+  Result := Exec(
+    'powershell.exe',
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Script),
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode
+  ) and (ResultCode = 0);
+end;
+
 procedure OpenInstalledClick(Sender: TObject);
 var
   ErrorCode: Integer;
@@ -422,6 +450,12 @@ begin
        (not IsHex64(SilentSigner)) then
     begin
       Log('Refusing silent setup because /PROFILE or /PINNEDSIGNERSHA256 is invalid. Silent setup never creates or trusts a certificate.');
+      Result := False;
+      Exit;
+    end;
+    if not SilentSignerIsAvailable then
+    begin
+      Log('Refusing silent setup because the pinned private-key certificate is missing or is not trusted in every required current-user store.');
       Result := False;
       Exit;
     end;
