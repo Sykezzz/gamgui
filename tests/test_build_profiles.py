@@ -110,9 +110,12 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "desktopicon" in wizard and "Flags: unchecked" in wizard
     assert "Launch GamGUI" in wizard and "skipifsilent" in wizard
     assert "GamGUI is already installed" in wizard
+    assert "if DirExists(FixedCurrent)" in wizard
+    assert "Refusing silent setup because GamGUI is already installed" in wizard
     assert "PrepareToInstall" in wizard
     assert "/PINNEDSIGNERSHA256" in wizard
     assert "Silent setup never creates or trusts a certificate" in wizard
+    assert "Refusing silent setup because /PROFILE or /PINNEDSIGNERSHA256 is invalid" in wizard
     assert "Google, GAM, Keychain, or tenant services" in wizard
     assert "setup-progress.json" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
