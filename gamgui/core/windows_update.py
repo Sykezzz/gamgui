@@ -27,6 +27,7 @@ from .paths import app_data_dir
 from .update_platform import bundle_executable
 
 WINDOWS_TOOLCHAIN_RELATIVE = Path("resources") / "updater" / "windows-toolchain.json"
+WINDOWS_SIGNING_SCRIPT_RELATIVE = Path("resources") / "updater" / "windows_local_signing.ps1"
 TOOLCHAIN_TIMEOUT_SECONDS = 30 * 60
 
 
@@ -45,6 +46,68 @@ def bundled_toolchain_archive_root() -> Optional[Path]:
         return None
     candidate = Path(frozen_root) / "resources" / "updater" / "toolchain"
     return candidate if candidate.is_dir() else None
+
+
+def default_windows_signing_script_path() -> Path:
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if frozen_root:
+        candidate = Path(frozen_root) / WINDOWS_SIGNING_SCRIPT_RELATIVE
+        if candidate.is_file():
+            return candidate
+    return Path(__file__).resolve().parents[2] / "scripts" / "windows_local_signing.ps1"
+
+
+def verify_windows_bundle(
+    bundle: Path,
+    certificate_sha256: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", certificate_sha256.lower()):
+        raise RuntimeError("The pinned Windows signing certificate is invalid.")
+    run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(default_windows_signing_script_path()),
+            "-Action",
+            "Verify",
+            "-Path",
+            str(Path(bundle)),
+            "-CertificateSha256",
+            certificate_sha256.lower(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+
+def verify_windows_file(
+    path: Path,
+    certificate_sha256: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", certificate_sha256.lower()):
+        raise RuntimeError("The pinned Windows signing certificate is invalid.")
+    run(
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(default_windows_signing_script_path()),
+            "-Action", "VerifyFile", "-Path", str(Path(path)),
+            "-CertificateSha256", certificate_sha256.lower(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=TOOLCHAIN_TIMEOUT_SECONDS,
+    )
 
 
 @dataclass(frozen=True)

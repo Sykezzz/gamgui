@@ -79,6 +79,7 @@ def test_cli_modes_are_parsed_without_rejecting_macos_arguments():
 
 
 def test_automatic_update_prompt_explains_restart_and_honors_choice(monkeypatch):
+    monkeypatch.setattr("gamgui.app.sys.platform", "darwin")
     calls = []
 
     def run(arguments, **options):
@@ -100,6 +101,7 @@ def test_automatic_update_prompt_explains_restart_and_honors_choice(monkeypatch)
 
 
 def test_automatic_update_prompt_defers_when_user_declines(monkeypatch):
+    monkeypatch.setattr("gamgui.app.sys.platform", "darwin")
     monkeypatch.setattr(
         "gamgui.app.subprocess.run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
@@ -302,6 +304,85 @@ def test_pending_update_hands_off_exact_staged_state(monkeypatch, tmp_path):
     assert options["close_fds"] is True
     assert options["pass_fds"] == (descriptor,)
     assert UpdateStateStore().load().activation_transaction_id == transaction
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows helper handoff")
+def test_windows_pending_update_hands_off_to_signed_detached_helper(
+    monkeypatch,
+    tmp_path,
+):
+    data_root = tmp_path / "data"
+    sha = "a" * 40
+    current = tmp_path / "Programs" / "GamGUI" / "current"
+    current.mkdir(parents=True)
+    (current / "GamGUI.exe").write_bytes(b"current")
+    pending = data_root / "updates" / "pending" / sha / "core" / "GamGUI"
+    pending.mkdir(parents=True)
+    (pending / "GamGUI.exe").write_bytes(b"candidate")
+    helper = data_root / "updater" / "GamGUIUpdater.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"helper")
+    artifact = ComponentArtifactId(
+        source_sha=sha,
+        version="0.0.1",
+        profile="core",
+        component_set_digest="b" * 64,
+        architecture="x86_64",
+        minimum_macos_version="10.0",
+        packaging_revision="2-windows-local",
+        platform="windows",
+        bundle_format="onedir",
+        signer_thumbprint="c" * 64,
+        toolchain_manifest_digest="d" * 64,
+        artifact_sha256="e" * 64,
+    )
+    monkeypatch.setenv("GAMGUI_APP_DATA_DIR", str(data_root))
+    monkeypatch.setattr("gamgui.app.sys.platform", "win32")
+    monkeypatch.setattr("gamgui.app.installed_app_path", lambda: current)
+    monkeypatch.setattr("gamgui.app._activation_must_defer", lambda: False)
+    monkeypatch.setattr("gamgui.app._confirm_automatic_update", lambda _state: True)
+    verified = []
+    monkeypatch.setattr(
+        "gamgui.core.windows_update.verify_windows_file",
+        lambda path, thumbprint: verified.append((path, thumbprint)),
+    )
+
+    class Mutex:
+        handle = 1234
+        name = "Local\\GamGUIUpdater-" + ("1" * 24)
+
+        def close(self):
+            self.handle = 0
+
+    monkeypatch.setattr(
+        "gamgui.app.WindowsNamedMutex.acquire",
+        lambda _name: Mutex(),
+    )
+    UpdateStateStore().save(
+        UpdateState(
+            candidate_sha=sha,
+            pending_app=str(pending),
+            canary_result="passed",
+            required_check_evidence=["update-ready"],
+            activation_kind=ACTIVATION_APP_UPDATE,
+            candidate_artifact=artifact,
+            local_signer_thumbprint="c" * 64,
+            windows_installation_root=str(current.parent),
+        )
+    )
+    launched = []
+    monkeypatch.setattr(
+        "gamgui.app.subprocess.Popen",
+        lambda argv, **kwargs: launched.append((argv, kwargs)),
+    )
+
+    assert _handoff_pending_update()
+    arguments, options = launched[0]
+    assert arguments[0] == str(helper)
+    assert "--activation-mutex-handle" in arguments
+    assert options["close_fds"] is True
+    assert options["startupinfo"].lpAttributeList == {"handle_list": [1234]}
+    assert verified == [(helper, "c" * 64)]
 
 
 def test_corrupt_existing_update_state_enters_local_recovery_probe(

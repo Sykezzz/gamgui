@@ -107,6 +107,9 @@ datas.append((str(profile_metadata), "resources/components"))
 toolchain_manifest = Path("gamgui/resources/updater/windows-toolchain.json")
 if toolchain_manifest.is_file():
     datas.append((str(toolchain_manifest), "resources/updater"))
+windows_signing_script = Path("scripts/windows_local_signing.ps1")
+if windows_signing_script.is_file():
+    datas.append((str(windows_signing_script), "resources/updater"))
 toolchain_bundle_dir = Path(os.environ.get("GAMGUI_TOOLCHAIN_BUNDLE_DIR", ""))
 if str(toolchain_bundle_dir) and toolchain_bundle_dir.is_dir():
     for archive in sorted(toolchain_bundle_dir.glob("*.zip")):

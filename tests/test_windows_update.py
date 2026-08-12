@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from gamgui.core.updater import UpdateCandidate
+from gamgui.core.components import CORE_PROFILE, build_profile_payload, verify_bundle_artifact, write_artifact_sidecar
+from gamgui.core.update_platform import WindowsNamedMutex, windows_mutex_name
+from gamgui.core.updater import (
+    ACTIVATION_APP_UPDATE,
+    LocalUpdateInstaller,
+    UpdateCandidate,
+    UpdateState,
+    UpdateStateStore,
+    _windows_directory_exchange,
+)
 from gamgui.core.windows_update import WindowsLocalUpdateBuilder, WindowsToolchain
 
 SHA = "a" * 40
@@ -65,3 +74,157 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "TrustedPublisher" in script and "CurrentUser\\Root" in script
     assert "SignedCms" in script and "bundle-manifest.p7s" in script
     assert "Get-AuthenticodeSignature" in script
+
+
+def _windows_bundle(path: Path, content: bytes, *, source_sha: str = SHA) -> Path:
+    path.mkdir(parents=True)
+    (path / "GamGUI.exe").write_bytes(content)
+    metadata = path / "_internal" / "resources" / "components" / "profile.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps(
+            build_profile_payload(
+                CORE_PROFILE,
+                source_sha=source_sha,
+                version="1",
+                architecture="x86_64",
+                minimum_macos_version="10.0",
+                packaging_revision="2-windows-local",
+                platform_name="windows",
+                bundle_format="onedir",
+                signer_thumbprint="c" * 64,
+                toolchain_manifest_digest="d" * 64,
+            )
+        ),
+        encoding="utf-8",
+    )
+    write_artifact_sidecar(
+        path,
+        signing_channel="local",
+        signing_authority="GamGUI Local",
+    )
+    return path
+
+
+class _Process:
+    def __init__(self):
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def test_windows_installer_uses_shared_journal_and_exact_health_marker(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    update_root = data_root / "updates"
+    install_root = tmp_path / "Programs" / "GamGUI"
+    current = _windows_bundle(install_root / "current", b"old")
+    pending = _windows_bundle(update_root / "pending" / SHA / "core" / "GamGUI", b"new")
+    candidate = verify_bundle_artifact(pending).artifact
+    installed = verify_bundle_artifact(current).artifact
+    store = UpdateStateStore(update_root / "state.json")
+    store.save(
+        UpdateState(
+            installed_sha=SHA,
+            candidate_sha=SHA,
+            pending_app=str(pending),
+            installed_profile=CORE_PROFILE,
+            desired_profile=CORE_PROFILE,
+            installed_artifact=installed,
+            candidate_artifact=candidate,
+            activation_kind=ACTIVATION_APP_UPDATE,
+            required_check_evidence=["update-ready"],
+            installed_signing_channel="local",
+            candidate_signing_channel="local",
+            installed_signing_authority="GamGUI Local",
+            candidate_signing_authority="GamGUI Local",
+            local_signer_thumbprint="c" * 64,
+            windows_installation_root=str(install_root),
+        )
+    )
+    verified: list[Path] = []
+    monkeypatch.setattr(
+        "gamgui.core.windows_update.verify_windows_bundle",
+        lambda bundle, _thumbprint, **_kwargs: verified.append(Path(bundle)),
+    )
+
+    def popen(_argv, env):
+        marker = env.get("GAMGUI_UPDATE_HEALTH_MARKER")
+        if marker:
+            Path(marker).parent.mkdir(parents=True, exist_ok=True)
+            Path(marker).write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "transaction_id": env["GAMGUI_ACTIVATION_TRANSACTION_ID"],
+                        "sha": env["GAMGUI_INSTALLED_SHA"],
+                        "profile": candidate.profile,
+                        "component_set_digest": candidate.component_set_digest,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return _Process()
+
+    installer = LocalUpdateInstaller(
+        store=store,
+        root=update_root,
+        data_root=data_root,
+        run=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+        popen=popen,
+    )
+
+    assert installer.install(SHA, pending, current, health_timeout=0.1)
+    assert (current / "GamGUI.exe").read_bytes() == b"new"
+    final = store.load()
+    assert final.installed_platform == "windows"
+    assert final.windows_installation_root == str(install_root)
+    assert final.candidate_sha == "" and final.pending_bundle == ""
+    assert verified
+
+
+def test_windows_directory_exchange_retries_a_locked_current_directory(tmp_path, monkeypatch):
+    left = tmp_path / "current"
+    right = tmp_path / ".current.incoming"
+    left.mkdir()
+    right.mkdir()
+    (left / "value").write_text("old", encoding="utf-8")
+    (right / "value").write_text("new", encoding="utf-8")
+    original = __import__("os").replace
+    failures = 2
+
+    def replace(source, destination):
+        nonlocal failures
+        if Path(source) == left and failures:
+            failures -= 1
+            raise PermissionError("locked")
+        return original(source, destination)
+
+    monkeypatch.setattr("gamgui.core.updater.os.replace", replace)
+    _windows_directory_exchange(left, right, sleep=lambda _seconds: None)
+
+    assert (left / "value").read_text(encoding="utf-8") == "new"
+    assert (right / "value").read_text(encoding="utf-8") == "old"
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Windows mutex contract")
+def test_windows_named_mutex_excludes_a_second_updater(tmp_path):
+    name = windows_mutex_name(tmp_path)
+    first = WindowsNamedMutex.acquire(name)
+    assert first is not None
+    try:
+        assert WindowsNamedMutex.acquire(name) is None
+    finally:
+        first.close()
+    second = WindowsNamedMutex.acquire(name)
+    assert second is not None
+    second.close()

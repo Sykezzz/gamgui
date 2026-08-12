@@ -114,7 +114,13 @@ class WindowsNamedMutex:
     def acquire(cls, name: str) -> Optional["WindowsNamedMutex"]:
         if sys.platform != "win32" or not re.fullmatch(r"Local\\GamGUIUpdater-[0-9a-f]{24}", name):
             return None
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.SetHandleInformation.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+        kernel32.SetHandleInformation.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
         handle = kernel32.CreateMutexW(None, True, name)
         if not handle:
             raise OSError(ctypes.get_last_error(), "Could not create updater mutex.")
@@ -130,16 +136,28 @@ class WindowsNamedMutex:
     def adopt(cls, handle: int, name: str) -> "WindowsNamedMutex":
         if sys.platform != "win32" or int(handle) <= 0:
             raise ValueError("The updater mutex handle is invalid.")
-        mutex = cls(int(handle), name, owned=True)
+        mutex = cls(int(handle), name, owned=False)
         if not re.fullmatch(r"Local\\GamGUIUpdater-[0-9a-f]{24}", name):
             mutex.close()
             raise ValueError("The updater mutex name is invalid.")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        result = kernel32.WaitForSingleObject(mutex.handle, 60_000)
+        if result not in {cls.WAIT_OBJECT_0, cls.WAIT_ABANDONED}:
+            mutex.close()
+            raise TimeoutError("The updater mutex handoff timed out.")
+        mutex.owned = True
         return mutex
 
     def close(self) -> None:
         if not self.handle:
             return
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
         if self.owned:
             kernel32.ReleaseMutex(self.handle)
         kernel32.CloseHandle(self.handle)

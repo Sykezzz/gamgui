@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Enroll", "Inspect", "Sign", "Verify", "Remove")]
+    [ValidateSet("Enroll", "Inspect", "Sign", "Verify", "SignFile", "VerifyFile", "Remove")]
     [string]$Action,
     [string]$Path = "",
     [string]$CertificateSha256 = "",
@@ -157,14 +157,6 @@ if ($Action -eq "Enroll") {
 }
 
 if (-not ($CertificateSha256 -match '^[0-9a-fA-F]{64}$')) { throw "A pinned certificate SHA-256 is required." }
-$certificate = Find-LocalCertificate ($Action -in @("Inspect", "Sign"))
-
-if ($Action -eq "Inspect") {
-    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
-    [ordered]@{ certificate_sha256 = Get-CertificateSha256 $certificate; store_thumbprint = $certificate.Thumbprint.ToLowerInvariant(); trusted = $true } | ConvertTo-Json -Compress
-    exit 0
-}
-
 if ($Action -eq "Remove") {
     foreach ($store in @("My", "Root", "TrustedPublisher")) {
         foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
@@ -173,9 +165,32 @@ if ($Action -eq "Remove") {
     }
     exit 0
 }
+$certificate = Find-LocalCertificate ($Action -in @("Inspect", "Sign", "SignFile"))
+
+if ($Action -eq "Inspect") {
+    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+    [ordered]@{ certificate_sha256 = Get-CertificateSha256 $certificate; store_thumbprint = $certificate.Thumbprint.ToLowerInvariant(); trusted = $true } | ConvertTo-Json -Compress
+    exit 0
+}
 
 if (-not $Path) { throw "A Windows application bundle path is required." }
-$root = Get-Item -LiteralPath $Path
+$target = Get-Item -LiteralPath $Path
+if ($Action -eq "SignFile") {
+    if ($target.PSIsContainer) { throw "The standalone updater helper path is not a file." }
+    if (-not (Test-Trusted $certificate)) { throw "The pinned GamGUI Local certificate is not trusted for this user." }
+    $result = Set-AuthenticodeSignature -LiteralPath $target.FullName -Certificate $certificate -HashAlgorithm SHA256
+    if ($result.Status -ne "Valid") { throw "Authenticode signing failed for the updater helper: $($result.Status)" }
+    exit 0
+}
+if ($Action -eq "VerifyFile") {
+    if ($target.PSIsContainer -or -not (Test-Trusted $certificate)) { throw "The standalone updater helper trust check failed." }
+    $signature = Get-AuthenticodeSignature -LiteralPath $target.FullName
+    if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate -or (Get-CertificateSha256 $signature.SignerCertificate) -ne $CertificateSha256.ToLowerInvariant()) {
+        throw "The standalone updater helper is unsigned or changed."
+    }
+    exit 0
+}
+$root = $target
 if (-not $root.PSIsContainer -or -not (Test-Path -LiteralPath (Join-Path $root.FullName "GamGUI.exe") -PathType Leaf)) {
     throw "The Windows application bundle is incomplete."
 }

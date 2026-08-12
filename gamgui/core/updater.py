@@ -544,10 +544,8 @@ class UpdateStateStore:
         except (OSError, ValueError):
             return None
         if (
-            not pending.is_dir()
-            or not (pending / "Contents" / "MacOS" / "GamGUI").is_file()
-            or not current_app.is_dir()
-            or not (current_app / "Contents" / "MacOS" / "GamGUI").is_file()
+            not bundle_is_complete(pending, candidate.platform)
+            or not bundle_is_complete(current_app, candidate.platform)
         ):
             return None
         if candidate.artifact_sha256 or getattr(sys, "frozen", False):
@@ -569,6 +567,10 @@ class UpdateStateStore:
             "architecture",
             "minimum_macos_version",
             "packaging_revision",
+            "platform",
+            "bundle_format",
+            "signer_thumbprint",
+            "toolchain_manifest_digest",
         )
         if any(
             getattr(candidate, field, None)
@@ -1939,7 +1941,12 @@ class LocalUpdateInstaller:
         )
         database_snapshot = backup / "database"
         migration_copy = backup / "migration-copy"
-        backup_app = backup / "GamGUI.app"
+        backup_app = backup / (
+            "current"
+            if candidate_artifact is not None
+            and candidate_artifact.platform == "windows"
+            else "GamGUI.app"
+        )
         backup_sidecar = backup / "installed-artifact.json"
         candidate_sidecar = backup / "candidate-artifact.json"
         installed_sidecar = artifact_sidecar_path(current_app)
@@ -2002,7 +2009,10 @@ class LocalUpdateInstaller:
                 migration_copy.mkdir(parents=True)
             _owner_only_directory(migration_copy)
 
-            candidate_executable = pending_app / "Contents" / "MacOS" / "GamGUI"
+            candidate_executable = bundle_executable(
+                pending_app,
+                candidate_artifact.platform if candidate_artifact is not None else "",
+            )
             migration_env = os.environ.copy()
             migration_env[APP_DATA_ENV] = str(migration_copy)
             self._run(
@@ -2080,7 +2090,18 @@ class LocalUpdateInstaller:
             launch_env[ACTIVATION_PROBE_ENV] = "1"
             launch_env[ACTIVATION_CURRENT_APP_ENV] = str(current_app)
             process = self._popen(
-                [str(current_app / "Contents" / "MacOS" / "GamGUI")],
+                [
+                    str(
+                        bundle_executable(
+                            current_app,
+                            (
+                                candidate_artifact.platform
+                                if candidate_artifact is not None
+                                else ""
+                            ),
+                        )
+                    )
+                ],
                 env=launch_env,
             )
             expected_health = {
@@ -2147,6 +2168,11 @@ class LocalUpdateInstaller:
                 installed_components=state.installed_components,
             )
             state.installed_artifact = candidate_artifact
+            state.installed_platform = (
+                candidate_artifact.platform
+                if candidate_artifact is not None
+                else state.installed_platform
+            )
             state.installed_signing_channel = (
                 candidate_signing_channel or previous_signing_channel
             )
@@ -2155,7 +2181,9 @@ class LocalUpdateInstaller:
             )
             state.candidate_sha = ""
             state.pending_app = ""
+            state.pending_bundle = ""
             state.candidate_artifact = None
+            state.candidate_platform = ""
             state.candidate_signing_channel = ""
             state.candidate_signing_authority = ""
             state.candidate_migration_team_id = ""
@@ -2357,9 +2385,24 @@ class LocalUpdateInstaller:
             _remove_tree(restore_copy, expected_current.parent)
         shutil.copytree(backup_app, restore_copy, symlinks=True)
         _fsync_tree(restore_copy)
-        if not (
-            restore_copy / "Contents" / "MacOS" / "GamGUI"
-        ).is_file():
+        rollback_platform = (
+            state.installed_artifact.platform
+            if state.installed_artifact is not None
+            else state.installed_platform
+        )
+        if not rollback_platform:
+            rollback_platform = (
+                "macos"
+                if (restore_copy / "Contents" / "MacOS" / "GamGUI").is_file()
+                else "windows"
+                if (restore_copy / "GamGUI.exe").is_file()
+                else ""
+            )
+        if (
+            not restore_copy.is_dir()
+            or restore_copy.is_symlink()
+            or not bundle_executable(restore_copy, rollback_platform).is_file()
+        ):
             raise RuntimeError("The rollback application snapshot is incomplete.")
         if state.installed_artifact is not None and backup_sidecar.is_file():
             verify_bundle_artifact(
@@ -2374,6 +2417,14 @@ class LocalUpdateInstaller:
                 check=True,
                 text=True,
                 capture_output=True,
+            )
+        elif rollback_platform == "windows":
+            from .windows_update import verify_windows_bundle
+
+            verify_windows_bundle(
+                restore_copy,
+                state.local_signer_thumbprint,
+                run=self._run,
             )
         if expected_current.exists():
             _atomic_exchange(expected_current, restore_copy)
@@ -2415,7 +2466,7 @@ class LocalUpdateInstaller:
         incoming = Path(journal.incoming_app)
         previous = Path(journal.previous_app)
         backup = Path(journal.backup)
-        if current.suffix != ".app":
+        if current.suffix != ".app" and current.name.lower() != "current":
             raise ValueError("The activation journal application path is invalid.")
         _require_within(pending, self.root)
         _require_within(backup, self.root / "backups")
@@ -2468,9 +2519,20 @@ class LocalUpdateInstaller:
         if not activation_evidence_valid(state):
             raise ValueError("The candidate lacks required update evidence.")
         _require_within(pending_app, self.root)
-        if not pending_app.is_dir() or not (pending_app / "Contents" / "MacOS" / "GamGUI").is_file():
+        candidate_platform = state.candidate_artifact.platform
+        host_platform = runtime_platform()
+        if (
+            host_platform
+            and candidate_platform != host_platform
+            and (
+                getattr(sys, "frozen", False)
+                or current_app.suffix != ".app"
+            )
+        ):
+            raise ValueError("The staged application targets another operating system.")
+        if not bundle_is_complete(pending_app, candidate_platform):
             raise ValueError("The staged application bundle is incomplete.")
-        if current_app.suffix != ".app" or not current_app.is_dir():
+        if not bundle_is_complete(current_app, candidate_platform):
             raise ValueError("The installed application bundle could not be resolved.")
         if pending_app.is_symlink() or current_app.is_symlink():
             raise ValueError("Application bundle symlinks are not accepted.")
@@ -2589,6 +2651,22 @@ class LocalUpdateInstaller:
                     text=True,
                     capture_output=True,
                 )
+        elif envelope.artifact.platform == "windows":
+            if (
+                not state.local_signer_thumbprint
+                or envelope.artifact.signer_thumbprint
+                != state.local_signer_thumbprint
+            ):
+                raise ValueError(
+                    "The staged Windows signing certificate changed."
+                )
+            from .windows_update import verify_windows_bundle
+
+            verify_windows_bundle(
+                bundle,
+                state.local_signer_thumbprint,
+                run=self._run,
+            )
         return envelope
 
     def _wait_for_health(
@@ -2682,7 +2760,9 @@ class LocalUpdateInstaller:
         _block_candidate(state, sha)
         state.candidate_sha = ""
         state.pending_app = ""
+        state.pending_bundle = ""
         state.candidate_artifact = None
+        state.candidate_platform = ""
         state.candidate_signing_channel = ""
         state.candidate_signing_authority = ""
         state.candidate_migration_team_id = ""
@@ -2709,7 +2789,7 @@ class LocalUpdateInstaller:
         self._launch_bundle(current_app)
 
     def _launch_bundle(self, current_app: Path) -> None:
-        executable = current_app / "Contents" / "MacOS" / "GamGUI"
+        executable = bundle_executable(current_app)
         if not executable.is_file():
             return
         env = os.environ.copy()
@@ -3612,8 +3692,12 @@ def _atomic_exchange(first: Path, second: Path) -> None:
                 f"{left} <-> {right}",
             )
 
-    # Windows is not a supported deployment target. This fallback exists so
-    # local tooling can exercise recovery semantics; macOS never reaches it.
+    if sys.platform == "win32":
+        _windows_directory_exchange(left, right)
+        return
+
+    # Portable test fallback. Production macOS and Windows use their explicit
+    # platform branches above.
     temporary = left.parent / (
         f".{left.name}.{secrets.token_hex(16)}.exchange"
     )
@@ -3625,6 +3709,46 @@ def _atomic_exchange(first: Path, second: Path) -> None:
         if not left.exists() and temporary.exists():
             os.replace(temporary, left)
         raise
+
+
+def _windows_directory_exchange(
+    left: Path,
+    right: Path,
+    *,
+    attempts: int = 8,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Swap same-volume directories with bounded locked-file retries."""
+
+    if left.drive.lower() != right.drive.lower():
+        raise ValueError("Windows activation directories must be on the same volume.")
+    temporary = left.parent / f".{left.name}.{secrets.token_hex(16)}.exchange"
+    last_error: Optional[OSError] = None
+    for attempt in range(max(1, attempts)):
+        moved_left = False
+        moved_right = False
+        try:
+            os.replace(left, temporary)
+            moved_left = True
+            os.replace(right, left)
+            moved_right = True
+            os.replace(temporary, right)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                if moved_right and left.exists() and not right.exists():
+                    os.replace(left, right)
+                if moved_left and temporary.exists() and not left.exists():
+                    os.replace(temporary, left)
+            except OSError:
+                raise RuntimeError(
+                    "The Windows activation swap could not restore its pre-swap paths."
+                ) from exc
+            if attempt + 1 >= max(1, attempts):
+                break
+            sleep(min(0.25 * (2**attempt), 2.0))
+    raise OSError("Windows activation files remained locked after bounded retries.") from last_error
 
 
 def _tree_bytes(root: Path) -> int:
