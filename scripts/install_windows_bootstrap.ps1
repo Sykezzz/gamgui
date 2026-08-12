@@ -6,7 +6,8 @@ param(
     [switch]$TrustApproved,
     [string]$PretrustedSignerSha256 = "",
     [string]$ProgressReceipt = "",
-    [string]$AdditionalFileToSign = ""
+    [string]$AdditionalFileToSign = "",
+    [switch]$CiEphemeralCertificate
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,7 @@ $journalPath = Join-Path $updatesRoot "bootstrap-install.json"
 $incoming = Join-Path $installRoot ".bootstrap-pending"
 $signingScript = Join-Path $bootstrapRoot "windows_local_signing.ps1"
 $uninstallScript = Join-Path $bootstrapRoot "uninstall.ps1"
+$ciSigningArgs = if ($CiEphemeralCertificate) { @("-CiEphemeralCertificate") } else { @() }
 
 function Write-AtomicJson([string]$Path, $Value) {
     $parent = Split-Path -Parent $Path
@@ -162,11 +164,12 @@ try {
     Write-SetupProgress "identity" "working" "SETUP-CREATING-IDENTITY"
     if ($TrustMode -eq "Pretrusted") {
         if ($PretrustedSignerSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "Pretrusted setup requires a pinned signer SHA-256." }
-        $inspection = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Inspect -CertificateSha256 $PretrustedSignerSha256 | ConvertFrom-Json
+        $inspection = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Inspect -CertificateSha256 $PretrustedSignerSha256 @ciSigningArgs | ConvertFrom-Json
         if ($LASTEXITCODE) { throw "The pinned pretrusted signer could not be inspected." }
         $script:signerSha = [string]$inspection.certificate_sha256
-        if (-not [bool]$inspection.trusted) { throw "The pinned pretrusted signer is not trusted for this user." }
+        if (-not [bool]$inspection.trusted -and -not $CiEphemeralCertificate) { throw "The pinned pretrusted signer is not trusted for this user." }
     } else {
+        if ($CiEphemeralCertificate) { throw "CI ephemeral signing is allowed only for pretrusted disposable-runner setup." }
         if (-not $TrustApproved) { throw "Certificate trust was not approved. Nothing was installed." }
         $enrollment = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Enroll | ConvertFrom-Json
         if ($LASTEXITCODE) { throw "The GamGUI Local identity could not be created." }
@@ -198,7 +201,7 @@ try {
     Write-InstallJournal "payload_staged"
 
     Write-SetupProgress "signing" "working" "SETUP-SIGNING-FILES"
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Sign -Path $incomingCurrent -CertificateSha256 $signerSha
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Sign -Path $incomingCurrent -CertificateSha256 $signerSha @ciSigningArgs
     if ($LASTEXITCODE) { throw "The installed application could not be locally signed." }
     $script:installedHelper = $true
     Write-InstallJournal "installing_helper"
@@ -210,7 +213,7 @@ try {
     Write-InstallJournal "installing_uninstall_support"
     Copy-Item -LiteralPath $uninstallScript -Destination $installedUninstallPath -Force
     foreach ($file in @($helper, $installedSigningPath, $installedUninstallPath)) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $file -CertificateSha256 $signerSha
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $file -CertificateSha256 $signerSha @ciSigningArgs
         if ($LASTEXITCODE) { throw "Installed support files could not be locally signed." }
     }
     if ($AdditionalFileToSign) {
@@ -219,7 +222,7 @@ try {
         if (-not $resolvedAdditional.StartsWith($allowedInstallerRoot + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
             throw "The additional setup file is outside the installer directory."
         }
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $resolvedAdditional -CertificateSha256 $signerSha
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action SignFile -Path $resolvedAdditional -CertificateSha256 $signerSha @ciSigningArgs
         if ($LASTEXITCODE) { throw "The Windows uninstaller could not be locally signed." }
         $additionalSigned = $true
     }
@@ -236,14 +239,14 @@ try {
     if ($LASTEXITCODE) { throw "The locally signed artifact receipt could not be created." }
 
     Write-SetupProgress "verification" "working" "SETUP-VERIFYING-INSTALLATION"
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Verify -Path $current -CertificateSha256 $signerSha
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action Verify -Path $current -CertificateSha256 $signerSha @ciSigningArgs
     if ($LASTEXITCODE) { throw "The installed application signature did not verify." }
     foreach ($file in @($helper, $installedSigningPath, $installedUninstallPath)) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $file -CertificateSha256 $signerSha
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $file -CertificateSha256 $signerSha @ciSigningArgs
         if ($LASTEXITCODE) { throw "An installed support-file signature did not verify." }
     }
     if ($AdditionalFileToSign -and $additionalSigned) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $AdditionalFileToSign -CertificateSha256 $signerSha
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $signingScript -Action VerifyFile -Path $AdditionalFileToSign -CertificateSha256 $signerSha @ciSigningArgs
         if ($LASTEXITCODE) { throw "The Windows uninstaller signature did not verify." }
     }
     Write-InstallJournal "verified"

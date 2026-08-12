@@ -57,6 +57,8 @@ def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():
 
     assert 'ValidateSet("Interactive", "Pretrusted")' in install
     assert "PretrustedSignerSha256" in install
+    assert "CiEphemeralCertificate" in install
+    assert "CI ephemeral signing is allowed only for pretrusted disposable-runner setup" in install
     assert "TrustApproved" in install
     assert "-TrustLocalCertificate" in install
     assert "RemoveTrust" in install
@@ -173,6 +175,7 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert "-SkipTamperedBootstrap" in workflow
     assert 'if (-not $env:CI)' in exercise
     assert "-CiEphemeralCertificate" in exercise
+    assert "/CIEPHEMERALSIGNER=1" in exercise
     assert "[switch]$SkipTamperedBootstrap" in exercise
     assert "unsafe Setup invocation unexpectedly succeeded" in exercise
     assert 'Exercise-Profile "core"' in exercise

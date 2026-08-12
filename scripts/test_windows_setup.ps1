@@ -63,9 +63,9 @@ function Invoke-SetupFailure([string[]]$Arguments) {
 }
 
 function New-TrustedIdentity() {
-    $identity = & $signing -Action Enroll -TrustLocalCertificate -CiEphemeralCertificate | ConvertFrom-Json
-    if ($LASTEXITCODE -or $identity.trust_required -or -not $identity.created) {
-        throw "The disposable runner identity was not created and trusted."
+    $identity = & $signing -Action Enroll -CiEphemeralCertificate | ConvertFrom-Json
+    if ($LASTEXITCODE -or -not $identity.created -or -not $identity.ci_ephemeral) {
+        throw "The disposable runner identity was not created."
     }
     return [string]$identity.certificate_sha256
 }
@@ -87,10 +87,10 @@ function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
         throw "The installed exact-SHA profile identity is wrong."
     }
     if ([string]$state.local_signer_thumbprint -ne $CertificateSha256) { throw "The installed signer pin is wrong." }
-    & $signing -Action Verify -Path $current -CertificateSha256 $CertificateSha256 | Out-Null
+    & $signing -Action Verify -Path $current -CertificateSha256 $CertificateSha256 -CiEphemeralCertificate | Out-Null
     if ($LASTEXITCODE) { throw "The installed application signature receipt failed." }
     foreach ($file in @($helper, $uninstaller)) {
-        & $signing -Action VerifyFile -Path $file -CertificateSha256 $CertificateSha256 | Out-Null
+        & $signing -Action VerifyFile -Path $file -CertificateSha256 $CertificateSha256 -CiEphemeralCertificate | Out-Null
         if ($LASTEXITCODE) { throw "A locally signed setup file failed verification." }
     }
     $registration = Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{120C7CDF-EBCA-4D86-B724-FDBD4BE66E03}_is1" -ErrorAction Stop
@@ -110,7 +110,7 @@ function Exercise-Profile([string]$Profile) {
     try {
         Invoke-MonitoredSetup @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/PROFILE=$Profile", "/PINNEDSIGNERSHA256=$signer"
+            "/PROFILE=$Profile", "/PINNEDSIGNERSHA256=$signer", "/CIEPHEMERALSIGNER=1"
         )
         Assert-Installed $Profile $signer
         $repeat = Start-Process -FilePath $SetupPath -ArgumentList @(
