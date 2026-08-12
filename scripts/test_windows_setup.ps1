@@ -17,6 +17,7 @@ $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
 $current = Join-Path $localAppData "Programs\GamGUI\current"
 $dataRoot = Join-Path $localAppData "GamGUI"
 $statePath = Join-Path $dataRoot "updates\state.json"
+$progressPath = Join-Path $dataRoot "updates\setup-progress.json"
 $helper = Join-Path $dataRoot "updater\GamGUIUpdater.exe"
 $uninstaller = Join-Path $dataRoot "installer\unins000.exe"
 
@@ -24,6 +25,34 @@ function Invoke-Process([string]$FilePath, [string[]]$Arguments, [int]$ExpectedE
     $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne $ExpectedExitCode) {
         throw "$([System.IO.Path]::GetFileName($FilePath)) returned $($process.ExitCode), expected $ExpectedExitCode."
+    }
+}
+
+function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200) {
+    Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
+    $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastMessage = "SETUP-NOT-STARTED"
+    while (-not $process.HasExited) {
+        if (Test-Path -LiteralPath $progressPath -PathType Leaf) {
+            try {
+                $receipt = Get-Content -Raw -LiteralPath $progressPath | ConvertFrom-Json
+                if ([string]$receipt.message_code -and [string]$receipt.message_code -ne $lastMessage) {
+                    $lastMessage = [string]$receipt.message_code
+                    Write-Host "Setup progress: $lastMessage"
+                }
+            } catch {
+                # The backend replaces this small JSON receipt atomically; retry while it is moving.
+            }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "Setup exceeded $TimeoutSeconds seconds at sanitized phase $lastMessage."
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "Setup returned $($process.ExitCode) at sanitized phase $lastMessage."
     }
 }
 
@@ -79,7 +108,7 @@ function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
 function Exercise-Profile([string]$Profile) {
     $signer = New-TrustedIdentity
     try {
-        Invoke-Process $SetupPath @(
+        Invoke-MonitoredSetup @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
             "/PROFILE=$Profile", "/PINNEDSIGNERSHA256=$signer"
         )
