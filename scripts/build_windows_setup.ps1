@@ -35,7 +35,8 @@ if (
     [string]$installerManifest.revision -ne "windows-setup-v1" -or
     [string]$installerManifest.compiler.name -ne "inno-setup" -or
     [string]$installerManifest.compiler.version -ne "7.0.2" -or
-    [string]$installerManifest.compiler.sha256 -notmatch '^[0-9a-f]{64}$'
+    [string]$installerManifest.compiler.sha256 -notmatch '^[0-9a-f]{64}$' -or
+    [string]$installerManifest.compiler.executable_sha256 -notmatch '^[0-9a-f]{64}$'
 ) { throw "The committed Windows installer toolchain manifest is invalid." }
 $installerToolchainDigest = (Get-FileHash -LiteralPath $installerManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
@@ -76,8 +77,10 @@ if (-not $InnoCompilerPath) {
     }
 }
 $InnoCompilerPath = (Resolve-Path -LiteralPath $InnoCompilerPath).Path
-$compilerVersion = (Get-Item -LiteralPath $InnoCompilerPath).VersionInfo.ProductVersion
-if ($compilerVersion -notlike "7.0.2*") { throw "The Inno Setup compiler version is not the committed 7.0.2 pin." }
+$compilerHash = (Get-FileHash -LiteralPath $InnoCompilerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($compilerHash -ne [string]$installerManifest.compiler.executable_sha256) {
+    throw "The Inno Setup compiler executable does not match the committed 7.0.2 pin."
+}
 
 $releaseArgs = @{
     ExpectedSha = $sourceSha

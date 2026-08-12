@@ -131,6 +131,7 @@ def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
 
     assert manifest["compiler"]["version"] == "7.0.2"
     assert len(manifest["compiler"]["sha256"]) == 64
+    assert len(manifest["compiler"]["executable_sha256"]) == 64
     assert manifest["compiler"]["publisher"] == "Pyrsys B.V."
     assert "Get-AuthenticodeSignature" in build
     assert "The checkout does not match the requested exact SHA" in build
