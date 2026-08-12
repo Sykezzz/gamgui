@@ -19,15 +19,40 @@ $expected = ($checksumLine -split "\s+")[0].ToLowerInvariant()
 
 $taskRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-gam-windows-" + [guid]::NewGuid())
 $archive = Join-Path $taskRoot $assetName
+$cacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "gamgui-gam-download-cache"
+$cachedArchive = Join-Path $cacheRoot $assetName
 $expanded = Join-Path $taskRoot "expanded"
 $stage = Join-Path $destinationParent (".gam7-stage-" + [guid]::NewGuid())
 $backup = Join-Path $destinationParent (".gam7-backup-" + [guid]::NewGuid())
 
 try {
-    New-Item -ItemType Directory -Path $taskRoot, $expanded, $stage -Force | Out-Null
+    New-Item -ItemType Directory -Path $taskRoot, $expanded, $stage, $cacheRoot -Force | Out-Null
     $url = "https://github.com/GAM-team/GAM/releases/download/$Tag/$assetName"
-    Write-Host "==> Downloading pinned GAM $Tag for Windows..."
-    Invoke-WebRequest -Uri $url -OutFile $archive
+    $cachedHash = if (Test-Path -LiteralPath $cachedArchive -PathType Leaf) {
+        (Get-FileHash -LiteralPath $cachedArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    } else { "" }
+    if ($cachedHash -ne $expected) {
+        Remove-Item -LiteralPath $cachedArchive -Force -ErrorAction SilentlyContinue
+        Write-Host "==> Downloading pinned GAM $Tag for Windows..."
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $download = "$cachedArchive.download"
+            Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $download
+                $downloadHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($downloadHash -ne $expected) { throw "Downloaded GAM archive failed its committed checksum." }
+                Move-Item -LiteralPath $download -Destination $cachedArchive -Force
+                break
+            } catch {
+                Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+    } else {
+        Write-Host "==> Reusing checksum-verified pinned GAM $Tag download."
+    }
+    Copy-Item -LiteralPath $cachedArchive -Destination $archive
     $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $expected) {
         throw "Checksum mismatch for $assetName. Expected $expected, received $actual."
