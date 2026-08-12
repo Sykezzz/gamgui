@@ -96,6 +96,7 @@ var
   UninstallDataCheck: TNewCheckBox;
   ProgressReceipt: String;
   SilentSigner: String;
+  CiEphemeralSigner: Boolean;
   SelectedProfile: String;
   ExistingInstall: Boolean;
   ExistingProfile: String;
@@ -405,6 +406,7 @@ begin
   Result := True;
   SelectedProfile := 'classroom-oneroster';
   SilentSigner := '';
+  CiEphemeralSigner := False;
   if WizardSilent then
   begin
     if DirExists(FixedCurrent) then
@@ -415,6 +417,7 @@ begin
     end;
     SelectedProfile := Lowercase(GetCommandValue('PROFILE'));
     SilentSigner := GetCommandValue('PINNEDSIGNERSHA256');
+    CiEphemeralSigner := GetCommandValue('CIEPHEMERALSIGNER') = '1';
     if ((SelectedProfile <> 'core') and (SelectedProfile <> 'classroom-oneroster')) or
        (not IsHex64(SilentSigner)) then
     begin
@@ -450,7 +453,10 @@ begin
     ' -NoShortcuts -ProgressReceipt ' + AddQuotes(ProgressReceipt) +
     ' -AdditionalFileToSign ' + AddQuotes(ExpandConstant('{uninstallexe}'));
   if WizardSilent then
-    Arguments := Arguments + ' -TrustMode Pretrusted -PretrustedSignerSha256 ' + AddQuotes(SilentSigner)
+  begin
+    Arguments := Arguments + ' -TrustMode Pretrusted -PretrustedSignerSha256 ' + AddQuotes(SilentSigner);
+    if CiEphemeralSigner then Arguments := Arguments + ' -CiEphemeralCertificate';
+  end
   else
     Arguments := Arguments + ' -TrustMode Interactive -TrustApproved';
 
