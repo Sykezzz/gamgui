@@ -195,7 +195,12 @@ def test_windows_signer_preflight_terminates_a_stalled_provider(tmp_path):
     )
 
     assert result.returncode == 2
-    assert time.monotonic() - started < 8
+    # Native Windows PowerShell may need roughly two seconds to initialize its
+    # 64-bit certificate-provider view before the one-second inspection and
+    # bounded process-tree cleanup run. Keep this assertion below the outer
+    # ten-second hard timeout without constraining normal provider startup to
+    # the older in-process timing envelope.
+    assert time.monotonic() - started < 9.5
 
 
 def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
