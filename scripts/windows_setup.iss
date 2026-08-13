@@ -341,7 +341,11 @@ begin
   TrustCheck.Checked := False;
 
   ProgressReceipt := AddBackslash(FixedData) + 'updates\setup-progress.json';
-
+  if WizardSilent and (not RunSilentSignerPreflight) then
+  begin
+    Log('Refusing silent setup because the pinned identity is missing, lacks its private key, is untrusted, or its provider did not answer safely.');
+    Abort;
+  end;
 end;
 
 function InitializeUninstall: Boolean;
@@ -398,28 +402,25 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if ExistingInstall then
+    Result := 'GamGUI is already installed. Open it or uninstall it before running Setup again.';
+end;
+
+function RunSilentSignerPreflight: Boolean;
 var
   Arguments: String;
   ResultCode: Integer;
 begin
-  Result := '';
-  if ExistingInstall then
-    Result := 'GamGUI is already installed. Open it or uninstall it before running Setup again.'
-  else if WizardSilent then
-  begin
-    { Run the same read-only signer inspection used by the transactional backend
-      before expanding the large embedded profile. The backend repeats the check
-      immediately before any application file is copied or signed. }
-    ExtractTemporaryFile('gamgui-signer-preflight.ps1');
-    ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
-    Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-      AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
-      ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
-      ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
-    if (not Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or
-       (ResultCode <> 0) then
-      Result := 'The pinned GamGUI Local identity is missing, does not have its private key, or is not trusted for this Windows user.';
-  end;
+  ExtractTemporaryFile('gamgui-signer-preflight.ps1');
+  ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
+  Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
+    ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
+    ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
+  Result := Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and
+    (ResultCode = 0);
 end;
 
 function InitializeSetup: Boolean;
@@ -450,7 +451,7 @@ begin
       Result := False;
       Exit;
     end;
-    { PrepareToInstall runs the shared read-only signer inspection before the
+    { InitializeWizard runs the shared read-only signer inspection before the
       large embedded profile is expanded. The transactional backend repeats the
       exact check before copying or signing the application. }
   end;
