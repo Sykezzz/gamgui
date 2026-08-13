@@ -130,6 +130,8 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "HasPrivateKey" in wizard
     assert "if not SilentSignerIsAvailable then" in wizard
     assert "missing or is not trusted" in wizard
+    assert "GetEnv('CI')" in wizard
+    assert "Refusing the ephemeral signer switch outside a disposable CI runner" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
     assert "Also delete local application data" in wizard
 
