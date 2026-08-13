@@ -17,6 +17,19 @@ $stdoutPath = "$receiptBase.out"
 $stderrPath = "$receiptBase.err"
 $process = $null
 
+function Get-NativeWindowsPowerShellPath() {
+    # Inno Setup is a 32-bit launcher even when the installation itself is in
+    # 64-bit mode.  A relative powershell.exe can therefore inspect the pinned
+    # certificate through the 32-bit key-provider view and incorrectly report
+    # that its private key is unavailable.  Always run the read-only inspection
+    # through native Windows PowerShell, matching the transactional backend.
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        $sysnative = Join-Path $env:SystemRoot "Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+        if (Test-Path -LiteralPath $sysnative -PathType Leaf) { return $sysnative }
+    }
+    return (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 function Stop-PreflightProcess([System.Diagnostics.Process]$Target) {
     if ($null -eq $Target -or $Target.HasExited) { return }
     $killer = Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
@@ -36,7 +49,7 @@ try {
         "-Action Inspect",
         "-CertificateSha256 $CertificateSha256"
     ) -join " "
-    $process = Start-Process -FilePath powershell.exe -ArgumentList $argumentLine `
+    $process = Start-Process -FilePath (Get-NativeWindowsPowerShellPath) -ArgumentList $argumentLine `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
         -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {

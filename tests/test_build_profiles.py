@@ -153,6 +153,9 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     )
     assert 'ValidatePattern(\'^[0-9a-fA-F]{64}$\')' in preflight
     assert '"-Action Inspect"' in preflight
+    assert '"Sysnative\\WindowsPowerShell\\v1.0\\powershell.exe"' in preflight
+    assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in preflight
+    assert "Start-Process -FilePath (Get-NativeWindowsPowerShellPath)" in preflight
     assert ".WaitForExit($TimeoutSeconds * 1000)" in preflight
     assert "$process.Refresh()" in preflight
     assert "if ($null -eq $process.ExitCode) { exit 1 }" in preflight
