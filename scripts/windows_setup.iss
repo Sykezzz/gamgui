@@ -68,6 +68,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; Keep the read-only signer preflight ahead of the solid application payload so
 ; an invalid silent-install identity fails before Setup expands either profile.
 Source: "{#SourceRoot}\scripts\windows_local_signing.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight.ps1"; Flags: dontcopy solidbreak
+Source: "{#SourceRoot}\scripts\windows_signer_preflight.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight-runner.ps1"; Flags: dontcopy
 Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseCoreProfile
 Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseClassroomProfile
 
@@ -410,9 +411,11 @@ begin
       before expanding the large embedded profile. The backend repeats the check
       immediately before any application file is copied or signed. }
     ExtractTemporaryFile('gamgui-signer-preflight.ps1');
+    ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
     Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-      AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
-      ' -Action Inspect -CertificateSha256 ' + AddQuotes(SilentSigner);
+      AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
+      ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
+      ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
     if (not Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or
        (ResultCode <> 0) then
       Result := 'The pinned GamGUI Local identity is missing, does not have its private key, or is not trusted for this Windows user.';
