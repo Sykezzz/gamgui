@@ -177,27 +177,34 @@ end;
 
 function SilentSignerIsAvailable: Boolean;
 var
-  Script, TrustChecks: String;
+  Script, Probe, TrustChecks: String;
   ResultCode: Integer;
 begin
   TrustChecks :=
     'if ((-not (Find-Certificate ''Root'' $false)) -or ' +
-    '(-not (Find-Certificate ''TrustedPublisher'' $false))) { exit 1 };';
-  Script :=
+    '(-not (Find-Certificate ''TrustedPublisher'' $false))) { return $false };';
+  Probe :=
     '$ErrorActionPreference=''Stop'';' +
-    '$expected=''' + Lowercase(SilentSigner) + ''';' +
     '$algorithm=[System.Security.Cryptography.HashAlgorithmName]::SHA256;' +
     'function Find-Certificate([string]$name,[bool]$privateKey) {' +
     '$store=[System.Security.Cryptography.X509Certificates.X509Store]::new($name,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser);' +
     'try {' +
     '$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly);' +
-    '$matches=@($store.Certificates | Where-Object {' +
+    '$candidates=$store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,''CN=GamGUI Local'',$false);' +
+    '$matches=@($candidates | Where-Object {' +
     '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected) -and ' +
     '((-not $privateKey) -or $_.HasPrivateKey)' +
     '}); return $matches.Count -eq 1' +
     '} finally { $store.Close() } };' +
-    'if (-not (Find-Certificate ''My'' $true)) { exit 1 };' +
-    TrustChecks + 'exit 0';
+    'if (-not (Find-Certificate ''My'' $true)) { return $false };' +
+    TrustChecks + 'return $true';
+  Script :=
+    '$expected=''' + Lowercase(SilentSigner) + ''';' +
+    '$probe=Start-Job -ScriptBlock { param($expected) ' + Probe + ' } -ArgumentList $expected;' +
+    'if (-not (Wait-Job -Job $probe -Timeout 15)) { exit 2 };' +
+    '$result=[bool](Receive-Job -Job $probe -ErrorAction SilentlyContinue);' +
+    '$state=$probe.State; Remove-Job -Job $probe -Force -ErrorAction SilentlyContinue;' +
+    'if (($state -ne ''Completed'') -or (-not $result)) { exit 1 }; exit 0';
   Result := Exec(
     'powershell.exe',
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Script),
