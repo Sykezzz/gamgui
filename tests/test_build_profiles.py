@@ -126,6 +126,9 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "function SilentSignerIsAvailable: Boolean;" in wizard
     assert "X509Certificates.X509Store" in wizard
     assert "OpenFlags]::ReadOnly" in wizard
+    assert "FindBySubjectDistinguishedName" in wizard
+    assert "Start-Job -ScriptBlock" in wizard
+    assert "Wait-Job -Job $probe -Timeout 15" in wizard
     assert "Find-Certificate ''My''" in wizard
     assert "Find-Certificate ''Root''" in wizard
     assert "Find-Certificate ''TrustedPublisher''" in wizard
