@@ -155,6 +155,7 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "taskkill.exe" in preflight
     assert "$killer.WaitForExit(5000)" in preflight
     assert "Stop-Process -Id $killer.Id -Force" in preflight
+    assert "Stop-PreflightProcess $process\n        $process = $null\n        exit 2" in preflight
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows signer process contract")
