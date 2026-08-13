@@ -119,6 +119,8 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "GamGui.RootTrustDialog" in script
     assert "GetDlgItem($process.MainWindowHandle, 6)" in script
     assert "protected current-user root-store operation exceeded 15 seconds" in script
+    assert "FindByThumbprint" in script
+    assert "Get-LocalCertificates $store $Certificate.Thumbprint" in script
     assert "Import-Certificate" not in script
     assert "if ($CiEphemeralCertificate)" in script
     assert "New-CiSigningCertificate" in script
