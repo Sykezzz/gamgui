@@ -181,18 +181,22 @@ var
   ResultCode: Integer;
 begin
   TrustChecks :=
-    'if ((-not (Find-Certificate ''Cert:\CurrentUser\Root'' $false)) -or ' +
-    '(-not (Find-Certificate ''Cert:\CurrentUser\TrustedPublisher'' $false))) { exit 1 };';
+    'if ((-not (Find-Certificate ''Root'' $false)) -or ' +
+    '(-not (Find-Certificate ''TrustedPublisher'' $false))) { exit 1 };';
   Script :=
     '$ErrorActionPreference=''Stop'';' +
     '$expected=''' + Lowercase(SilentSigner) + ''';' +
     '$algorithm=[System.Security.Cryptography.HashAlgorithmName]::SHA256;' +
-    'function Find-Certificate([string]$store,[bool]$privateKey) {' +
-    '$matches=@(Get-ChildItem -LiteralPath $store | Where-Object {' +
+    'function Find-Certificate([string]$name,[bool]$privateKey) {' +
+    '$store=[System.Security.Cryptography.X509Certificates.X509Store]::new($name,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser);' +
+    'try {' +
+    '$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly);' +
+    '$matches=@($store.Certificates | Where-Object {' +
     '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected) -and ' +
     '((-not $privateKey) -or $_.HasPrivateKey)' +
-    '}); return $matches.Count -eq 1 };' +
-    'if (-not (Find-Certificate ''Cert:\CurrentUser\My'' $true)) { exit 1 };' +
+    '}); return $matches.Count -eq 1' +
+    '} finally { $store.Close() } };' +
+    'if (-not (Find-Certificate ''My'' $true)) { exit 1 };' +
     TrustChecks + 'exit 0';
   Result := Exec(
     'powershell.exe',

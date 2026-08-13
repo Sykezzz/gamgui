@@ -124,9 +124,12 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Google, GAM, Keychain, or tenant services" in wizard
     assert "setup-progress.json" in wizard
     assert "function SilentSignerIsAvailable: Boolean;" in wizard
-    assert "Cert:\\CurrentUser\\My" in wizard
-    assert "Cert:\\CurrentUser\\Root" in wizard
-    assert "Cert:\\CurrentUser\\TrustedPublisher" in wizard
+    assert "X509Certificates.X509Store" in wizard
+    assert "OpenFlags]::ReadOnly" in wizard
+    assert "Find-Certificate ''My''" in wizard
+    assert "Find-Certificate ''Root''" in wizard
+    assert "Find-Certificate ''TrustedPublisher''" in wizard
+    assert "Get-ChildItem -LiteralPath $store" not in wizard
     assert "HasPrivateKey" in wizard
     assert "if not SilentSignerIsAvailable then" in wizard
     assert "missing or is not trusted" in wizard
@@ -197,6 +200,7 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert "sanitized phase" in exercise
     assert '"/LOG=$setupLog"' in exercise
     assert "Setup diagnostic log" in exercise
+    assert "taskkill.exe /PID $Process.Id /T /F" in exercise
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():
