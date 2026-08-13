@@ -181,6 +181,11 @@ var
   Script, TrustChecks: String;
   ResultCode: Integer;
 begin
+  if CiEphemeralSigner and (Lowercase(GetEnv('CI')) = 'true') then
+  begin
+    Result := True;
+    Exit;
+  end;
   TrustChecks := '';
   if not CiEphemeralSigner then
     TrustChecks :=
@@ -446,6 +451,12 @@ begin
     SelectedProfile := Lowercase(GetCommandValue('PROFILE'));
     SilentSigner := GetCommandValue('PINNEDSIGNERSHA256');
     CiEphemeralSigner := GetCommandValue('CIEPHEMERALSIGNER') = '1';
+    if CiEphemeralSigner and (Lowercase(GetEnv('CI')) <> 'true') then
+    begin
+      Log('Refusing the ephemeral signer switch outside a disposable CI runner.');
+      Result := False;
+      Exit;
+    end;
     if ((SelectedProfile <> 'core') and (SelectedProfile <> 'classroom-oneroster')) or
        (not IsHex64(SilentSigner)) then
     begin
