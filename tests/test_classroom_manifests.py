@@ -12,6 +12,7 @@ import pytest
 from gamgui.core.classroom import manifests as manifests_module
 from gamgui.core.classroom.manifests import RosterManifestStore
 from gamgui.core.classroom.models import RosterDiff
+from tests.windows_acl_assertions import assert_current_user_only_acl
 
 
 def test_manifest_persists_exact_plan_and_target_results(tmp_path):
@@ -160,14 +161,18 @@ def test_roster_store_permission_failure_prevents_database_creation(
     monkeypatch,
 ):
     path = tmp_path / "private" / "ops.db"
-    original_chmod = manifests_module.os.chmod
+    original_restrict = manifests_module.restrict_owner_only
 
-    def fail_directory_chmod(candidate, mode):
+    def fail_directory_restrict(candidate, *, directory=None):
         if Path(candidate) == path.parent:
             raise PermissionError("policy denied")
-        return original_chmod(candidate, mode)
+        return original_restrict(candidate, directory=directory)
 
-    monkeypatch.setattr(manifests_module.os, "chmod", fail_directory_chmod)
+    monkeypatch.setattr(
+        manifests_module,
+        "restrict_owner_only",
+        fail_directory_restrict,
+    )
 
     with pytest.raises(PermissionError, match="policy denied"):
         RosterManifestStore(path)
@@ -183,6 +188,16 @@ def test_roster_store_uses_owner_only_directory_and_database_modes(tmp_path):
 
     assert path.parent.stat().st_mode & 0o777 == 0o700
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows protected-DACL assertion")
+def test_roster_store_uses_current_user_only_windows_acls(tmp_path):
+    path = tmp_path / "private" / "ops.db"
+
+    RosterManifestStore(path)
+
+    assert_current_user_only_acl(path.parent, directory=True)
+    assert_current_user_only_acl(path)
 
 
 def test_roster_store_tolerates_only_disappearing_sqlite_companions(

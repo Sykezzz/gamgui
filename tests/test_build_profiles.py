@@ -130,6 +130,8 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "HasPrivateKey" in wizard
     assert "if not SilentSignerIsAvailable then" in wizard
     assert "missing or is not trusted" in wizard
+    assert "GetEnv('CI')" not in wizard
+    assert "Refusing a validation-only signer switch in public Setup" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
     assert "Also delete local application data" in wizard
 
@@ -182,7 +184,8 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert "-SkipTamperedBootstrap" in workflow
     assert 'if (-not $env:CI)' in exercise
     assert "-CiEphemeralCertificate" in exercise
-    assert "/CIEPHEMERALSIGNER=1" in exercise
+    assert "/CIEPHEMERALSIGNER=1" not in exercise
+    assert "-TrustLocalCertificate" in exercise
     assert "[switch]$SkipTamperedBootstrap" in exercise
     assert "unsafe Setup invocation unexpectedly succeeded" in exercise
     assert 'Exercise-Profile "core"' in exercise
