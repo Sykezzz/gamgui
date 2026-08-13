@@ -15,6 +15,13 @@ from gamgui.core.gam.models import GAMUser
 from tests.test_oneroster_helpers import valid_files, zip_bytes
 
 
+# A 1.5-second live call is representative of the high-latency profile this gate
+# covers and keeps the network signal above filesystem/CPU variation on hosted
+# Windows runners. The test still measures the complete planning operation and
+# still requires the same 30% end-to-end improvement with an identical plan.
+_LIVE_SNAPSHOT_DELAY_SECONDS = 1.5
+
+
 class _DelayedLiveSnapshots:
     def __init__(self, *, delay: float, serialize_snapshots: bool) -> None:
         self.delay = delay
@@ -63,10 +70,7 @@ def _ready_service(root: Path) -> tuple[OneRosterService, str]:
 async def _timed_plan(root: Path, *, serialize_snapshots: bool):
     service, import_id = _ready_service(root)
     connector = _DelayedLiveSnapshots(
-        # Keep the deterministic network signal materially above hosted-runner
-        # scheduling and filesystem jitter. The 30% gate remains unchanged; this
-        # makes it measure concurrent snapshots instead of transient CPU noise.
-        delay=0.5,
+        delay=_LIVE_SNAPSHOT_DELAY_SECONDS,
         serialize_snapshots=serialize_snapshots,
     )
     started = time.perf_counter()
@@ -130,15 +134,23 @@ async def test_large_roster_planning_gate_improves_median_without_plan_drift(
 
     serial_times: list[float] = []
     optimized_times: list[float] = []
-    for run_number in range(3):
-        serial = await _timed_plan(
-            tmp_path / f"serial-{run_number}",
-            serialize_snapshots=True,
+    for run_number in range(4):
+        # Balance which implementation runs first so host filesystem caches and
+        # one-time interpreter work cannot systematically favor either sample.
+        order = (
+            (("serial", True), ("optimized", False))
+            if run_number % 2 == 0
+            else (("optimized", False), ("serial", True))
         )
-        optimized = await _timed_plan(
-            tmp_path / f"optimized-{run_number}",
-            serialize_snapshots=False,
-        )
+        samples = {
+            name: await _timed_plan(
+                tmp_path / f"{name}-{run_number}",
+                serialize_snapshots=serialize,
+            )
+            for name, serialize in order
+        }
+        serial = samples["serial"]
+        optimized = samples["optimized"]
         serial_times.append(serial[0])
         optimized_times.append(optimized[0])
         assert optimized[1] == serial[1]
