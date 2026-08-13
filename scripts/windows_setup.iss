@@ -96,7 +96,6 @@ var
   UninstallDataCheck: TNewCheckBox;
   ProgressReceipt: String;
   SilentSigner: String;
-  CiEphemeralSigner: Boolean;
   SelectedProfile: String;
   ExistingInstall: Boolean;
   ExistingProfile: String;
@@ -181,16 +180,9 @@ var
   Script, TrustChecks: String;
   ResultCode: Integer;
 begin
-  if CiEphemeralSigner and (Lowercase(GetEnv('CI')) = 'true') then
-  begin
-    Result := True;
-    Exit;
-  end;
-  TrustChecks := '';
-  if not CiEphemeralSigner then
-    TrustChecks :=
-      'if ((-not (Find-Certificate ''Cert:\CurrentUser\Root'' $false)) -or ' +
-      '(-not (Find-Certificate ''Cert:\CurrentUser\TrustedPublisher'' $false))) { exit 1 };';
+  TrustChecks :=
+    'if ((-not (Find-Certificate ''Cert:\CurrentUser\Root'' $false)) -or ' +
+    '(-not (Find-Certificate ''Cert:\CurrentUser\TrustedPublisher'' $false))) { exit 1 };';
   Script :=
     '$ErrorActionPreference=''Stop'';' +
     '$expected=''' + Lowercase(SilentSigner) + ''';' +
@@ -439,7 +431,6 @@ begin
   Result := True;
   SelectedProfile := 'classroom-oneroster';
   SilentSigner := '';
-  CiEphemeralSigner := False;
   if WizardSilent then
   begin
     if DirExists(FixedCurrent) then
@@ -450,10 +441,9 @@ begin
     end;
     SelectedProfile := Lowercase(GetCommandValue('PROFILE'));
     SilentSigner := GetCommandValue('PINNEDSIGNERSHA256');
-    CiEphemeralSigner := GetCommandValue('CIEPHEMERALSIGNER') = '1';
-    if CiEphemeralSigner and (Lowercase(GetEnv('CI')) <> 'true') then
+    if GetCommandValue('CIEPHEMERALSIGNER') <> '' then
     begin
-      Log('Refusing the ephemeral signer switch outside a disposable CI runner.');
+      Log('Refusing a validation-only signer switch in public Setup.');
       Result := False;
       Exit;
     end;
@@ -500,7 +490,6 @@ begin
   if WizardSilent then
   begin
     Arguments := Arguments + ' -TrustMode Pretrusted -PretrustedSignerSha256 ' + AddQuotes(SilentSigner);
-    if CiEphemeralSigner then Arguments := Arguments + ' -CiEphemeralCertificate';
   end
   else
     Arguments := Arguments + ' -TrustMode Interactive -TrustApproved';
