@@ -179,6 +179,8 @@ begin
     end;
 end;
 
+function RunSilentSignerPreflight: Boolean; forward;
+
 procedure OpenInstalledClick(Sender: TObject);
 var
   ErrorCode: Integer;
@@ -348,6 +350,21 @@ begin
   end;
 end;
 
+function RunSilentSignerPreflight: Boolean;
+var
+  Arguments: String;
+  ResultCode: Integer;
+begin
+  ExtractTemporaryFile('gamgui-signer-preflight.ps1');
+  ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
+  Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
+    ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
+    ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
+  Result := Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and
+    (ResultCode = 0);
+end;
+
 function InitializeUninstall: Boolean;
 begin
   Result := True;
@@ -406,21 +423,6 @@ begin
   Result := '';
   if ExistingInstall then
     Result := 'GamGUI is already installed. Open it or uninstall it before running Setup again.';
-end;
-
-function RunSilentSignerPreflight: Boolean;
-var
-  Arguments: String;
-  ResultCode: Integer;
-begin
-  ExtractTemporaryFile('gamgui-signer-preflight.ps1');
-  ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
-  Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
-    ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
-    ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
-  Result := Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and
-    (ResultCode = 0);
 end;
 
 function InitializeSetup: Boolean;
