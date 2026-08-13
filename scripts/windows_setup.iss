@@ -67,10 +67,10 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 ; Keep the read-only signer preflight ahead of the solid application payload so
 ; an invalid silent-install identity fails before Setup expands either profile.
-Source: "{#SourceRoot}\scripts\windows_local_signing.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight.ps1"; Flags: dontcopy solidbreak
+Source: "{#SourceRoot}\scripts\windows_local_signing.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight.ps1"; Flags: dontcopy
 Source: "{#SourceRoot}\scripts\windows_signer_preflight.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight-runner.ps1"; Flags: dontcopy
-Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseCoreProfile
-Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseClassroomProfile
+Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall solidbreak; Check: UseCoreProfile
+Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall solidbreak; Check: UseClassroomProfile
 
 [Icons]
 Name: "{userprograms}\GamGUI"; Filename: "{localappdata}\GamGUI\updater\GamGUIUpdater.exe"; Parameters: "--launch-installed"; WorkingDir: "{localappdata}\GamGUI\updater"

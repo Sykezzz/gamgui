@@ -133,7 +133,8 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Start-Job -ScriptBlock" not in wizard
     assert 'DestName: "gamgui-signer-preflight.ps1"' in wizard
     assert 'DestName: "gamgui-signer-preflight-runner.ps1"' in wizard
-    assert "Flags: dontcopy solidbreak" in wizard
+    assert "Flags: dontcopy solidbreak" not in wizard
+    assert wizard.count("deleteafterinstall solidbreak") == 2
     assert "-TimeoutSeconds 15" in wizard
     assert "before expanding the large embedded profile" in wizard
     assert "The transactional backend repeats the" in wizard
