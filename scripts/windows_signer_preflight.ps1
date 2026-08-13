@@ -41,6 +41,7 @@ try {
         -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         Stop-PreflightProcess $process
+        $process = $null
         exit 2
     }
     [void]$process.WaitForExit()
