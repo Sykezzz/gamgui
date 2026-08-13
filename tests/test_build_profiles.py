@@ -123,21 +123,11 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Refusing silent setup because /PROFILE or /PINNEDSIGNERSHA256 is invalid" in wizard
     assert "Google, GAM, Keychain, or tenant services" in wizard
     assert "setup-progress.json" in wizard
-    assert "function SilentSignerIsAvailable: Boolean;" in wizard
-    assert "X509Certificates.X509Store" in wizard
-    assert "OpenFlags]::ReadOnly" in wizard
-    assert "FindBySubjectDistinguishedName" in wizard
-    assert "Start-Job -ScriptBlock" in wizard
-    assert "Wait-Job -Job $probe -Timeout 15" in wizard
-    assert "Find-Identity" in wizard
-    assert "Find-TrustedCopy ''Root'' $identity.Thumbprint" in wizard
-    assert "Find-TrustedCopy ''TrustedPublisher'' $identity.Thumbprint" in wizard
-    assert "FindByThumbprint" in wizard
-    assert "Stop-Process -Id $PID -Force" in wizard
-    assert "Get-ChildItem -LiteralPath $store" not in wizard
-    assert "HasPrivateKey" in wizard
-    assert "if not SilentSignerIsAvailable then" in wizard
-    assert "missing or is not trusted" in wizard
+    assert "function SilentSignerIsAvailable: Boolean;" not in wizard
+    assert "X509Certificates.X509Store" not in wizard
+    assert "Start-Job -ScriptBlock" not in wizard
+    assert "The transactional backend is the only signer trust authority" in wizard
+    assert "-TrustMode Pretrusted -PretrustedSignerSha256" in wizard
     assert "GetEnv('CI')" not in wizard
     assert "Refusing a validation-only signer switch in public Setup" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
