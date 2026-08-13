@@ -126,7 +126,11 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "function SilentSignerIsAvailable: Boolean;" not in wizard
     assert "X509Certificates.X509Store" not in wizard
     assert "Start-Job -ScriptBlock" not in wizard
-    assert "The transactional backend is the only signer trust authority" in wizard
+    assert 'DestName: "gamgui-signer-preflight.ps1"' in wizard
+    assert "Flags: dontcopy solidbreak" in wizard
+    assert "-Action Inspect -CertificateSha256" in wizard
+    assert "before expanding the large embedded profile" in wizard
+    assert "The transactional backend repeats the" in wizard
     assert "-TrustMode Pretrusted -PretrustedSignerSha256" in wizard
     assert "GetEnv('CI')" not in wizard
     assert "Refusing a validation-only signer switch in public Setup" in wizard

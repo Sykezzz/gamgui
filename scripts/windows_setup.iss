@@ -65,6 +65,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
+; Keep the read-only signer preflight ahead of the solid application payload so
+; an invalid silent-install identity fails before Setup expands either profile.
+Source: "{#SourceRoot}\scripts\windows_local_signing.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight.ps1"; Flags: dontcopy solidbreak
 Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseCoreProfile
 Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseClassroomProfile
 
@@ -394,10 +397,26 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Arguments: String;
+  ResultCode: Integer;
 begin
   Result := '';
   if ExistingInstall then
-    Result := 'GamGUI is already installed. Open it or uninstall it before running Setup again.';
+    Result := 'GamGUI is already installed. Open it or uninstall it before running Setup again.'
+  else if WizardSilent then
+  begin
+    { Run the same read-only signer inspection used by the transactional backend
+      before expanding the large embedded profile. The backend repeats the check
+      immediately before any application file is copied or signed. }
+    ExtractTemporaryFile('gamgui-signer-preflight.ps1');
+    Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+      AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
+      ' -Action Inspect -CertificateSha256 ' + AddQuotes(SilentSigner);
+    if (not Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or
+       (ResultCode <> 0) then
+      Result := 'The pinned GamGUI Local identity is missing, does not have its private key, or is not trusted for this Windows user.';
+  end;
 end;
 
 function InitializeSetup: Boolean;
@@ -428,10 +447,9 @@ begin
       Result := False;
       Exit;
     end;
-    { The transactional backend is the only signer trust authority. It checks
-      the exact pinned SHA-256, private key, Root, and Trusted Publisher before
-      copying or signing the application. Keeping certificate-store access out
-      of Inno initialization also keeps headless setup bounded. }
+    { PrepareToInstall runs the shared read-only signer inspection before the
+      large embedded profile is expanded. The transactional backend repeats the
+      exact check before copying or signing the application. }
   end;
 end;
 
