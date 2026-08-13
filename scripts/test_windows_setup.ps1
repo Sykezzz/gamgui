@@ -30,9 +30,23 @@ function Invoke-Process([string]$FilePath, [string[]]$Arguments, [int]$ExpectedE
 
 function Stop-ProcessTree([System.Diagnostics.Process]$Process) {
     if ($Process.HasExited) { return }
-    & taskkill.exe /PID $Process.Id /T /F 2>$null | Out-Null
-    if (-not $Process.WaitForExit(10000)) {
-        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    $killer = $null
+    try {
+        # taskkill can itself wait forever when an Inno child is stuck in a
+        # certificate-store call. Keep the release gate bounded even then.
+        $killer = Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
+            -ArgumentList @("/PID", [string]$Process.Id, "/T", "/F") `
+            -PassThru -WindowStyle Hidden
+        if (-not $killer.WaitForExit(10000)) {
+            Stop-Process -Id $killer.Id -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        if (-not $Process.HasExited) {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $Process.WaitForExit(10000)) {
+            throw "Setup process $($Process.Id) could not be stopped after its bounded timeout."
+        }
     }
 }
 
