@@ -116,9 +116,9 @@ def test_windows_signing_script_requires_nonexportable_rsa_and_detached_manifest
     assert "FindBySubjectDistinguishedName" in script
     assert 'Get-ChildItem -LiteralPath "Cert:\\CurrentUser' not in script
     assert "Remove-LocalCertificates" in script
-    assert "StoreLocation]::LocalMachine" in script
-    assert "Public setup" in script
-    assert "never enables this test-only certificate path" in script
+    assert "GamGui.RootTrustDialog" in script
+    assert "GetDlgItem($process.MainWindowHandle, 6)" in script
+    assert "protected current-user root-store operation exceeded 15 seconds" in script
     assert "Import-Certificate" not in script
     assert "if ($CiEphemeralCertificate)" in script
     assert "New-CiSigningCertificate" in script
