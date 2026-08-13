@@ -15,6 +15,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from ..paths import app_data_dir
 from ..processes import current_process_identity, process_lease_is_dead
+from ..windows_acl import restrict_owner_only
 from .models import RosterDiff
 
 
@@ -472,7 +473,7 @@ def _secure_private_directory(path: Path, *, create: bool = False) -> None:
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
         raise PermissionError("Classroom operation data directory is not a private directory.")
-    os.chmod(path, 0o700)
+    restrict_owner_only(path, directory=True)
     _verify_owner_only(path, expected_mode=0o700, directory=True)
 
 
@@ -481,7 +482,7 @@ def _secure_private_file(path: Path) -> None:
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
         raise PermissionError("Classroom operation data path is not a private file.")
-    os.chmod(path, 0o600)
+    restrict_owner_only(path, directory=False)
     _verify_owner_only(path, expected_mode=0o600, directory=False)
 
 
