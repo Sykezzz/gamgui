@@ -277,7 +277,7 @@ def test_overlapping_terms_are_applied_automatically(tmp_path: Path) -> None:
 def test_session_dates_scope_each_class_and_treat_end_as_exclusive(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     files = valid_files(term_ids="term-current")
     files["academicSessions.csv"] = csv_text(
         (
@@ -347,7 +347,7 @@ def test_session_dates_scope_each_class_and_treat_end_as_exclusive(
 def test_future_sessions_are_ready_now_for_teacher_setup(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     files = valid_files()
     files["academicSessions.csv"] = files["academicSessions.csv"].replace(
         "term-1,active,Current Term,term,2000-01-01,2100-12-31",
@@ -378,7 +378,7 @@ def test_future_sessions_are_ready_now_for_teacher_setup(
 def test_future_teacher_enrollment_is_immediate_but_future_student_waits(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     start = today + timedelta(days=9)
     files = valid_files()
     files["academicSessions.csv"] = files["academicSessions.csv"].replace(
@@ -440,7 +440,7 @@ def test_schedule_scope_reuses_same_day_immutable_plan(
 def test_selects_nearest_upcoming_school_year_during_summer(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     year_start = today + timedelta(days=20)
     files = valid_files()
     files["academicSessions.csv"] = csv_text(
@@ -492,7 +492,7 @@ def test_selects_nearest_upcoming_school_year_during_summer(
 def test_blank_bulk_statuses_do_not_block_future_automatic_scope(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     year_start = today + timedelta(days=20)
     files = valid_files()
 
@@ -597,7 +597,7 @@ def test_blank_delta_status_is_rejected(tmp_path: Path) -> None:
 def test_later_semester_is_deferred_but_next_school_year_is_out_of_scope(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     later_start = today + timedelta(days=90)
     files = valid_files()
     files["academicSessions.csv"] += (
@@ -636,7 +636,7 @@ def test_later_semester_is_deferred_but_next_school_year_is_out_of_scope(
     assert courses["303"]["ready"] is False
 
 def test_future_term_becomes_ready_within_31_days(tmp_path: Path) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     term_start = today + timedelta(days=31)
     files = valid_files()
 
@@ -718,7 +718,7 @@ def test_term_with_missing_school_year_parent_holds_the_import(tmp_path: Path) -
 def test_enrollment_dates_filter_current_roster_and_use_exclusive_end(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     files = valid_files()
     files["enrollments.csv"] = files["enrollments.csv"].replace(
         ",student,false,,",
@@ -747,7 +747,7 @@ def test_enrollment_dates_filter_current_roster_and_use_exclusive_end(
 def test_ended_enrollment_does_not_block_on_stale_class_reference(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     files = valid_files()
     files["enrollments.csv"] = files["enrollments.csv"].replace(
         "enrollment-student-1,active,101,",
@@ -775,7 +775,7 @@ def test_ended_enrollment_does_not_block_on_stale_class_reference(
 def test_parent_session_does_not_keep_an_ended_child_term_active(
     tmp_path: Path,
 ) -> None:
-    today = date.today()
+    today = ingest_module.district_roster_date()
     files = valid_files(term_ids="year-1,term-1")
     files["academicSessions.csv"] = files["academicSessions.csv"].replace(
         "2000-01-01,2100-12-31,year-1,2026-27",
@@ -1012,7 +1012,7 @@ def test_legacy_snapshot_rebuilds_persisted_course_scope_before_preview(
     course = reopened.preview(snapshot.id, "courses").items[0]
     upgraded = reopened.get_import(snapshot.id)
 
-    assert upgraded.scope_date == date.today().isoformat()
+    assert upgraded.scope_date == ingest_module.district_roster_date().isoformat()
     assert upgraded.school_year_id == "year-1"
     assert course["scope_state"] == "current"
     assert course["school_year_id"] == "year-1"
