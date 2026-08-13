@@ -206,6 +206,8 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert 'Start-Process -FilePath "$env:SystemRoot\\System32\\taskkill.exe"' in exercise
     assert "if (-not $killer.WaitForExit(10000))" in exercise
     assert "Setup process $($Process.Id) could not be stopped" in exercise
+    assert "Temporary CI identity enrollment exceeded 60 seconds" in exercise
+    assert "-RedirectStandardOutput $stdout" in exercise
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():

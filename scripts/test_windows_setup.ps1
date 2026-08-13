@@ -95,8 +95,24 @@ function Invoke-SetupFailure([string[]]$Arguments) {
 }
 
 function New-TrustedIdentity() {
-    $identity = & $signing -Action Enroll -CiEphemeralCertificate -TrustLocalCertificate | ConvertFrom-Json
-    if ($LASTEXITCODE -or -not $identity.created -or -not $identity.ci_ephemeral) {
+    Write-Host "Setup exercise: creating temporary trusted identity"
+    $stdout = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-signing-" + [guid]::NewGuid() + ".json")
+    $stderr = "$stdout.err"
+    try {
+        $process = Start-Process -FilePath powershell.exe -ArgumentList @(
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $signing,
+            "-Action", "Enroll", "-CiEphemeralCertificate", "-TrustLocalCertificate"
+        ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(60000)) {
+            Stop-ProcessTree $process
+            throw "Temporary CI identity enrollment exceeded 60 seconds."
+        }
+        if ($process.ExitCode -ne 0) { throw "Temporary CI identity enrollment failed closed." }
+        $identity = Get-Content -Raw -LiteralPath $stdout | ConvertFrom-Json
+    } finally {
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $identity.created -or -not $identity.ci_ephemeral) {
         throw "The disposable runner identity was not created."
     }
     return [string]$identity.certificate_sha256
@@ -108,7 +124,7 @@ function Remove-IdentityIfPresent([string]$CertificateSha256) {
         $_.Subject -eq "CN=GamGUI Local" -and
         ([System.BitConverter]::ToString($_.GetCertHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)) -replace "-", "").ToLowerInvariant() -eq $CertificateSha256
     })
-    if ($match) { & $signing -Action Remove -CertificateSha256 $CertificateSha256 | Out-Null }
+    if ($match) { & $signing -Action Remove -CertificateSha256 $CertificateSha256 -CiEphemeralCertificate | Out-Null }
 }
 
 function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
@@ -138,6 +154,7 @@ function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
 }
 
 function Exercise-Profile([string]$Profile) {
+    Write-Host "Setup exercise: installing $Profile profile"
     $signer = New-TrustedIdentity
     try {
         Invoke-MonitoredSetup @(

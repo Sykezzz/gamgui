@@ -19,7 +19,42 @@ function Get-CertificateSha256([System.Security.Cryptography.X509Certificates.X5
 }
 
 function Get-LocalCertificates([string]$StoreName) {
-    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\$StoreName" | Where-Object { $_.Subject -eq $subject })
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        return @($store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,
+            $subject,
+            $false
+        ))
+    } finally {
+        $store.Dispose()
+    }
+}
+
+function Remove-LocalCertificates(
+    [string]$StoreName,
+    [string]$ExpectedSha256,
+    [System.Security.Cryptography.X509Certificates.StoreLocation]$Location = [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+) {
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        $Location
+    )
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $matches = @($store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,
+            $subject,
+            $false
+        ) | Where-Object { (Get-CertificateSha256 $_) -eq $ExpectedSha256 })
+        foreach ($match in $matches) { $store.Remove($match) }
+    } finally {
+        $store.Dispose()
+    }
 }
 
 function Get-EnhancedKeyUsageOids([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
@@ -58,10 +93,19 @@ function Add-Trust([System.Security.Cryptography.X509Certificates.X509Certificat
     # The PowerShell import cmdlet can surface an interactive root-trust prompt
     # on hosted Windows even for CurrentUser.  The caller owns the consent boundary; write
     # the public certificate through the noninteractive store API after consent.
+    $location = if ($CiEphemeralCertificate) {
+        # Hosted Windows runners are disposable administrators. Machine stores
+        # avoid an interactive CurrentUser root-confirmation dialog, and their
+        # trust is inherited by the runner's CurrentUser stores. Public setup
+        # never enables this test-only certificate path.
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+    } else {
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    }
     foreach ($storeName in @("Root", "TrustedPublisher")) {
         $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
             $storeName,
-            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+            $location
         )
         try {
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
@@ -245,17 +289,19 @@ if ($Action -eq "Enroll") {
 if (-not ($CertificateSha256 -match '^[0-9a-fA-F]{64}$')) { throw "A pinned certificate SHA-256 is required." }
 if ($Action -eq "Remove") {
     foreach ($store in @("My", "Root", "TrustedPublisher")) {
-        foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
-            Remove-Item -LiteralPath $match.PSPath -Force
+        Remove-LocalCertificates $store $CertificateSha256.ToLowerInvariant()
+    }
+    if ($CiEphemeralCertificate) {
+        foreach ($store in @("Root", "TrustedPublisher")) {
+            Remove-LocalCertificates $store $CertificateSha256.ToLowerInvariant() `
+                ([System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
         }
     }
     exit 0
 }
 if ($Action -eq "RemoveTrust") {
     foreach ($store in @("Root", "TrustedPublisher")) {
-        foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
-            Remove-Item -LiteralPath $match.PSPath -Force
-        }
+        Remove-LocalCertificates $store $CertificateSha256.ToLowerInvariant()
     }
     exit 0
 }
