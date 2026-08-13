@@ -1,5 +1,10 @@
 from pathlib import Path
 import json
+import subprocess
+import sys
+import time
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,12 +131,60 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "function SilentSignerIsAvailable: Boolean;" not in wizard
     assert "X509Certificates.X509Store" not in wizard
     assert "Start-Job -ScriptBlock" not in wizard
-    assert "The transactional backend is the only signer trust authority" in wizard
+    assert 'DestName: "gamgui-signer-preflight.ps1"' in wizard
+    assert 'DestName: "gamgui-signer-preflight-runner.ps1"' in wizard
+    assert "Flags: dontcopy solidbreak" in wizard
+    assert "-TimeoutSeconds 15" in wizard
+    assert "before expanding the large embedded profile" in wizard
+    assert "The transactional backend repeats the" in wizard
     assert "-TrustMode Pretrusted -PretrustedSignerSha256" in wizard
     assert "GetEnv('CI')" not in wizard
     assert "Refusing a validation-only signer switch in public Setup" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
     assert "Also delete local application data" in wizard
+
+    preflight = (ROOT / "scripts" / "windows_signer_preflight.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert 'ValidatePattern(\'^[0-9a-fA-F]{64}$\')' in preflight
+    assert '"-Action Inspect"' in preflight
+    assert ".WaitForExit($TimeoutSeconds * 1000)" in preflight
+    assert "$process.Refresh()" in preflight
+    assert "if ($null -eq $process.ExitCode) { exit 1 }" in preflight
+    assert "taskkill.exe" in preflight
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows signer process contract")
+def test_windows_signer_preflight_terminates_a_stalled_provider(tmp_path):
+    stalled_signer = tmp_path / "stalled-signer.ps1"
+    stalled_signer.write_text(
+        "param([string]$Action, [string]$CertificateSha256)\n"
+        "Start-Sleep -Seconds 30\n",
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "scripts" / "windows_signer_preflight.ps1"),
+            "-CertificateSha256",
+            "0" * 64,
+            "-SigningScript",
+            str(stalled_signer),
+            "-TimeoutSeconds",
+            "1",
+        ],
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 2
+    assert time.monotonic() - started < 8
 
 
 def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():

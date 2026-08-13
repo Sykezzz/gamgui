@@ -22,6 +22,7 @@ $ownedPaths = @(
     "main.py", "gamgui", "gamgui.spec", "gamgui-updater.spec", "pyproject.toml", "uv.lock",
     "scripts/build_windows_release.ps1", "scripts/build_windows_setup.ps1", "scripts/windows_setup.iss",
     "scripts/fetch_gam_windows.ps1", "scripts/gam_checksums.txt", "scripts/windows_local_signing.ps1",
+    "scripts/windows_signer_preflight.ps1",
     "scripts/install_windows_bootstrap.ps1", "scripts/uninstall_windows_bootstrap.ps1", "LICENSE"
 )
 $dirty = & git status --porcelain --untracked-files=all -- @ownedPaths
