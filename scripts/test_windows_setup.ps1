@@ -84,11 +84,25 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
     Remove-Item -LiteralPath $setupLog -Force -ErrorAction SilentlyContinue
 }
 
-function Invoke-SetupFailure([string[]]$Arguments) {
+function Invoke-SetupFailure([string[]]$Arguments, [int]$TimeoutSeconds = 300) {
+    Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
     $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
-    if (-not $process.WaitForExit(30000)) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastMessage = "SETUP-NOT-STARTED"
+    while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $progressPath -PathType Leaf) {
+            try {
+                $receipt = Get-Content -Raw -LiteralPath $progressPath | ConvertFrom-Json
+                if ([string]$receipt.message_code) { $lastMessage = [string]$receipt.message_code }
+            } catch {
+                # Retry while the backend atomically replaces the receipt.
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $process.HasExited) {
         Stop-ProcessTree $process
-        throw "A rejected Setup invocation did not fail closed within 30 seconds."
+        throw "A rejected Setup invocation exceeded $TimeoutSeconds seconds at sanitized phase $lastMessage."
     }
     if ($process.ExitCode -eq 0) { throw "An unsafe Setup invocation unexpectedly succeeded." }
     if (Test-Path -LiteralPath $current) { throw "A rejected Setup invocation created an installation." }
