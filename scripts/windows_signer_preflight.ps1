@@ -16,6 +16,17 @@ $receiptBase = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-signer-prefl
 $stdoutPath = "$receiptBase.out"
 $stderrPath = "$receiptBase.err"
 $process = $null
+
+function Stop-PreflightProcess([System.Diagnostics.Process]$Target) {
+    if ($null -eq $Target -or $Target.HasExited) { return }
+    $killer = Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
+        -ArgumentList @("/PID", $Target.Id, "/T", "/F") -WindowStyle Hidden -PassThru
+    if (-not $killer.WaitForExit(5000)) {
+        Stop-Process -Id $killer.Id -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $Target.Id -Force -ErrorAction SilentlyContinue
+}
+
 try {
     $argumentLine = @(
         "-NoProfile",
@@ -29,7 +40,7 @@ try {
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
         -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F *> $null
+        Stop-PreflightProcess $process
         exit 2
     }
     [void]$process.WaitForExit()
@@ -38,7 +49,7 @@ try {
     exit [int]$process.ExitCode
 } finally {
     if ($process -and -not $process.HasExited) {
-        & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F *> $null
+        Stop-PreflightProcess $process
     }
     Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 }
