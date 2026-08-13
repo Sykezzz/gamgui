@@ -63,18 +63,23 @@ function Get-CertificateSha256([System.Security.Cryptography.X509Certificates.X5
     return ([System.BitConverter]::ToString($bytes) -replace "-", "").ToLowerInvariant()
 }
 
-function Get-LocalCertificates([string]$StoreName) {
+function Get-LocalCertificates(
+    [string]$StoreName,
+    [string]$CertificateThumbprint = ""
+) {
     $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
         $StoreName,
         [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
     )
     try {
         $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
-        return @($store.Certificates.Find(
-            [System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,
-            $subject,
-            $false
-        ))
+        $findType = [System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName
+        $findValue = $subject
+        if ($CertificateThumbprint) {
+            $findType = [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint
+            $findValue = $CertificateThumbprint
+        }
+        return @($store.Certificates.Find($findType, $findValue, $false))
     } finally {
         $store.Dispose()
     }
@@ -131,7 +136,9 @@ function Find-LocalCertificate([bool]$RequirePrivateKey) {
 function Test-Trusted([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $sha = Get-CertificateSha256 $Certificate
     foreach ($store in @("Root", "TrustedPublisher")) {
-        $match = @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $sha })
+        $match = @(Get-LocalCertificates $store $Certificate.Thumbprint | Where-Object {
+            (Get-CertificateSha256 $_) -eq $sha
+        })
         if ($match.Count -ne 1) { return $false }
     }
     return $true

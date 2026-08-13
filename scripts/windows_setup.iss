@@ -177,31 +177,35 @@ end;
 
 function SilentSignerIsAvailable: Boolean;
 var
-  Script, Probe, TrustChecks: String;
+  Script, Probe: String;
   ResultCode: Integer;
 begin
-  TrustChecks :=
-    'if ((-not (Find-Certificate ''Root'' $false)) -or ' +
-    '(-not (Find-Certificate ''TrustedPublisher'' $false))) { return $false };';
   Probe :=
     '$ErrorActionPreference=''Stop'';' +
     '$algorithm=[System.Security.Cryptography.HashAlgorithmName]::SHA256;' +
-    'function Find-Certificate([string]$name,[bool]$privateKey) {' +
+    'function Open-Store([string]$name) {' +
     '$store=[System.Security.Cryptography.X509Certificates.X509Store]::new($name,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser);' +
-    'try {' +
-    '$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly);' +
+    '$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly); return $store};' +
+    'function Find-Identity {' +
+    '$store=Open-Store ''My''; try {' +
     '$candidates=$store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,''CN=GamGUI Local'',$false);' +
     '$matches=@($candidates | Where-Object {' +
     '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected) -and ' +
-    '((-not $privateKey) -or $_.HasPrivateKey)' +
-    '}); return $matches.Count -eq 1' +
-    '} finally { $store.Close() } };' +
-    'if (-not (Find-Certificate ''My'' $true)) { return $false };' +
-    TrustChecks + 'return $true';
+    '$_.HasPrivateKey}); if ($matches.Count -ne 1) { return $null }; return $matches[0]' +
+    '} finally { $store.Dispose() } };' +
+    'function Find-TrustedCopy([string]$name,[string]$thumbprint) {' +
+    '$store=Open-Store $name; try {' +
+    '$matches=@($store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,$thumbprint,$false) | Where-Object {' +
+    '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected)});' +
+    'return $matches.Count -eq 1' +
+    '} finally { $store.Dispose() } };' +
+    '$identity=Find-Identity; if ($null -eq $identity) { return $false };' +
+    'if ((-not (Find-TrustedCopy ''Root'' $identity.Thumbprint)) -or ' +
+    '(-not (Find-TrustedCopy ''TrustedPublisher'' $identity.Thumbprint))) { return $false }; return $true';
   Script :=
     '$expected=''' + Lowercase(SilentSigner) + ''';' +
     '$probe=Start-Job -ScriptBlock { param($expected) ' + Probe + ' } -ArgumentList $expected;' +
-    'if (-not (Wait-Job -Job $probe -Timeout 15)) { exit 2 };' +
+    'if (-not (Wait-Job -Job $probe -Timeout 15)) { Stop-Process -Id $PID -Force; exit 2 };' +
     '$result=[bool](Receive-Job -Job $probe -ErrorAction SilentlyContinue);' +
     '$state=$probe.State; Remove-Job -Job $probe -Force -ErrorAction SilentlyContinue;' +
     'if (($state -ne ''Completed'') -or (-not $result)) { exit 1 }; exit 0';

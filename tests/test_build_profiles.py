@@ -129,9 +129,11 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "FindBySubjectDistinguishedName" in wizard
     assert "Start-Job -ScriptBlock" in wizard
     assert "Wait-Job -Job $probe -Timeout 15" in wizard
-    assert "Find-Certificate ''My''" in wizard
-    assert "Find-Certificate ''Root''" in wizard
-    assert "Find-Certificate ''TrustedPublisher''" in wizard
+    assert "Find-Identity" in wizard
+    assert "Find-TrustedCopy ''Root'' $identity.Thumbprint" in wizard
+    assert "Find-TrustedCopy ''TrustedPublisher'' $identity.Thumbprint" in wizard
+    assert "FindByThumbprint" in wizard
+    assert "Stop-Process -Id $PID -Force" in wizard
     assert "Get-ChildItem -LiteralPath $store" not in wizard
     assert "HasPrivateKey" in wizard
     assert "if not SilentSignerIsAvailable then" in wizard
