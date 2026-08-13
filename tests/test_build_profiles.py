@@ -136,8 +136,12 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Flags: dontcopy solidbreak" not in wizard
     assert wizard.count("deleteafterinstall solidbreak") == 2
     assert "-TimeoutSeconds 15" in wizard
-    assert "before expanding the large embedded profile" in wizard
+    assert "before Setup expands either profile" in wizard
     assert "The transactional backend repeats the" in wizard
+    assert "function RunSilentSignerPreflight: Boolean;" in wizard
+    assert "if WizardSilent and (not RunSilentSignerPreflight) then" in wizard
+    assert "Abort;" in wizard
+    assert "The pinned GamGUI Local identity is missing" not in wizard
     assert "-TrustMode Pretrusted -PretrustedSignerSha256" in wizard
     assert "GetEnv('CI')" not in wizard
     assert "Refusing a validation-only signer switch in public Setup" in wizard
