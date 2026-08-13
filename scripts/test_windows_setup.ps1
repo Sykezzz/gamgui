@@ -28,6 +28,14 @@ function Invoke-Process([string]$FilePath, [string[]]$Arguments, [int]$ExpectedE
     }
 }
 
+function Stop-ProcessTree([System.Diagnostics.Process]$Process) {
+    if ($Process.HasExited) { return }
+    & taskkill.exe /PID $Process.Id /T /F 2>$null | Out-Null
+    if (-not $Process.WaitForExit(10000)) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200) {
     Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
     $setupLog = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-setup-" + [guid]::NewGuid() + ".log")
@@ -47,7 +55,7 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
             }
         }
         if ([DateTime]::UtcNow -ge $deadline) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree $process
             throw "Setup exceeded $TimeoutSeconds seconds at sanitized phase $lastMessage."
         }
         Start-Sleep -Milliseconds 500
@@ -65,7 +73,7 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
 function Invoke-SetupFailure([string[]]$Arguments) {
     $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(30000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        Stop-ProcessTree $process
         throw "A rejected Setup invocation did not fail closed within 30 seconds."
     }
     if ($process.ExitCode -eq 0) { throw "An unsafe Setup invocation unexpectedly succeeded." }
