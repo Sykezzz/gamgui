@@ -84,19 +84,49 @@ function Invoke-MonitoredSetup([string[]]$Arguments, [int]$TimeoutSeconds = 1200
     Remove-Item -LiteralPath $setupLog -Force -ErrorAction SilentlyContinue
 }
 
-function Invoke-SetupFailure([string[]]$Arguments) {
+function Invoke-SetupFailure([string[]]$Arguments, [int]$TimeoutSeconds = 300) {
+    Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
     $process = Start-Process -FilePath $SetupPath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
-    if (-not $process.WaitForExit(30000)) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastMessage = "SETUP-NOT-STARTED"
+    while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $progressPath -PathType Leaf) {
+            try {
+                $receipt = Get-Content -Raw -LiteralPath $progressPath | ConvertFrom-Json
+                if ([string]$receipt.message_code) { $lastMessage = [string]$receipt.message_code }
+            } catch {
+                # Retry while the backend atomically replaces the receipt.
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $process.HasExited) {
         Stop-ProcessTree $process
-        throw "A rejected Setup invocation did not fail closed within 30 seconds."
+        throw "A rejected Setup invocation exceeded $TimeoutSeconds seconds at sanitized phase $lastMessage."
     }
     if ($process.ExitCode -eq 0) { throw "An unsafe Setup invocation unexpectedly succeeded." }
     if (Test-Path -LiteralPath $current) { throw "A rejected Setup invocation created an installation." }
 }
 
 function New-TrustedIdentity() {
-    $identity = & $signing -Action Enroll -CiEphemeralCertificate -TrustLocalCertificate | ConvertFrom-Json
-    if ($LASTEXITCODE -or -not $identity.created -or -not $identity.ci_ephemeral) {
+    Write-Host "Setup exercise: creating temporary trusted identity"
+    $stdout = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-signing-" + [guid]::NewGuid() + ".json")
+    $stderr = "$stdout.err"
+    try {
+        $process = Start-Process -FilePath powershell.exe -ArgumentList @(
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $signing,
+            "-Action", "Enroll", "-CiEphemeralCertificate", "-TrustLocalCertificate"
+        ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(60000)) {
+            Stop-ProcessTree $process
+            throw "Temporary CI identity enrollment exceeded 60 seconds."
+        }
+        if ($process.ExitCode -ne 0) { throw "Temporary CI identity enrollment failed closed." }
+        $identity = Get-Content -Raw -LiteralPath $stdout | ConvertFrom-Json
+    } finally {
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $identity.created -or -not $identity.ci_ephemeral) {
         throw "The disposable runner identity was not created."
     }
     return [string]$identity.certificate_sha256
@@ -108,7 +138,7 @@ function Remove-IdentityIfPresent([string]$CertificateSha256) {
         $_.Subject -eq "CN=GamGUI Local" -and
         ([System.BitConverter]::ToString($_.GetCertHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)) -replace "-", "").ToLowerInvariant() -eq $CertificateSha256
     })
-    if ($match) { & $signing -Action Remove -CertificateSha256 $CertificateSha256 | Out-Null }
+    if ($match) { & $signing -Action Remove -CertificateSha256 $CertificateSha256 -CiEphemeralCertificate | Out-Null }
 }
 
 function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
@@ -138,6 +168,7 @@ function Assert-Installed([string]$Profile, [string]$CertificateSha256) {
 }
 
 function Exercise-Profile([string]$Profile) {
+    Write-Host "Setup exercise: installing $Profile profile"
     $signer = New-TrustedIdentity
     try {
         Invoke-MonitoredSetup @(

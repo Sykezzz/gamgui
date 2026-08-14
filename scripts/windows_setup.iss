@@ -65,8 +65,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseCoreProfile
-Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall; Check: UseClassroomProfile
+; Keep the read-only signer preflight ahead of the solid application payload so
+; an invalid silent-install identity fails before Setup expands either profile.
+Source: "{#SourceRoot}\scripts\windows_local_signing.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight.ps1"; Flags: dontcopy
+Source: "{#SourceRoot}\scripts\windows_signer_preflight.ps1"; DestDir: "{tmp}"; DestName: "gamgui-signer-preflight-runner.ps1"; Flags: dontcopy
+Source: "{#CoreBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall solidbreak; Check: UseCoreProfile
+Source: "{#ClassroomBootstrap}\*"; DestDir: "{tmp}\gamgui-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs deleteafterinstall solidbreak; Check: UseClassroomProfile
 
 [Icons]
 Name: "{userprograms}\GamGUI"; Filename: "{localappdata}\GamGUI\updater\GamGUIUpdater.exe"; Parameters: "--launch-installed"; WorkingDir: "{localappdata}\GamGUI\updater"
@@ -175,42 +179,7 @@ begin
     end;
 end;
 
-function SilentSignerIsAvailable: Boolean;
-var
-  Script, Probe, TrustChecks: String;
-  ResultCode: Integer;
-begin
-  TrustChecks :=
-    'if ((-not (Find-Certificate ''Root'' $false)) -or ' +
-    '(-not (Find-Certificate ''TrustedPublisher'' $false))) { return $false };';
-  Probe :=
-    '$ErrorActionPreference=''Stop'';' +
-    '$algorithm=[System.Security.Cryptography.HashAlgorithmName]::SHA256;' +
-    'function Find-Certificate([string]$name,[bool]$privateKey) {' +
-    '$store=[System.Security.Cryptography.X509Certificates.X509Store]::new($name,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser);' +
-    'try {' +
-    '$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly);' +
-    '$candidates=$store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName,''CN=GamGUI Local'',$false);' +
-    '$matches=@($candidates | Where-Object {' +
-    '(([System.BitConverter]::ToString($_.GetCertHash($algorithm)) -replace ''-'','''').ToLowerInvariant() -eq $expected) -and ' +
-    '((-not $privateKey) -or $_.HasPrivateKey)' +
-    '}); return $matches.Count -eq 1' +
-    '} finally { $store.Close() } };' +
-    'if (-not (Find-Certificate ''My'' $true)) { return $false };' +
-    TrustChecks + 'return $true';
-  Script :=
-    '$expected=''' + Lowercase(SilentSigner) + ''';' +
-    '$probe=Start-Job -ScriptBlock { param($expected) ' + Probe + ' } -ArgumentList $expected;' +
-    'if (-not (Wait-Job -Job $probe -Timeout 15)) { exit 2 };' +
-    '$result=[bool](Receive-Job -Job $probe -ErrorAction SilentlyContinue);' +
-    '$state=$probe.State; Remove-Job -Job $probe -Force -ErrorAction SilentlyContinue;' +
-    'if (($state -ne ''Completed'') -or (-not $result)) { exit 1 }; exit 0';
-  Result := Exec(
-    'powershell.exe',
-    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Script),
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode
-  ) and (ResultCode = 0);
-end;
+function RunSilentSignerPreflight: Boolean; forward;
 
 procedure OpenInstalledClick(Sender: TObject);
 var
@@ -374,7 +343,26 @@ begin
   TrustCheck.Checked := False;
 
   ProgressReceipt := AddBackslash(FixedData) + 'updates\setup-progress.json';
+  if WizardSilent and (not RunSilentSignerPreflight) then
+  begin
+    Log('Refusing silent setup because the pinned identity is missing, lacks its private key, is untrusted, or its provider did not answer safely.');
+    Abort;
+  end;
+end;
 
+function RunSilentSignerPreflight: Boolean;
+var
+  Arguments: String;
+  ResultCode: Integer;
+begin
+  ExtractTemporaryFile('gamgui-signer-preflight.ps1');
+  ExtractTemporaryFile('gamgui-signer-preflight-runner.ps1');
+  Arguments := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight-runner.ps1')) +
+    ' -SigningScript ' + AddQuotes(ExpandConstant('{tmp}\gamgui-signer-preflight.ps1')) +
+    ' -CertificateSha256 ' + AddQuotes(SilentSigner) + ' -TimeoutSeconds 15';
+  Result := Exec('powershell.exe', Arguments, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and
+    (ResultCode = 0);
 end;
 
 function InitializeUninstall: Boolean;
@@ -465,12 +453,9 @@ begin
       Result := False;
       Exit;
     end;
-    if not SilentSignerIsAvailable then
-    begin
-      Log('Refusing silent setup because the pinned private-key certificate is missing or is not trusted in every required current-user store.');
-      Result := False;
-      Exit;
-    end;
+    { InitializeWizard runs the shared read-only signer inspection before the
+      large embedded profile is expanded. The transactional backend repeats the
+      exact check before copying or signing the application. }
   end;
 end;
 

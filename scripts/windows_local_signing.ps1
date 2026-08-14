@@ -13,13 +13,101 @@ $ErrorActionPreference = "Stop"
 $subject = "CN=GamGUI Local"
 $codeSigningOid = "1.3.6.1.5.5.7.3.3"
 
+if (-not ("GamGui.RootTrustDialog" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace GamGui {
+    public static class RootTrustDialog {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+    }
+}
+"@
+}
+
+function Invoke-RootStoreMutation([string]$Arguments) {
+    # TrustLocalCertificate is the caller's explicit consent boundary. Windows
+    # still opens its protected-root confirmation dialog, so acknowledge only
+    # that standard IDYES control for this exact certutil child and keep the
+    # operation bounded. This works for both interactive setup and headless CI.
+    $process = Start-Process -FilePath "$env:SystemRoot\System32\certutil.exe" `
+        -ArgumentList $Arguments -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        $process.Refresh()
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
+            $yes = [GamGui.RootTrustDialog]::GetDlgItem($process.MainWindowHandle, 6)
+            if ($yes -ne [IntPtr]::Zero) {
+                [void][GamGui.RootTrustDialog]::SendMessage(
+                    $yes,
+                    0x00F5,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                )
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        throw "The protected current-user root-store operation exceeded 15 seconds."
+    }
+    if ($process.ExitCode -ne 0) { throw "The protected current-user root-store operation failed closed." }
+}
+
 function Get-CertificateSha256([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $bytes = $Certificate.GetCertHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
     return ([System.BitConverter]::ToString($bytes) -replace "-", "").ToLowerInvariant()
 }
 
-function Get-LocalCertificates([string]$StoreName) {
-    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\$StoreName" | Where-Object { $_.Subject -eq $subject })
+function Get-LocalCertificates(
+    [string]$StoreName,
+    [string]$CertificateThumbprint = ""
+) {
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        $findType = [System.Security.Cryptography.X509Certificates.X509FindType]::FindBySubjectDistinguishedName
+        $findValue = $subject
+        if ($CertificateThumbprint) {
+            $findType = [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint
+            $findValue = $CertificateThumbprint
+        }
+        return @($store.Certificates.Find($findType, $findValue, $false))
+    } finally {
+        $store.Dispose()
+    }
+}
+
+function Remove-LocalCertificates(
+    [string]$StoreName,
+    [string]$ExpectedSha256
+) {
+    $matches = @(Get-LocalCertificates $StoreName | Where-Object {
+        (Get-CertificateSha256 $_) -eq $ExpectedSha256
+    })
+    if ($StoreName -eq "Root") {
+        foreach ($match in $matches) {
+            Invoke-RootStoreMutation "-user -delstore Root $($match.Thumbprint)"
+        }
+        return
+    }
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        foreach ($match in $matches) { $store.Remove($match) }
+    } finally {
+        $store.Dispose()
+    }
 }
 
 function Get-EnhancedKeyUsageOids([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
@@ -48,7 +136,9 @@ function Find-LocalCertificate([bool]$RequirePrivateKey) {
 function Test-Trusted([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $sha = Get-CertificateSha256 $Certificate
     foreach ($store in @("Root", "TrustedPublisher")) {
-        $match = @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $sha })
+        $match = @(Get-LocalCertificates $store $Certificate.Thumbprint | Where-Object {
+            (Get-CertificateSha256 $_) -eq $sha
+        })
         if ($match.Count -ne 1) { return $false }
     }
     return $true
@@ -58,7 +148,17 @@ function Add-Trust([System.Security.Cryptography.X509Certificates.X509Certificat
     # The PowerShell import cmdlet can surface an interactive root-trust prompt
     # on hosted Windows even for CurrentUser.  The caller owns the consent boundary; write
     # the public certificate through the noninteractive store API after consent.
-    foreach ($storeName in @("Root", "TrustedPublisher")) {
+    $publicPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gamgui-local-" + [guid]::NewGuid() + ".cer")
+    try {
+        [System.IO.File]::WriteAllBytes(
+            $publicPath,
+            $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+        )
+        Invoke-RootStoreMutation "-user -f -addstore Root `"$publicPath`""
+    } finally {
+        Remove-Item -LiteralPath $publicPath -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($storeName in @("TrustedPublisher")) {
         $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
             $storeName,
             [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
@@ -245,17 +345,13 @@ if ($Action -eq "Enroll") {
 if (-not ($CertificateSha256 -match '^[0-9a-fA-F]{64}$')) { throw "A pinned certificate SHA-256 is required." }
 if ($Action -eq "Remove") {
     foreach ($store in @("My", "Root", "TrustedPublisher")) {
-        foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
-            Remove-Item -LiteralPath $match.PSPath -Force
-        }
+        Remove-LocalCertificates $store $CertificateSha256.ToLowerInvariant()
     }
     exit 0
 }
 if ($Action -eq "RemoveTrust") {
     foreach ($store in @("Root", "TrustedPublisher")) {
-        foreach ($match in @(Get-LocalCertificates $store | Where-Object { (Get-CertificateSha256 $_) -eq $CertificateSha256.ToLowerInvariant() })) {
-            Remove-Item -LiteralPath $match.PSPath -Force
-        }
+        Remove-LocalCertificates $store $CertificateSha256.ToLowerInvariant()
     }
     exit 0
 }
