@@ -27,6 +27,11 @@ from gamgui.web.routes.oneroster import (
 )
 from tests.test_oneroster_helpers import valid_files, zip_bytes
 
+# The guided-setup endpoints are only reached through hx-post forms, so htmx always
+# stamps this header. Without it they redirect to the full page, because returning a
+# layout-less partial to a plain navigation renders an unstyled orphan document.
+HTMX = {"HX-Request": "true"}
+
 
 TEMPLATES = Path(__file__).parents[1] / "gamgui" / "web" / "templates"
 
@@ -540,6 +545,75 @@ def test_dashboard_reads_only_local_import_configuration():
     assert not any(call[0] in {"gam", "google", "connector"} for call in service.calls)
 
 
+def test_connectivity_diagnostics_render_success_without_leaking_activity_lease():
+    client, service = _client()
+    registry = ActivityRegistry()
+    client.app.state.gamgui.activity_registry = registry
+    service.scope_readiness = lambda: {
+        "ready": False, "verified_at": 0.0, "expires_at": 0.0
+    }
+    service.mark_scope_ready = lambda: {
+        "ready": True, "verified_at": 1.0, "expires_at": 2.0
+    }
+    course = SimpleNamespace(id="course-1", aliases=("Section_123",))
+
+    class Roster(tuple):
+        def covers(self, course_ids):
+            return tuple(course_ids) == ("course-1",)
+
+    connector = SimpleNamespace(
+        list_oneroster_directory=lambda: asyncio.sleep(0, result=(object(),)),
+        list_oneroster_managed_courses=lambda aliases: asyncio.sleep(
+            0, result=(course,)
+        ),
+        list_course_participants_many=lambda course_ids, role: asyncio.sleep(
+            0, result=Roster((object(),))
+        ),
+    )
+    client.app.state.gamgui.connector = connector
+
+    response = client.post(
+        "/classroom/imports/access/verify",
+        data={"managed_alias": "Section_123", "admin": "admin@example.com"},
+    )
+
+    assert response.status_code == 200
+    assert "OneRoster read capabilities passed" in response.text
+    assert "WEB-HTTP-5XX" not in response.text
+    assert not registry.is_active()
+
+
+def test_connectivity_diagnostics_render_controlled_failure_and_release_lease():
+    client, service = _client()
+    registry = ActivityRegistry()
+    client.app.state.gamgui.activity_registry = registry
+    service.scope_readiness = lambda: {
+        "ready": False, "verified_at": 0.0, "expires_at": 0.0
+    }
+    service.invalidate_scope_readiness = lambda: None
+    client.app.state.gamgui.connector = SimpleNamespace(
+        list_oneroster_directory=lambda: asyncio.sleep(
+            0, result=(object(),)
+        ),
+        list_oneroster_managed_courses=lambda aliases: asyncio.sleep(
+            0, result=()
+        ),
+        list_course_participants_many=lambda course_ids, role: asyncio.sleep(
+            0, result=()
+        ),
+    )
+
+    response = client.post(
+        "/classroom/imports/access/verify",
+        data={"managed_alias": "Section_123", "admin": "admin@example.com"},
+    )
+
+    assert response.status_code == 200
+    assert "Diagnostic stopped" in response.text
+    assert "WEB-HTTP-5XX" not in response.text
+    assert not registry.is_active()
+
+
 def test_upload_rejects_non_zip_before_service_and_accepts_zip_stream():
     client, service = _client()
     registry = ActivityRegistry()
@@ -689,6 +763,7 @@ def test_folder_upload_accepts_future_session_snapshot_without_error(
             )
             for name, value in source_files.items()
         ],
+        headers=HTMX,
     )
 
     assert response.status_code == 200
@@ -789,7 +864,9 @@ def test_bounded_upload_stream_rejects_bytes_past_server_cap():
 
 def test_validate_uses_eagerly_validated_snapshot_without_remote_call():
     client, service = _client()
-    response = client.post("/classroom/imports/import/import-1/validate")
+    response = client.post(
+        "/classroom/imports/import/import-1/validate", headers=HTMX
+    )
 
     assert response.status_code == 200
     assert "Local validation completed" in response.text
@@ -864,6 +941,37 @@ def test_preview_rejects_unallowlisted_kind_before_service():
     assert not any(call[0] == "preview" for call in service.calls)
 
 
+def test_plain_navigation_gets_the_full_page_not_a_layoutless_partial():
+    """A non-htmx request must never receive a bare guided-setup fragment.
+
+    The partial has no {% extends %}, so a browser rendering it as a whole
+    document shows an unstyled page: no stylesheet link, no app shell.
+    """
+
+    client, _ = _client()
+
+    detail = client.get("/classroom/imports/import/import-1", follow_redirects=False)
+    assert detail.status_code == 303
+    assert detail.headers["location"] == "/classroom/imports"
+
+    naming = client.post(
+        "/classroom/imports/import/import-1/naming",
+        data={"naming_choice": "default"},
+        follow_redirects=False,
+    )
+    assert naming.status_code == 303
+
+    # Following it lands on a real document that carries the stylesheet.
+    landed = client.get("/classroom/imports/import/import-1")
+    assert landed.status_code == 200
+    assert '<link rel="stylesheet" href="/static/app.css" />' in landed.text
+
+    # The htmx path still swaps in the bare partial.
+    swapped = client.get("/classroom/imports/import/import-1", headers=HTMX)
+    assert swapped.status_code == 200
+    assert "<!doctype html>" not in swapped.text.lower()
+
+
 def test_academic_sessions_explain_automatic_scope_without_selection_controls():
     client, service = _client()
     preview = client.get(
@@ -880,6 +988,7 @@ def test_academic_sessions_explain_automatic_scope_without_selection_controls():
     selected = client.post(
         "/classroom/imports/import/import-1/session",
         data={"session_id": "term-2026"},
+        headers=HTMX,
     )
     assert selected.status_code == 200
     assert "Automatic class and enrollment date scope refreshed" in selected.text
@@ -906,6 +1015,7 @@ def test_import_naming_scheme_is_discoverable_and_rebuilds_locally():
                 "[[ ({school_year})]]"
             ),
         },
+        headers=HTMX,
     )
 
     assert configured.status_code == 200
@@ -1270,6 +1380,46 @@ def test_thresholds_validate_numbers_and_save_profile():
         },
     )
     assert "OR-THRESHOLD-INVALID" in conflict.text
+
+
+def test_real_threshold_service_save_response_normalizes_nested_models(tmp_path):
+    actions = (
+        "course_create", "course_update", "course_archive", "teacher_add",
+        "teacher_remove", "student_add", "student_remove", "owner_mismatch",
+        "record_rejected",
+    )
+    service = OneRosterService("example.org", tmp_path / "threshold-models")
+    state = SimpleNamespace(
+        component_manager=FakeComponentManager(),
+        oneroster_service=service,
+        audit_domain="example.org",
+        connector=object(),
+        oneroster_manifest_tasks={},
+        oneroster_manifest_errors={},
+        activity_registry=ActivityRegistry(),
+    )
+    app = FastAPI()
+    app.state.gamgui = state
+    app.include_router(router)
+    data = {
+        "mode": "normal",
+        **{f"{action}_disabled": "true" for action in actions},
+        "additional_blackouts": (
+            "2026-08-01T08:00 | 2026-08-01T17:00 | Registration freeze"
+        ),
+    }
+    for action in (
+        "teacher_remove", "student_remove", "owner_mismatch", "record_rejected"
+    ):
+        data.pop(f"{action}_disabled")
+        data[f"{action}_percent"] = "2"
+
+    response = TestClient(app).post("/classroom/imports/thresholds", data=data)
+
+    assert response.status_code == 200
+    assert "Threshold profile saved" in response.text
+    assert "Registration freeze" in response.text
+    assert service.get_threshold_profile().configured is True
 
 
 def test_student_gate_requires_manifest_and_typed_open_confirmation():

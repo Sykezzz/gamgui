@@ -19,7 +19,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncIterator, Iterable
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from ..activity import ADMIN_ACTIVITY_BUSY_MESSAGE, try_acquire_admin_activity
 from ..server import TEMPLATES
@@ -106,6 +111,9 @@ _THRESHOLD_KEYS = {
     for measure in ("count", "percent")
 }
 _CHECKED_VALUES = {"1", "true", "yes", "on"}
+_ADDITIONS_FIRST_ACTION_KINDS = frozenset(
+    {"course_create", "course_activate", "teacher_add", "student_add"}
+)
 _DEFAULT_COURSE_NAME_TEMPLATE = (
     "{course_title} \u2013 {class_code} ({school_year})"
 )
@@ -630,6 +638,18 @@ def _manifest_record(
             for item in (result.get("drift_report", ()) or ())
         ][:100],
     )
+    action_kinds = {
+        str(kind)
+        for kind, count in action_counts.items()
+        if int(count or 0) > 0
+    }
+    result["additions_first_bootstrap_eligible"] = bool(
+        result["status"] == "paused"
+        and result["plan_kind"] == "limited"
+        and total > complete_count
+        and action_kinds
+        and action_kinds <= _ADDITIONS_FIRST_ACTION_KINDS
+    )
     error_code = str(result.get("error", "") or "")
     status = str(result.get("status", "") or "")
     if error_code:
@@ -794,12 +814,33 @@ def _execution_error(exc: Exception) -> tuple[str, str]:
     code = str(getattr(exc, "code", "") or "OR-EXECUTION-FAILED")
     if code == "OR-ACTIVE-JOB":
         code = "CMP-ACTIVE-JOB"
+    if code == "CMP-ACTIVE-JOB":
+        return (
+            code,
+            "The bootstrap did not start because another administrative job remained "
+            "active. No additions-first GAM phase was submitted.",
+        )
     return (
         code,
         "Execution stopped. One or more Classroom changes may already have been "
         "applied. Review the persisted per-action results below, re-read live "
         "Classroom state, and create and confirm a new plan before continuing.",
     )
+
+
+def _is_htmx(request: Request) -> bool:
+    return request.headers.get("HX-Request", "").casefold() == "true"
+
+
+def _page_redirect() -> RedirectResponse:
+    """Send a plain browser navigation back to the full OneRoster page.
+
+    The guided-setup partials carry no layout, so returning one straight to a
+    non-htmx request renders an orphan document: no stylesheet, no app shell.
+    303 keeps a native form POST from re-submitting on refresh.
+    """
+
+    return RedirectResponse(router.prefix, status_code=303)
 
 
 def _status(
@@ -842,7 +883,7 @@ async def _ingest_uploaded_stream(
     )
 
 
-def _uploaded_snapshot_response(request: Request, value: Any) -> HTMLResponse:
+def _uploaded_snapshot_response(request: Request, value: Any) -> Response:
     snapshot = _snapshot_record(value)
     import_id = str(snapshot.get("id", snapshot.get("import_id", "")) or "")
     if not _valid_import_id(import_id):
@@ -852,6 +893,9 @@ def _uploaded_snapshot_response(request: Request, value: Any) -> HTMLResponse:
             error_code="OR-IMPORT-FAILED",
         )
     snapshot.setdefault("id", import_id)
+    # The upload is already persisted; a non-htmx submit still needs the styled page.
+    if not _is_htmx(request):
+        return _page_redirect()
     return TEMPLATES.TemplateResponse(
         request,
         "_oneroster_guided_setup.html",
@@ -900,6 +944,7 @@ def _manifest_response(
     polling: bool = False,
     progress: Any = None,
     gate: Any = None,
+    bootstrap_missing_count: int = 0,
 ) -> HTMLResponse:
     template = (
         "_oneroster_manifest.html"
@@ -917,6 +962,7 @@ def _manifest_response(
             "polling": polling,
             "progress": _record(progress) if progress is not None else {},
             "gate": _record(gate) if gate is not None else {},
+            "bootstrap_missing_count": max(0, int(bootstrap_missing_count or 0)),
         },
     )
 
@@ -933,6 +979,20 @@ async def _manifest_progress(service: Any, manifest_id: str) -> Any:
 
 async def _manifest_gate(service: Any) -> Any:
     return await _local_gate(service)
+
+
+async def _bootstrap_missing_report_count(
+    service: Any,
+    manifest_id: str,
+) -> int:
+    store = getattr(service, "store", None)
+    method = getattr(store, "bootstrap_missing_report_count", None)
+    if not callable(method):
+        return 0
+    try:
+        return max(0, int(await asyncio.to_thread(method, manifest_id) or 0))
+    except (KeyError, TypeError, ValueError):
+        return 0
 
 
 async def _run_manifest(
@@ -967,6 +1027,42 @@ async def _run_manifest(
         errors[manifest_id] = _execution_error(exc)
 
 
+async def _run_additions_first_bootstrap(
+    service: Any,
+    connector: Any,
+    manifest_id: str,
+    import_id_ack: str,
+    errors: dict[str, tuple[str, str]],
+) -> None:
+    try:
+        await _call(
+            service,
+            ("execute_additions_first_bootstrap",),
+            (
+                (
+                    (connector, manifest_id),
+                    {
+                        "import_id_ack": import_id_ack,
+                        "deferred_verification_ack": True,
+                    },
+                ),
+                (
+                    (),
+                    {
+                        "connector": connector,
+                        "manifest_id": manifest_id,
+                        "import_id_ack": import_id_ack,
+                        "deferred_verification_ack": True,
+                    },
+                ),
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - exposed through stable engine codes
+        errors[manifest_id] = _execution_error(exc)
+
+
 def _start_manifest_task(
     state: Any,
     service: Any,
@@ -988,6 +1084,38 @@ def _start_manifest_task(
             errors,
         ),
         name=f"oneroster-manifest-{manifest_id}",
+    )
+    tasks[manifest_id] = task
+
+    def discard_finished(done: asyncio.Task) -> None:
+        if tasks.get(manifest_id) is done:
+            tasks.pop(manifest_id, None)
+
+    task.add_done_callback(discard_finished)
+    return True
+
+
+def _start_additions_first_bootstrap_task(
+    state: Any,
+    service: Any,
+    connector: Any,
+    manifest_id: str,
+    import_id_ack: str,
+) -> bool:
+    tasks, errors = _task_maps(state)
+    current = tasks.get(manifest_id)
+    if current is not None and not current.done():
+        return False
+    errors.pop(manifest_id, None)
+    task = asyncio.create_task(
+        _run_additions_first_bootstrap(
+            service,
+            connector,
+            manifest_id,
+            import_id_ack,
+            errors,
+        ),
+        name=f"oneroster-additions-first-bootstrap-{manifest_id}",
     )
     tasks[manifest_id] = task
 
@@ -1137,6 +1265,12 @@ async def _local_thresholds(service: Any) -> dict[str, Any]:
         )
     except TypeError:
         return {"configured": False, "mode": "normal", "rules": {}}
+    return _threshold_record(value)
+
+
+def _threshold_record(value: Any) -> dict[str, Any]:
+    """Normalize nested threshold models for the Jinja form."""
+
     result = _record(value)
     result.setdefault("configured", False)
     result.setdefault("mode", "normal")
@@ -1232,6 +1366,7 @@ async def oneroster_page(request: Request) -> HTMLResponse:
     active_snapshot: dict[str, Any] = {}
     active_manifest: dict[str, Any] = {}
     active_progress: dict[str, Any] = {}
+    active_bootstrap_missing_count = 0
     if feature["ready"]:
         # These contracts are local SQLite/config reads. No connector is consulted.
         history = await _local_history(feature["service"])
@@ -1263,6 +1398,11 @@ async def oneroster_page(request: Request) -> HTMLResponse:
                     active_progress = (
                         _record(progress) if progress is not None else {}
                     )
+                    active_bootstrap_missing_count = (
+                        await _bootstrap_missing_report_count(
+                            feature["service"], manifest_id
+                        )
+                    )
                 except KeyError:
                     # The manifest can be pruned between the bounded header and
                     # page reads. Falling back to setup is safer than showing a
@@ -1280,6 +1420,7 @@ async def oneroster_page(request: Request) -> HTMLResponse:
             "active_snapshot": active_snapshot,
             "active_manifest": active_manifest,
             "active_progress": active_progress,
+            "bootstrap_missing_count": active_bootstrap_missing_count,
         },
     )
 
@@ -1332,6 +1473,7 @@ async def verify_live_access(
             },
         )
     diagnostics: list[dict[str, str]] = []
+    active_snapshot: dict[str, Any] = {}
     try:
         directory = getattr(connector, "list_oneroster_directory", None)
         courses = getattr(connector, "list_oneroster_managed_courses", None)
@@ -1404,7 +1546,6 @@ async def verify_live_access(
         if callable(invalidator):
             await asyncio.to_thread(invalidator)
         access = await _local_scope_readiness(feature["service"])
-        active_snapshot = history[0] if history else {}
         code, message = _safe_error(exc, "CMP-AUTH-REQUIRED")
         notice = ""
         error = message
@@ -1431,7 +1572,7 @@ async def upload_snapshot(
     request: Request,
     package: Annotated[UploadFile, File()],
     replace_active: Annotated[str, Form()] = "",
-) -> HTMLResponse:
+) -> Response:
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1490,7 +1631,7 @@ async def upload_snapshot_folder(
     request: Request,
     folder_files: Annotated[list[UploadFile], File()],
     replace_active: Annotated[str, Form()] = "",
-) -> HTMLResponse:
+) -> Response:
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1537,7 +1678,11 @@ async def upload_snapshot_folder(
 
 
 @router.get("/import/{import_id}", response_class=HTMLResponse)
-async def import_detail(request: Request, import_id: str) -> HTMLResponse:
+async def import_detail(request: Request, import_id: str) -> Response:
+    # A bookmarked or typed URL lands here as a plain navigation; the full page
+    # already renders this snapshot's guided setup inside the layout.
+    if not _is_htmx(request):
+        return _page_redirect()
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1568,7 +1713,7 @@ async def select_academic_session(
     request: Request,
     import_id: str,
     session_id: Annotated[str, Form()],
-) -> HTMLResponse:
+) -> Response:
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1618,6 +1763,8 @@ async def select_academic_session(
         lease.release()
     snapshot = _snapshot_record(value)
     snapshot.setdefault("id", import_id)
+    if not _is_htmx(request):
+        return _page_redirect()
     return TEMPLATES.TemplateResponse(
         request,
         "_oneroster_guided_setup.html",
@@ -1637,7 +1784,7 @@ async def configure_course_naming(
     import_id: str,
     naming_choice: Annotated[str, Form()] = "default",
     custom_template: Annotated[str, Form()] = "",
-) -> HTMLResponse:
+) -> Response:
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1698,6 +1845,8 @@ async def configure_course_naming(
         lease.release()
     snapshot = _snapshot_record(value)
     snapshot.setdefault("id", import_id)
+    if not _is_htmx(request):
+        return _page_redirect()
     return TEMPLATES.TemplateResponse(
         request,
         "_oneroster_guided_setup.html",
@@ -1780,7 +1929,7 @@ async def export_gam_csv(
 
 
 @router.post("/import/{import_id}/validate", response_class=HTMLResponse)
-async def validate_snapshot(request: Request, import_id: str) -> HTMLResponse:
+async def validate_snapshot(request: Request, import_id: str) -> Response:
     feature = await _feature(request)
     if not feature["ready"]:
         return _status(
@@ -1823,6 +1972,8 @@ async def validate_snapshot(request: Request, import_id: str) -> HTMLResponse:
         lease.release()
     snapshot = _snapshot_record(value)
     snapshot.setdefault("id", import_id)
+    if not _is_htmx(request):
+        return _page_redirect()
     return TEMPLATES.TemplateResponse(
         request,
         "_oneroster_guided_setup.html",
@@ -2536,7 +2687,7 @@ async def save_threshold_settings(request: Request) -> HTMLResponse:
         return _status(request, error=message, error_code=code)
     finally:
         lease.release()
-    thresholds = _record(value) or profile
+    thresholds = _threshold_record(value) or profile
     thresholds.setdefault("configured", True)
     return TEMPLATES.TemplateResponse(
         request,
@@ -2585,6 +2736,9 @@ async def manifest_detail(
         polling=bool(task is not None and not task.done()),
         progress=await _manifest_progress(feature["service"], manifest_id),
         gate=await _manifest_gate(feature["service"]),
+        bootstrap_missing_count=await _bootstrap_missing_report_count(
+            feature["service"], manifest_id
+        ),
     )
 
 
@@ -2660,6 +2814,102 @@ async def execute_manifest(
     )
 
 
+@router.post(
+    "/manifest/{manifest_id}/additions-first-bootstrap",
+    response_class=HTMLResponse,
+)
+async def execute_additions_first_bootstrap(
+    request: Request,
+    manifest_id: str,
+    import_id_ack: Annotated[str, Form()] = "",
+    deferred_verification_ack: Annotated[str, Form()] = "",
+) -> HTMLResponse:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(manifest_id):
+        return _status(
+            request,
+            error="That manifest identifier is invalid.",
+            error_code="OR-MANIFEST-NOT-FOUND",
+        )
+    connector = _connector(request)
+    if connector is None:
+        return _connector_required(request)
+    service = feature["service"]
+    try:
+        manifest = await _load_manifest_page(service, manifest_id)
+    except Exception as exc:  # noqa: BLE001
+        code, message = _safe_error(exc, "OR-MANIFEST-NOT-FOUND")
+        return _status(request, error=message, error_code=code)
+    manifest_view = _manifest_record(manifest)
+    if not manifest_view["additions_first_bootstrap_eligible"]:
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(
+                "OR-BOOTSTRAP-NOT-ELIGIBLE",
+                "Additions-first bootstrap is available only for a paused "
+                "additions-only manifest containing additive work.",
+            ),
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+    if import_id_ack.strip() != str(manifest_view.get("import_id", "") or ""):
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(
+                "OR-CONFIRMATION-MISMATCH",
+                "Type the exact import ID shown on this immutable manifest.",
+            ),
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+    acknowledged = (
+        deferred_verification_ack.strip().casefold() in _CHECKED_VALUES
+    )
+    if not acknowledged:
+        return _manifest_response(
+            request,
+            manifest,
+            task_error=(
+                "OR-DEFERRED-VERIFICATION-ACK-REQUIRED",
+                "Acknowledge deferred course verification before starting "
+                "additions-first bootstrap.",
+            ),
+            progress=await _manifest_progress(service, manifest_id),
+            gate=await _manifest_gate(service),
+        )
+
+    started = _start_additions_first_bootstrap_task(
+        request.app.state.gamgui,
+        service,
+        connector,
+        manifest_id,
+        import_id_ack.strip(),
+    )
+    return _manifest_response(
+        request,
+        manifest,
+        notice=(
+            "Additions-first bootstrap was queued. Completed batches remain "
+            "durable; course creation, student additions, activation, and "
+            "additional teachers are submitted in that order before deferred "
+            "verification and retries."
+            if started
+            else "Additions-first bootstrap is already queued for this manifest."
+        ),
+        polling=True,
+        progress=await _manifest_progress(service, manifest_id),
+        gate=await _manifest_gate(service),
+    )
+
+
 @router.get("/manifest/{manifest_id}/status", response_class=HTMLResponse)
 async def manifest_status(
     request: Request,
@@ -2702,6 +2952,9 @@ async def manifest_status(
         polling=polling,
         progress=await _manifest_progress(feature["service"], manifest_id),
         gate=await _manifest_gate(feature["service"]),
+        bootstrap_missing_count=await _bootstrap_missing_report_count(
+            feature["service"], manifest_id
+        ),
     )
 
 
@@ -2850,6 +3103,70 @@ async def retry_manifest_stabilization(
         ),
         progress=await _manifest_progress(service, manifest_id),
         gate=await _manifest_gate(service),
+    )
+
+
+@router.get("/manifest/{manifest_id}/additions-first-missing.csv")
+async def export_additions_first_missing_report(
+    request: Request,
+    manifest_id: str,
+) -> Response:
+    feature = await _feature(request)
+    if not feature["ready"]:
+        return _status(
+            request,
+            error=feature["message"],
+            error_code=feature["code"],
+        )
+    if not _valid_import_id(manifest_id):
+        return _status(
+            request,
+            error="That manifest identifier is invalid.",
+            error_code="OR-MANIFEST-NOT-FOUND",
+        )
+    store = getattr(feature["service"], "store", None)
+    count_method = getattr(store, "bootstrap_missing_report_count", None)
+    writer = getattr(store, "write_bootstrap_missing_report", None)
+    if not callable(count_method) or not callable(writer):
+        return _status(
+            request,
+            error="The additions-first missing-action report is unavailable.",
+            error_code="OR-BOOTSTRAP-MISSING-REPORT-UNAVAILABLE",
+        )
+
+    stream = tempfile.TemporaryFile(mode="w+b")
+    try:
+        await asyncio.to_thread(count_method, manifest_id)
+        count = await asyncio.to_thread(writer, manifest_id, stream)
+        row_count = max(0, int(count or 0))
+        stream.seek(0)
+    except Exception as exc:  # noqa: BLE001 - exposed through a stable report code
+        stream.close()
+        code, message = _safe_error(exc, "OR-BOOTSTRAP-MISSING-REPORT-FAILED")
+        return _status(request, error=message, error_code=code)
+
+    async def chunks() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                chunk = await asyncio.to_thread(stream.read, 64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            stream.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": (
+                f'attachment; filename="oneroster-additions-first-missing-'
+                f'{manifest_id}.csv"'
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "X-OneRoster-Row-Count": str(row_count),
+        },
     )
 
 
