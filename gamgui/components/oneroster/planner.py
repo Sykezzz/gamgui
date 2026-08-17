@@ -36,7 +36,7 @@ from .store import OneRosterStore
 from .thresholds import evaluate_thresholds
 
 
-PLANNER_SCHEMA_VERSION = 3
+PLANNER_SCHEMA_VERSION = 4
 DIRECTORY_CONCURRENCY = 12
 COURSE_CONCURRENCY = 8
 # The current planner uses compact in-memory participant/action models. Keep
@@ -320,11 +320,16 @@ class OneRosterPlanner:
         try:
             raw = await bulk(aliases)
             return _index_managed_courses(raw)
-        except GAMError:
+        except GAMError as exc:
             # The exact-set bulk command is an optimization. Fall back to
             # bounded per-alias reads, which distinguish absent new courses
             # from genuine authentication and permission failures.
-            return None
+            if exc.kind is GAMErrorKind.NOT_FOUND:
+                return None
+            raise OneRosterError(
+                "OR-CLASSROOM-READ",
+                "Live Classroom course resolution failed; no import plan was created.",
+            ) from exc
         except OneRosterError:
             raise
         except Exception as exc:
@@ -1195,12 +1200,26 @@ def _directory_resolution_issues(
         for participant in course.participants:
             code = codes.get(participant.email.casefold())
             if code:
+                role = participant.role.casefold()
                 issues.append(
                     _issue(
                         code,
-                        "A OneRoster participant did not resolve to one active live Directory user.",
+                        (
+                            "This OneRoster student was omitted because the account did not "
+                            "resolve to one active live Directory user."
+                            if role == "student"
+                            else (
+                                "This OneRoster teacher did not resolve to one active "
+                                "live Directory user."
+                            )
+                        ),
                         course.class_id,
                         source_id=participant.source_user_id,
+                        severity=(
+                            IssueSeverity.WARNING
+                            if role == "student"
+                            else IssueSeverity.ERROR
+                        ),
                     )
                 )
     return _dedupe_issues(issues)
@@ -1218,6 +1237,17 @@ def _canonicalize_eligible_courses(
             issues.extend(course_issues)
             continue
         canonical = _canonicalize_course(course, resolved)
+        preferred_owner = resolved.get(course.owner_email.casefold(), "")
+        if preferred_owner != canonical.owner_email:
+            issues.append(
+                _issue(
+                    "OR-OWNER-FALLBACK",
+                    "The designated primary teacher was unavailable, so another active "
+                    "OneRoster teacher was selected as owner.",
+                    course.class_id,
+                    severity=IssueSeverity.WARNING,
+                )
+            )
         courses[index] = canonical
         eligible.append(canonical)
     courses.clear()
@@ -1233,14 +1263,6 @@ def _course_resolution_issues(
     for participant in course.participants:
         primary = resolved.get(participant.email.casefold(), "")
         if not primary:
-            issues.append(
-                _issue(
-                    "OR-COURSE-DIRECTORY-BLOCKED",
-                    "This class has a participant that did not resolve to one active live Directory user.",
-                    course.class_id,
-                    source_id=participant.source_user_id,
-                )
-            )
             continue
         by_primary[primary].add(participant.source_user_id)
     for source_ids in by_primary.values():
@@ -1252,12 +1274,17 @@ def _course_resolution_issues(
                     course.class_id,
                 )
             )
-    owner = resolved.get(course.owner_email.casefold(), "")
-    if not owner:
+    active_teachers = {
+        resolved[participant.email.casefold()]
+        for participant in course.participants
+        if participant.role.casefold() == "teacher"
+        and participant.email.casefold() in resolved
+    }
+    if not active_teachers:
         issues.append(
             _issue(
-                "OR-OWNER-NOT-FOUND",
-                "The primary teacher did not resolve to one active live Directory user.",
+                "OR-COURSE-NO-ACTIVE-TEACHER",
+                "This class has no OneRoster teacher with an active live Directory account.",
                 course.class_id,
             )
         )
@@ -1268,22 +1295,36 @@ def _canonicalize_course(
     course: _DesiredCourse,
     resolved: Mapping[str, str],
 ) -> _DesiredCourse:
+    active_participants = tuple(
+        _Participant(
+            source_user_id=participant.source_user_id,
+            email=resolved[participant.email.casefold()],
+            role=participant.role,
+            primary=participant.primary,
+        )
+        for participant in course.participants
+        if participant.email.casefold() in resolved
+    )
+    active_teachers = sorted(
+        {
+            participant.email
+            for participant in active_participants
+            if participant.role.casefold() == "teacher"
+        }
+    )
+    preferred_owner = resolved.get(course.owner_email.casefold(), "")
     return _DesiredCourse(
         class_id=course.class_id,
         alias=course.alias,
         name=course.name,
         section=course.section,
         room=course.room,
-        owner_email=resolved[course.owner_email.casefold()],
-        participants=tuple(
-            _Participant(
-                source_user_id=participant.source_user_id,
-                email=resolved[participant.email.casefold()],
-                role=participant.role,
-                primary=participant.primary,
-            )
-            for participant in course.participants
+        owner_email=(
+            preferred_owner
+            if preferred_owner in active_teachers
+            else active_teachers[0]
         ),
+        participants=active_participants,
     )
 
 
@@ -1568,10 +1609,11 @@ def _issue(
     class_id: str,
     *,
     source_id: str = "",
+    severity: IssueSeverity = IssueSeverity.ERROR,
 ) -> ImportIssue:
     return ImportIssue(
         code=code,
-        severity=IssueSeverity.ERROR,
+        severity=severity,
         message=message,
         entity_kind="class",
         source_id=source_id or class_id,

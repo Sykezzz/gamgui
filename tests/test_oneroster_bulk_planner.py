@@ -91,16 +91,21 @@ class BulkPlannerConnector:
 
 
 class BulkLookupFailureConnector(BulkPlannerConnector):
-    def __init__(self, detail_error_kind: GAMErrorKind) -> None:
+    def __init__(
+        self,
+        detail_error_kind: GAMErrorKind,
+        bulk_error_kind: GAMErrorKind = GAMErrorKind.NOT_FOUND,
+    ) -> None:
         super().__init__([])
         self.detail_error_kind = detail_error_kind
+        self.bulk_error_kind = bulk_error_kind
 
     async def list_oneroster_managed_courses(self, aliases):
         self.calls["courses"] += 1
         raise GAMError(
-            kind=GAMErrorKind.NOT_FOUND,
+            kind=self.bulk_error_kind,
             exit_code=1,
-            stderr="Requested Classroom course alias was not found.",
+            stderr="Bulk Classroom lookup failed.",
         )
 
     async def get_course(self, *_args, **_kwargs):
@@ -216,7 +221,10 @@ async def test_bulk_alias_fallback_still_fails_closed_on_permission_error(
     tmp_path: Path,
 ):
     service, import_id = _ready_service(tmp_path)
-    connector = BulkLookupFailureConnector(GAMErrorKind.PERMISSION_DENIED)
+    connector = BulkLookupFailureConnector(
+        GAMErrorKind.PERMISSION_DENIED,
+        bulk_error_kind=GAMErrorKind.PERMISSION_DENIED,
+    )
 
     with pytest.raises(OneRosterError) as failure:
         await service.build_live_plan(
@@ -228,7 +236,27 @@ async def test_bulk_alias_fallback_still_fails_closed_on_permission_error(
     assert failure.value.code == "OR-CLASSROOM-READ"
     assert not service.scope_readiness().ready
     assert connector.calls["courses"] == 1
-    assert connector.calls["get_course"] >= 1
+    assert connector.calls["get_course"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_rate_limit_does_not_restart_slow_per_alias_scan(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    connector = BulkLookupFailureConnector(
+        GAMErrorKind.RATE_LIMITED,
+        bulk_error_kind=GAMErrorKind.RATE_LIMITED,
+    )
+
+    with pytest.raises(OneRosterError) as failure:
+        await service.build_live_plan(
+            connector,
+            import_id,
+            limited_import=True,
+        )
+
+    assert failure.value.code == "OR-CLASSROOM-READ"
+    assert connector.calls["courses"] == 1
+    assert connector.calls["get_course"] == 0
 
 
 @pytest.mark.asyncio

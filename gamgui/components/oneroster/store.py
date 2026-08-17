@@ -1255,13 +1255,15 @@ class OneRosterStore:
         self,
         manifest_id: str,
     ) -> tuple[ExecutionBatch, ...]:
+        """Return ordinary bounded batches that can be materialized safely."""
+
         with closing(self._conn()) as conn:
             rows = conn.execute(
                 """
                 SELECT b.* FROM execution_batches AS b
                 JOIN execution_runs AS r ON r.id = b.run_id
                 WHERE r.domain = ? AND b.manifest_id = ?
-                  AND b.status = 'reconciling'
+                  AND b.status = 'reconciling' AND b.execution_mode = 'verified'
                 ORDER BY b.sequence_number
                 """,
                 (self.domain, manifest_id),
@@ -1282,6 +1284,140 @@ class OneRosterStore:
                     )
                 )
         return tuple(result)
+
+    def get_reconciling_phase_batches(
+        self,
+        manifest_id: str,
+    ) -> tuple[ExecutionBatch, ...]:
+        """Return header-only reconciling phases without materializing membership."""
+
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT b.* FROM execution_batches AS b
+                JOIN execution_runs AS r ON r.id = b.run_id
+                WHERE r.domain = ? AND b.manifest_id = ?
+                  AND b.status = 'reconciling'
+                  AND b.execution_mode = 'additions_first'
+                ORDER BY b.sequence_number
+                """,
+                (self.domain, manifest_id),
+            ).fetchall()
+        return tuple(_execution_batch_from_row(row) for row in rows)
+
+    def get_pending_additions_first_phase_batches(
+        self,
+        manifest_id: str,
+    ) -> tuple[ExecutionBatch, ...]:
+        """Return header-only submitted/reconciling phases across all attempts."""
+
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT batch.* FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                WHERE run.domain = ? AND batch.manifest_id = ?
+                  AND batch.execution_mode = 'additions_first'
+                  AND batch.status IN ('submitted','reconciling')
+                ORDER BY batch.prepared_at, batch.id
+                """,
+                (self.domain, manifest_id),
+            ).fetchall()
+        return tuple(_execution_batch_from_row(row) for row in rows)
+
+    def attach_paused_additions_first_reconciliation(
+        self,
+        batch_id: str,
+        manifest_id: str,
+        active_run_id: str,
+        *,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Authorize a new attempt to reconcile a phase submitted by a paused run."""
+
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = conn.execute(
+                """
+                SELECT batch.*, prior.status AS prior_run_status,
+                       prior.phase AS prior_run_phase,
+                       prior.stop_requested AS prior_stop_requested,
+                       prior.last_error_code AS prior_error_code,
+                       manifest.status AS manifest_status,
+                       manifest.run_owner,
+                       active.status AS active_run_status,
+                       active.manifest_id AS active_manifest_id
+                FROM execution_batches AS batch
+                JOIN execution_runs AS prior ON prior.id = batch.run_id
+                JOIN manifests AS manifest ON manifest.id = batch.manifest_id
+                JOIN execution_runs AS active ON active.id = ?
+                WHERE batch.id = ? AND batch.manifest_id = ?
+                  AND prior.domain = ? AND active.domain = prior.domain
+                """,
+                (active_run_id, batch_id, manifest_id, self.domain),
+            ).fetchone()
+            if (
+                batch is None
+                or str(batch["execution_mode"]) != "additions_first"
+                or str(batch["status"]) not in {"submitted", "reconciling"}
+                or str(batch["prior_run_status"]) != "paused"
+                or str(batch["prior_run_phase"]) != "paused"
+                or not bool(batch["prior_stop_requested"])
+                or str(batch["prior_error_code"]) != "OR-BOOTSTRAP-PAUSED"
+                or str(batch["manifest_status"]) != "running"
+                or str(batch["run_owner"]) != owner
+                or str(batch["active_run_status"])
+                not in {"running", "pause_requested"}
+                or str(batch["active_manifest_id"]) != manifest_id
+            ):
+                raise PermissionError(
+                    "The active attempt cannot reconcile this paused bootstrap phase."
+                )
+            _require_execution_membership_integrity(conn, batch)
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = 'reconciling', reconciliation_run_id = ?
+                WHERE id = ? AND status IN ('submitted','reconciling')
+                """,
+                (active_run_id, batch_id),
+            )
+            conn.execute(
+                """
+                UPDATE execution_runs
+                SET phase = 'reconciliation', updated_at = ?, last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                  AND status IN ('running','pause_requested')
+                """,
+                (timestamp, timestamp, active_run_id, self.domain),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def has_reconciling_additions_first_phase(self, manifest_id: str) -> bool:
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                WHERE run.domain = ? AND batch.manifest_id = ?
+                  AND batch.execution_mode = 'additions_first'
+                  AND batch.status IN ('submitted','reconciling')
+                LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+        return row is not None
 
     def get_manifest_actions_by_id(
         self,
@@ -1307,6 +1443,1451 @@ class OneRosterStore:
                 "Durable batch membership no longer matches manifest actions.",
             )
         return tuple(by_id[action_id] for action_id in selected)
+
+    def get_manifest_action_chunk(
+        self,
+        manifest_id: str,
+        *,
+        after_rowid: int = 0,
+        limit: int = 500,
+        statuses: Sequence[str] = (),
+        kinds: Sequence[str] = (),
+    ) -> tuple[tuple[int, ImportAction], ...]:
+        """Read a keyset-paginated action page without constructing an ID list."""
+
+        _validate_id(manifest_id)
+        selected_statuses = _bounded_text_values(statuses, maximum=16)
+        selected_kinds = _bounded_text_values(kinds, maximum=32)
+        page_size = max(1, min(int(limit or 500), 1000))
+        clauses = ["manifest_id = ?", "rowid > ?"]
+        params: list[Any] = [manifest_id, max(0, int(after_rowid or 0))]
+        if selected_statuses:
+            clauses.append(
+                "status IN (" + ",".join("?" for _ in selected_statuses) + ")"
+            )
+            params.extend(selected_statuses)
+        if selected_kinds:
+            clauses.append("kind IN (" + ",".join("?" for _ in selected_kinds) + ")")
+            params.extend(selected_kinds)
+        params.append(page_size)
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT rowid AS action_rowid, * FROM manifest_actions
+                WHERE {' AND '.join(clauses)}
+                ORDER BY rowid LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            if not rows and not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+        return tuple(
+            (int(row["action_rowid"]), _action_from_row(row)) for row in rows
+        )
+
+    def iter_manifest_action_chunks(
+        self,
+        manifest_id: str,
+        *,
+        chunk_size: int = 500,
+        statuses: Sequence[str] = (),
+        kinds: Sequence[str] = (),
+    ) -> Iterable[tuple[ImportAction, ...]]:
+        """Iterate bounded action pages while opening no long-lived transaction."""
+
+        after_rowid = 0
+        while page := self.get_manifest_action_chunk(
+            manifest_id,
+            after_rowid=after_rowid,
+            limit=chunk_size,
+            statuses=statuses,
+            kinds=kinds,
+        ):
+            yield tuple(action for _rowid, action in page)
+            after_rowid = page[-1][0]
+
+    def manifest_action_counts(self, manifest_id: str) -> Mapping[str, int]:
+        """Return status counts for one manifest using a single aggregate query."""
+
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn:
+            if not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count FROM manifest_actions
+                WHERE manifest_id = ? GROUP BY status
+                """,
+                (manifest_id,),
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def validate_additions_first_checkpoint(
+        self,
+        manifest_id: str,
+    ) -> Mapping[str, Any]:
+        """Validate a paused additive checkpoint without exposing the store connection."""
+
+        _validate_id(manifest_id)
+        allowed_kinds = {
+            "course_create",
+            "student_add",
+            "course_activate",
+            "teacher_add",
+        }
+        with closing(self._conn()) as conn:
+            manifest = conn.execute(
+                "SELECT * FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone()
+            if manifest is None:
+                raise KeyError("OneRoster import manifest not found.")
+            if (
+                str(manifest["status"]) != "paused"
+                or float(manifest["confirmed_at"] or 0) <= 0
+                or str(manifest["plan_kind"]) != "limited"
+                or str(manifest["prepared_live_hash"] or "")
+            ):
+                raise OneRosterError(
+                    "OR-FAST-RESUME-INELIGIBLE",
+                    "The manifest is not a paused additions-first checkpoint.",
+                )
+            prior_run = conn.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE domain = ? AND manifest_id = ?
+                ORDER BY started_at DESC, rowid DESC LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            pause_code = str(prior_run["last_error_code"] or "") if prior_run else ""
+            if (
+                prior_run is None
+                or str(prior_run["status"]) != "paused"
+                or str(prior_run["phase"]) != "paused"
+                or not bool(prior_run["stop_requested"])
+                or pause_code
+                not in {"OR-EXECUTION-PAUSED", "OR-BOOTSTRAP-PAUSED"}
+            ):
+                raise OneRosterError(
+                    "OR-FAST-RESUME-INELIGIBLE",
+                    "The latest execution was not a verified pause checkpoint.",
+                )
+            active = conn.execute(
+                """
+                SELECT 1 FROM execution_runs
+                WHERE domain = ? AND manifest_id = ?
+                  AND status IN ('running','pause_requested','recovery_required')
+                LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            if active is not None:
+                raise OneRosterError(
+                    "OR-RECOVERY-REQUIRED",
+                    "An active or interrupted execution must be reconciled first.",
+                )
+            status_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count FROM manifest_actions
+                WHERE manifest_id = ? GROUP BY status
+                """,
+                (manifest_id,),
+            ).fetchall()
+            status_counts = {
+                str(row["status"]): int(row["count"] or 0) for row in status_rows
+            }
+            accepted_statuses = {"pending", "applied"}
+            if pause_code == "OR-BOOTSTRAP-PAUSED":
+                accepted_statuses.add("submitted")
+            if set(status_counts) - accepted_statuses:
+                raise OneRosterError(
+                    "OR-FAST-RESUME-INELIGIBLE",
+                    "The checkpoint contains an unsupported action state.",
+                )
+            kind_rows = conn.execute(
+                """
+                SELECT kind, COUNT(*) AS count FROM manifest_actions
+                WHERE manifest_id = ? GROUP BY kind
+                """,
+                (manifest_id,),
+            ).fetchall()
+            kind_counts = {
+                str(row["kind"]): int(row["count"] or 0) for row in kind_rows
+            }
+            if not kind_counts or set(kind_counts) - allowed_kinds:
+                raise OneRosterError(
+                    "OR-FAST-RESUME-INELIGIBLE",
+                    "The checkpoint contains actions outside additions-first mode.",
+                )
+            missing_create = conn.execute(
+                """
+                SELECT subject COLLATE NOCASE FROM manifest_actions
+                WHERE manifest_id = ?
+                EXCEPT
+                SELECT subject COLLATE NOCASE FROM manifest_actions
+                WHERE manifest_id = ? AND kind = 'course_create'
+                LIMIT 1
+                """,
+                (manifest_id, manifest_id),
+            ).fetchone()
+            if missing_create is not None:
+                raise OneRosterError(
+                    "OR-FAST-RESUME-INELIGIBLE",
+                    "Every checkpoint course must originate in this bootstrap manifest.",
+                )
+            batches = conn.execute(
+                """
+                SELECT batch.* FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                WHERE run.domain = ? AND batch.manifest_id = ?
+                ORDER BY batch.prepared_at, batch.id
+                """,
+                (self.domain, manifest_id),
+            ).fetchall()
+            submitted_batch_ids: list[str] = []
+            for batch in batches:
+                batch_status = str(batch["status"])
+                if batch_status in {"prepared", "running", "abandoned"}:
+                    raise OneRosterError(
+                        "OR-RECOVERY-REQUIRED",
+                        "The checkpoint contains an unfinished durable batch.",
+                    )
+                if batch_status in {"submitted", "reconciling"}:
+                    if (
+                        pause_code != "OR-BOOTSTRAP-PAUSED"
+                        or str(batch["execution_mode"]) != "additions_first"
+                    ):
+                        raise OneRosterError(
+                            "OR-RECOVERY-REQUIRED",
+                            "Submitted phase work requires explicit bootstrap reconciliation.",
+                        )
+                    submitted_batch_ids.append(str(batch["id"]))
+                elif batch_status not in {"completed", "reconciled", "failed"}:
+                    raise OneRosterError(
+                        "OR-RECOVERY-REQUIRED",
+                        "The checkpoint contains an unknown durable batch state.",
+                    )
+                _require_execution_membership_integrity(conn, batch)
+            invalid_applied = conn.execute(
+                """
+                SELECT action.action_id
+                FROM manifest_actions AS action
+                LEFT JOIN execution_batch_actions AS membership
+                  ON membership.action_id = action.action_id
+                LEFT JOIN execution_batches AS batch
+                  ON batch.id = membership.batch_id
+                 AND batch.manifest_id = action.manifest_id
+                WHERE action.manifest_id = ? AND action.status = 'applied'
+                GROUP BY action.action_id
+                HAVING SUM(
+                    CASE
+                      WHEN batch.status IN ('completed','reconciled')
+                       AND (
+                         (batch.execution_mode = 'additions_first'
+                          AND membership.result_status = 'applied')
+                         OR
+                         (batch.execution_mode = 'verified'
+                          AND membership.result_status IN ('','applied'))
+                       )
+                      THEN 1 ELSE 0
+                    END
+                ) != 1
+                LIMIT 1
+                """,
+                (manifest_id,),
+            ).fetchone()
+            if invalid_applied is not None:
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "An applied action lacks exactly one successful durable batch receipt.",
+                )
+            pending_nonterminal = conn.execute(
+                """
+                SELECT 1 FROM manifest_actions AS action
+                JOIN execution_batch_actions AS membership
+                  ON membership.action_id = action.action_id
+                JOIN execution_batches AS batch
+                  ON batch.id = membership.batch_id
+                 AND batch.manifest_id = action.manifest_id
+                WHERE action.manifest_id = ? AND action.status = 'pending'
+                  AND batch.status IN ('prepared','running','submitted','reconciling')
+                  AND NOT (
+                    batch.execution_mode = 'additions_first'
+                    AND batch.status IN ('submitted','reconciling')
+                    AND membership.result_status = 'pending'
+                  )
+                LIMIT 1
+                """,
+                (manifest_id,),
+            ).fetchone()
+            if pending_nonterminal is not None:
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "A pending action still belongs to a nonterminal durable batch.",
+                )
+            if status_counts.get("submitted", 0):
+                invalid_submitted = conn.execute(
+                    """
+                    SELECT action.action_id
+                    FROM manifest_actions AS action
+                    LEFT JOIN execution_batch_actions AS membership
+                      ON membership.action_id = action.action_id
+                    LEFT JOIN execution_batches AS batch
+                      ON batch.id = membership.batch_id
+                     AND batch.manifest_id = action.manifest_id
+                     AND batch.status IN ('submitted','reconciling')
+                     AND batch.execution_mode = 'additions_first'
+                    WHERE action.manifest_id = ? AND action.status = 'submitted'
+                    GROUP BY action.action_id
+                    HAVING SUM(
+                        CASE WHEN batch.id IS NOT NULL
+                                  AND membership.result_status = 'submitted'
+                             THEN 1 ELSE 0 END
+                    ) != 1
+                    LIMIT 1
+                    """,
+                    (manifest_id,),
+                ).fetchone()
+                if invalid_submitted is not None:
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "A submitted action lacks exact phase reconciliation provenance.",
+                    )
+            action_cursor = conn.execute(
+                "SELECT * FROM manifest_actions WHERE manifest_id = ? ORDER BY rowid",
+                (manifest_id,),
+            )
+            actions_hash, action_count = action_sequence_hash(
+                _action_from_row(row) for row in action_cursor
+            )
+            basis = {
+                "manifest_id": str(manifest["id"]),
+                "domain": str(manifest["domain"]),
+                "import_id": str(manifest["import_id"]),
+                "source_hash": str(manifest["source_hash"]),
+                "config_hash": str(manifest["config_hash"]),
+                "live_hash": str(manifest["live_hash"]),
+                "threshold_evaluation_hash": str(
+                    manifest["threshold_evaluation_hash"]
+                ),
+                "threshold_evidence": json.loads(
+                    str(manifest["threshold_evidence_json"] or "{}")
+                ),
+                "exclusions": json.loads(
+                    str(manifest["exclusions_json"] or "[]")
+                ),
+                "pilot_evidence": json.loads(
+                    str(manifest["pilot_evidence_json"] or "{}")
+                ),
+                "live_evidence": json.loads(
+                    str(manifest["live_evidence_json"] or "{}")
+                ),
+                "plan_kind": str(manifest["plan_kind"]),
+                "actions_hash": actions_hash,
+                "action_count": action_count,
+            }
+            if canonical_hash(basis) != str(manifest["manifest_hash"]):
+                raise OneRosterError(
+                    "OR-MANIFEST-INTEGRITY",
+                    "The immutable manifest no longer matches its approved hash.",
+                )
+        status_counts["total"] = sum(status_counts.values())
+        return {
+            "prior_run_id": str(prior_run["id"]),
+            "pause_code": pause_code,
+            "paused_at": float(prior_run["updated_at"] or 0),
+            "action_counts": dict(sorted(status_counts.items())),
+            "kind_counts": dict(sorted(kind_counts.items())),
+            "submitted_batch_ids": tuple(submitted_batch_ids),
+        }
+
+    def clear_bootstrap_missing_report(self, manifest_id: str) -> None:
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn, conn:
+            if not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+            conn.execute(
+                "DELETE FROM bootstrap_missing_actions WHERE manifest_id = ?",
+                (manifest_id,),
+            )
+
+    def replace_bootstrap_missing_report(
+        self,
+        manifest_id: str,
+        rows: Iterable[Sequence[Any] | Mapping[str, Any]],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """Atomically replace a missing-action report from bounded input pages."""
+
+        return self._save_bootstrap_missing_report(
+            manifest_id,
+            rows,
+            replace=True,
+            chunk_size=chunk_size,
+        )
+
+    def upsert_bootstrap_missing_report(
+        self,
+        manifest_id: str,
+        rows: Iterable[Sequence[Any] | Mapping[str, Any]],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """Upsert bounded report pages without retaining the full report in memory."""
+
+        return self._save_bootstrap_missing_report(
+            manifest_id,
+            rows,
+            replace=False,
+            chunk_size=chunk_size,
+        )
+
+    def _save_bootstrap_missing_report(
+        self,
+        manifest_id: str,
+        rows: Iterable[Sequence[Any] | Mapping[str, Any]],
+        *,
+        replace: bool,
+        chunk_size: int,
+    ) -> int:
+        _validate_id(manifest_id)
+        page_size = max(1, min(int(chunk_size or 500), 1000))
+        iterator = iter(rows)
+        written = 0
+        with closing(self._conn()) as conn, conn:
+            if not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+            if replace:
+                conn.execute(
+                    "DELETE FROM bootstrap_missing_actions WHERE manifest_id = ?",
+                    (manifest_id,),
+                )
+            while True:
+                page: list[tuple[str, str, int]] = []
+                for _ in range(page_size):
+                    try:
+                        raw = next(iterator)
+                    except StopIteration:
+                        break
+                    page.append(_bootstrap_missing_report_row(raw))
+                if not page:
+                    break
+                try:
+                    updated = conn.executemany(
+                        """
+                        INSERT INTO bootstrap_missing_actions (
+                            manifest_id, action_id, reason, cycle
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(manifest_id, action_id) DO UPDATE SET
+                            reason = excluded.reason,
+                            cycle = excluded.cycle
+                        """,
+                        (
+                            (manifest_id, action_id, reason, cycle)
+                            for action_id, reason, cycle in page
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise OneRosterError(
+                        "OR-MISSING-REPORT-ACTION",
+                        "A missing report row did not match this manifest.",
+                    ) from exc
+                written += max(0, int(updated.rowcount))
+        return written
+
+    def bootstrap_missing_report_count(self, manifest_id: str) -> int:
+        _validate_id(manifest_id)
+        with closing(self._conn()) as conn:
+            if not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM bootstrap_missing_actions
+                WHERE manifest_id = ?
+                """,
+                (manifest_id,),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def write_bootstrap_missing_report(
+        self,
+        manifest_id: str,
+        stream: BinaryIO | TextIO,
+    ) -> int:
+        """Stream a downloadable CSV containing durable mismatch evidence."""
+
+        _validate_id(manifest_id)
+        fields = (
+            "action_id",
+            "kind",
+            "subject",
+            "target",
+            "before",
+            "after",
+            "status",
+            "detail",
+            "reason",
+            "cycle",
+        )
+        _write_text(stream, _csv_line(fields))
+        count = 0
+        with closing(self._conn()) as conn:
+            if not conn.execute(
+                "SELECT 1 FROM manifests WHERE domain = ? AND id = ?",
+                (self.domain, manifest_id),
+            ).fetchone():
+                raise KeyError("OneRoster import manifest not found.")
+            rows = conn.execute(
+                """
+                SELECT action.action_id, action.kind, action.subject, action.target,
+                       action.before_value, action.after_value, action.status,
+                       action.detail, missing.reason, missing.cycle
+                FROM bootstrap_missing_actions AS missing
+                JOIN manifest_actions AS action
+                  ON action.manifest_id = missing.manifest_id
+                 AND action.action_id = missing.action_id
+                WHERE missing.manifest_id = ?
+                ORDER BY missing.cycle, action.kind,
+                         action.subject COLLATE NOCASE,
+                         action.target COLLATE NOCASE, action.rowid
+                """,
+                (manifest_id,),
+            )
+            for row in rows:
+                _write_text(
+                    stream,
+                    _csv_line(
+                        (
+                            str(row["action_id"]),
+                            str(row["kind"]),
+                            str(row["subject"]),
+                            str(row["target"]),
+                            str(row["before_value"]),
+                            str(row["after_value"]),
+                            str(row["status"]),
+                            str(row["detail"]),
+                            str(row["reason"]),
+                            str(row["cycle"]),
+                        )
+                    ),
+                )
+                count += 1
+        return count
+
+    def prepare_execution_phase(
+        self,
+        run_id: str,
+        manifest_id: str,
+        *,
+        phase: str,
+        kinds: Sequence[str],
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> Optional[ExecutionBatch]:
+        """Persist all pending members of one phase before native GAM starts."""
+
+        _validate_id(manifest_id)
+        selected_kinds = _bounded_text_values(kinds, maximum=32)
+        if not selected_kinds:
+            raise ValueError("An execution phase requires at least one action kind.")
+        phase_name = str(phase or "").strip()
+        owner = str(owner_id or "").strip()
+        if not phase_name or not owner:
+            raise ValueError("An execution phase and owner are required.")
+        timestamp = float(now if now is not None else time.time())
+        batch_id = secrets.token_hex(16)
+        placeholders = ",".join("?" for _ in selected_kinds)
+        with closing(self._conn()) as conn, conn:
+            run = conn.execute(
+                """
+                SELECT r.*, m.run_owner, m.status AS manifest_status
+                FROM execution_runs AS r
+                JOIN manifests AS m ON m.id = r.manifest_id
+                WHERE r.id = ? AND r.domain = ? AND r.manifest_id = ?
+                """,
+                (run_id, self.domain, manifest_id),
+            ).fetchone()
+            if (
+                run is None
+                or str(run["status"]) not in {"running", "pause_requested"}
+                or str(run["manifest_status"]) != "running"
+                or str(run["run_owner"]) != owner
+            ):
+                raise PermissionError("The execution run does not own this manifest.")
+            duplicate = conn.execute(
+                f"""
+                SELECT 1 FROM manifest_actions AS a
+                JOIN execution_batch_actions AS membership
+                  ON membership.action_id = a.action_id
+                JOIN execution_batches AS b
+                  ON b.id = membership.batch_id AND b.manifest_id = a.manifest_id
+                WHERE a.manifest_id = ? AND a.status = 'pending'
+                  AND a.kind IN ({placeholders})
+                  AND b.status IN ('prepared','running','submitted','reconciling')
+                  AND NOT (
+                    b.execution_mode = 'additions_first'
+                    AND b.status IN ('submitted','reconciling')
+                    AND membership.result_status = 'pending'
+                  )
+                LIMIT 1
+                """,
+                (manifest_id, *selected_kinds),
+            ).fetchone()
+            if duplicate is not None:
+                raise OneRosterError(
+                    "OR-PHASE-ACTIONS-ALREADY-PERSISTED",
+                    "A pending phase action already belongs to a durable batch.",
+                )
+            sequence_row = conn.execute(
+                """
+                SELECT COALESCE(MAX(sequence_number), 0) + 1 AS sequence
+                FROM execution_batches WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            sequence = int(sequence_row["sequence"] or 1)
+            conn.execute(
+                """
+                INSERT INTO execution_batches (
+                    id, run_id, manifest_id, sequence_number, phase,
+                    action_ids_hash, action_count, status, prepared_at,
+                    started_at, completed_at, attempt_number, error_code,
+                    worker_count, native_progress_count, native_progress_total,
+                    native_progress_updated_at, execution_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 'prepared', ?, 0, 0, 1, '',
+                          10, 0, 0, 0, 'additions_first')
+                """,
+                (
+                    batch_id,
+                    run_id,
+                    manifest_id,
+                    sequence,
+                    phase_name,
+                    canonical_hash(()),
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                f"""
+                INSERT INTO execution_batch_actions (batch_id, action_id, ordinal)
+                SELECT ?, action_id,
+                       ROW_NUMBER() OVER (
+                           ORDER BY subject COLLATE NOCASE,
+                                    target COLLATE NOCASE, rowid
+                       ) - 1
+                FROM manifest_actions
+                WHERE manifest_id = ? AND status = 'pending'
+                  AND kind IN ({placeholders})
+                ORDER BY subject COLLATE NOCASE, target COLLATE NOCASE, rowid
+                """,
+                (batch_id, manifest_id, *selected_kinds),
+            )
+            digest, action_count, valid = _execution_membership_integrity(
+                conn, batch_id, manifest_id
+            )
+            if not valid:
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "The durable phase membership could not be verified.",
+                )
+            if action_count == 0:
+                conn.execute("DELETE FROM execution_batches WHERE id = ?", (batch_id,))
+                return None
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET action_ids_hash = ?, action_count = ?
+                WHERE id = ? AND status = 'prepared'
+                """,
+                (digest, action_count, batch_id),
+            )
+            conn.execute(
+                """
+                UPDATE execution_runs
+                SET phase = ?, current_batch_sequence = ?, updated_at = ?,
+                    last_heartbeat_at = ?
+                WHERE id = ? AND domain = ?
+                """,
+                (phase_name, sequence, timestamp, timestamp, run_id, self.domain),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def mark_execution_phase_started(
+        self,
+        batch_id: str,
+        *,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Start one previously persisted whole-phase native GAM operation."""
+
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["status"]) != "prepared"
+                or str(batch["run_status"]) not in {"running", "pause_requested"}
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise OneRosterError(
+                    "OR-PHASE-NOT-PREPARED",
+                    "The durable execution phase is not ready to start.",
+                )
+            _require_execution_membership_integrity(conn, batch)
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = 'running', started_at = ?, worker_count = 10
+                WHERE id = ? AND status = 'prepared'
+                """,
+                (timestamp, batch_id),
+            )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def record_execution_phase_progress(
+        self,
+        batch_id: str,
+        dispatched: int,
+        total: int,
+        *,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Persist monotonic dispatched-command progress and renew the run lease."""
+
+        dispatched_count = int(dispatched)
+        total_count = int(total)
+        if dispatched_count < 0 or total_count < 0 or dispatched_count > total_count:
+            raise ValueError("Native phase progress must satisfy 0 <= dispatched <= total.")
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["status"]) != "running"
+                or str(batch["run_status"]) not in {"running", "pause_requested"}
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise PermissionError("The active phase does not own this manifest.")
+            action_count = int(batch["action_count"] or 0)
+            previous_dispatched = int(batch["native_progress_count"] or 0)
+            previous_total = int(batch["native_progress_total"] or 0)
+            if (
+                total_count > action_count
+                or dispatched_count < previous_dispatched
+                or total_count < previous_total
+            ):
+                raise OneRosterError(
+                    "OR-PHASE-PROGRESS-INVALID",
+                    "Native phase progress was non-monotonic or exceeded its durable membership.",
+                )
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET native_progress_count = ?, native_progress_total = ?,
+                    native_progress_updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (dispatched_count, total_count, timestamp, batch_id),
+            )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def mark_execution_phase_submitted(
+        self,
+        batch_id: str,
+        manifest_id: str,
+        *,
+        owner_id: str,
+        apply_seconds: float,
+        worker_count: int = 10,
+        throttling_count: int = 0,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Atomically record a successful native return and submitted actions."""
+
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["manifest_id"]) != manifest_id
+                or str(batch["status"]) != "running"
+                or str(batch["run_status"]) not in {"running", "pause_requested"}
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise PermissionError("The active phase does not own this manifest.")
+            _require_execution_membership_integrity(conn, batch)
+            updated = conn.execute(
+                """
+                UPDATE manifest_actions AS actions
+                SET status = 'submitted',
+                    detail = 'Native GAM phase submitted; awaiting reconciliation.'
+                WHERE actions.manifest_id = ? AND actions.status = 'pending'
+                  AND EXISTS (
+                      SELECT 1 FROM execution_batch_actions AS membership
+                      WHERE membership.batch_id = ?
+                        AND membership.action_id = actions.action_id
+                  )
+                """,
+                (manifest_id, batch_id),
+            )
+            if updated.rowcount != int(batch["action_count"]):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Not every durable phase action was pending after native execution.",
+                )
+            membership_updated = conn.execute(
+                """
+                UPDATE execution_batch_actions SET result_status = 'submitted'
+                WHERE batch_id = ? AND result_status = ''
+                """,
+                (batch_id,),
+            )
+            if membership_updated.rowcount != int(batch["action_count"]):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Durable phase receipts did not match submitted actions.",
+                )
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = 'submitted', apply_seconds = ?, worker_count = ?,
+                    throttling_count = ?, native_progress_count = action_count,
+                    native_progress_total = action_count,
+                    native_progress_updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    max(0.0, float(apply_seconds)),
+                    max(1, int(worker_count)),
+                    max(0, int(throttling_count)),
+                    timestamp,
+                    batch_id,
+                ),
+            )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def mark_execution_phase_reconciling(
+        self,
+        batch_id: str,
+        *,
+        error_code: str,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Move an uncertain native phase to reconciliation without guessing outcomes."""
+
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        code = str(error_code or "OR-EXECUTION-INTERRUPTED").strip()
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["status"]) not in {"running", "submitted"}
+                or str(batch["run_status"]) not in {"running", "pause_requested"}
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise PermissionError("The active phase does not own this manifest.")
+            _require_execution_membership_integrity(conn, batch)
+            if str(batch["status"]) == "running":
+                updated = conn.execute(
+                    """
+                    UPDATE manifest_actions AS actions
+                    SET status = 'submitted',
+                        detail = 'Native GAM phase outcome is uncertain; reconciliation required.'
+                    WHERE actions.manifest_id = ? AND actions.status = 'pending'
+                      AND EXISTS (
+                          SELECT 1 FROM execution_batch_actions AS membership
+                          WHERE membership.batch_id = ?
+                            AND membership.action_id = actions.action_id
+                      )
+                    """,
+                    (str(batch["manifest_id"]), batch_id),
+                )
+                if updated.rowcount != int(batch["action_count"]):
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "Uncertain phase membership no longer matched pending actions.",
+                    )
+                membership_updated = conn.execute(
+                    """
+                    UPDATE execution_batch_actions SET result_status = 'submitted'
+                    WHERE batch_id = ? AND result_status = ''
+                    """,
+                    (batch_id,),
+                )
+                if membership_updated.rowcount != int(batch["action_count"]):
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "Uncertain phase receipts no longer matched issued actions.",
+                    )
+            conn.execute(
+                """
+                UPDATE execution_batches SET status = 'reconciling', error_code = ?
+                WHERE id = ? AND status IN ('running', 'submitted')
+                """,
+                (code, batch_id),
+            )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
+
+    def pause_additions_first_at_dispatch_boundary(
+        self,
+        manifest_id: str,
+        batch_id: str,
+        dispatched_count: int,
+        *,
+        now: Optional[float] = None,
+    ) -> Mapping[str, Any]:
+        """Convert a recovered student phase's undispatched suffix into retry work."""
+
+        _validate_id(manifest_id)
+        _validate_id(batch_id)
+        boundary = int(dispatched_count)
+        if boundary < 0:
+            raise ValueError("The native dispatch boundary cannot be negative.")
+        timestamp = float(now if now is not None else time.time())
+        idempotent = False
+        with closing(self._conn()) as conn, conn:
+            batch = conn.execute(
+                """
+                SELECT batch.*, run.status AS run_status, run.phase AS run_phase,
+                       run.stop_requested AS run_stop_requested,
+                       run.last_error_code AS run_error_code,
+                       manifest.status AS manifest_status,
+                       manifest.run_owner, manifest.run_pid, manifest.run_identity
+                FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                JOIN manifests AS manifest ON manifest.id = batch.manifest_id
+                WHERE batch.id = ? AND batch.manifest_id = ?
+                  AND run.domain = ? AND manifest.domain = run.domain
+                """,
+                (batch_id, manifest_id, self.domain),
+            ).fetchone()
+            if batch is None:
+                raise KeyError("OneRoster execution phase not found.")
+            _require_execution_membership_integrity(conn, batch)
+            action_count = int(batch["action_count"] or 0)
+            persisted_dispatched = int(batch["native_progress_count"] or 0)
+            persisted_total = int(batch["native_progress_total"] or 0)
+            if (
+                str(batch["execution_mode"]) != "additions_first"
+                or str(batch["phase"]) != "student_add"
+                or str(batch["status"]) != "reconciling"
+                or str(batch["reconciliation_run_id"] or "")
+            ):
+                raise OneRosterError(
+                    "OR-DISPATCH-BOUNDARY-INELIGIBLE",
+                    "Only an unattached recovered additions-first student phase can use a dispatch boundary.",
+                )
+            if (
+                boundary != persisted_dispatched
+                or persisted_total != action_count
+                or boundary > action_count
+            ):
+                raise OneRosterError(
+                    "OR-PHASE-PROGRESS-INVALID",
+                    "The requested boundary does not match persisted native phase progress.",
+                )
+            latest_run = conn.execute(
+                """
+                SELECT id FROM execution_runs
+                WHERE domain = ? AND manifest_id = ?
+                ORDER BY started_at DESC, rowid DESC LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            if latest_run is None or str(latest_run["id"]) != str(batch["run_id"]):
+                raise OneRosterError(
+                    "OR-DISPATCH-BOUNDARY-INELIGIBLE",
+                    "The dispatch boundary does not belong to the latest execution attempt.",
+                )
+            if (
+                str(batch["run_owner"] or "")
+                or int(batch["run_pid"] or 0)
+                or str(batch["run_identity"] or "")
+            ):
+                raise OneRosterError(
+                    "OR-DISPATCH-BOUNDARY-INELIGIBLE",
+                    "The recovered manifest still has an active execution lease.",
+                )
+            invalid_batch = conn.execute(
+                """
+                SELECT 1 FROM execution_batches AS other
+                JOIN execution_runs AS other_run ON other_run.id = other.run_id
+                WHERE other_run.domain = ? AND other.manifest_id = ?
+                  AND (
+                    other.status IN ('prepared','running','abandoned')
+                    OR other.status NOT IN (
+                        'submitted','reconciling','completed','reconciled','failed'
+                    )
+                    OR (
+                        other.status IN ('submitted','reconciling')
+                        AND other.execution_mode != 'additions_first'
+                    )
+                  )
+                LIMIT 1
+                """,
+                (self.domain, manifest_id),
+            ).fetchone()
+            if invalid_batch is not None:
+                raise OneRosterError(
+                    "OR-RECOVERY-REQUIRED",
+                    "Another durable batch prevents a clean additions-first pause.",
+                )
+
+            recovery_state = (
+                str(batch["manifest_status"]) == "recovery_required"
+                and str(batch["run_status"]) == "recovery_required"
+                and str(batch["run_phase"]) == "reconciliation"
+            )
+            paused_state = (
+                str(batch["manifest_status"]) == "paused"
+                and str(batch["run_status"]) == "paused"
+                and str(batch["run_phase"]) == "paused"
+                and bool(batch["run_stop_requested"])
+                and str(batch["run_error_code"] or "") == "OR-BOOTSTRAP-PAUSED"
+            )
+            if not recovery_state and not paused_state:
+                raise OneRosterError(
+                    "OR-DISPATCH-BOUNDARY-INELIGIBLE",
+                    "The execution is not at a recovered or already-paused dispatch checkpoint.",
+                )
+
+            receipt_counts = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN membership.ordinal < ?
+                                     AND membership.result_status = 'submitted'
+                                     AND action.status = 'submitted'
+                                THEN 1 ELSE 0 END) AS submitted_prefix,
+                       SUM(CASE WHEN membership.ordinal >= ?
+                                     AND membership.result_status = 'submitted'
+                                     AND action.status = 'submitted'
+                                THEN 1 ELSE 0 END) AS submitted_suffix,
+                       SUM(CASE WHEN membership.ordinal >= ?
+                                     AND membership.result_status = 'pending'
+                                     AND action.status = 'pending'
+                                THEN 1 ELSE 0 END) AS pending_suffix
+                FROM execution_batch_actions AS membership
+                JOIN manifest_actions AS action
+                  ON action.manifest_id = ?
+                 AND action.action_id = membership.action_id
+                WHERE membership.batch_id = ?
+                """,
+                (boundary, boundary, boundary, manifest_id, batch_id),
+            ).fetchone()
+            suffix_count = action_count - boundary
+            if (
+                int(receipt_counts["total"] or 0) != action_count
+                or int(receipt_counts["submitted_prefix"] or 0) != boundary
+            ):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "The dispatched phase prefix no longer has exact submitted receipts.",
+                )
+
+            if paused_state:
+                if (
+                    int(receipt_counts["pending_suffix"] or 0) != suffix_count
+                    or int(receipt_counts["submitted_suffix"] or 0)
+                ):
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "The paused phase suffix no longer matches its dispatch boundary.",
+                    )
+                idempotent = True
+            else:
+                if (
+                    int(receipt_counts["submitted_suffix"] or 0) != suffix_count
+                    or int(receipt_counts["pending_suffix"] or 0)
+                ):
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "The recovered phase no longer has a fully uncertain submitted suffix.",
+                    )
+                membership_update = conn.execute(
+                    """
+                    UPDATE execution_batch_actions SET result_status = 'pending'
+                    WHERE batch_id = ? AND ordinal >= ?
+                      AND result_status = 'submitted'
+                    """,
+                    (batch_id, boundary),
+                )
+                if membership_update.rowcount != suffix_count:
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "The recovered phase receipts changed while applying the dispatch boundary.",
+                    )
+                action_update = conn.execute(
+                    """
+                    UPDATE manifest_actions AS action
+                    SET status = 'pending',
+                        detail = 'Not dispatched before native GAM stopped; safe to retry.'
+                    WHERE action.manifest_id = ? AND action.status = 'submitted'
+                      AND EXISTS (
+                          SELECT 1 FROM execution_batch_actions AS membership
+                          WHERE membership.batch_id = ?
+                            AND membership.action_id = action.action_id
+                            AND membership.ordinal >= ?
+                            AND membership.result_status = 'pending'
+                      )
+                    """,
+                    (manifest_id, batch_id, boundary),
+                )
+                if action_update.rowcount != suffix_count:
+                    raise OneRosterError(
+                        "OR-BATCH-ACTIONS-CHANGED",
+                        "The recovered manifest actions changed while applying the dispatch boundary.",
+                    )
+                run_update = conn.execute(
+                    """
+                    UPDATE execution_runs
+                    SET status = 'paused', phase = 'paused', stop_requested = 1,
+                        updated_at = ?, last_heartbeat_at = ?,
+                        last_error_code = 'OR-BOOTSTRAP-PAUSED'
+                    WHERE id = ? AND domain = ? AND status = 'recovery_required'
+                    """,
+                    (timestamp, timestamp, str(batch["run_id"]), self.domain),
+                )
+                manifest_update = conn.execute(
+                    """
+                    UPDATE manifests
+                    SET status = 'paused', error = 'OR-BOOTSTRAP-PAUSED',
+                        run_owner = '', run_pid = 0, run_identity = ''
+                    WHERE domain = ? AND id = ? AND status = 'recovery_required'
+                    """,
+                    (self.domain, manifest_id),
+                )
+                if run_update.rowcount != 1 or manifest_update.rowcount != 1:
+                    raise OneRosterError(
+                        "OR-DISPATCH-BOUNDARY-INELIGIBLE",
+                        "The recovered execution changed while creating the pause checkpoint.",
+                    )
+
+        return {
+            "manifest_id": manifest_id,
+            "run_id": str(batch["run_id"]),
+            "batch_id": batch_id,
+            "action_count": action_count,
+            "dispatched_count": boundary,
+            "pending_count": action_count - boundary,
+            "idempotent": idempotent,
+        }
+
+    def get_execution_phase_action_chunk(
+        self,
+        batch_id: str,
+        *,
+        after_ordinal: int = -1,
+        limit: int = 500,
+        result_statuses: Optional[Sequence[str]] = None,
+    ) -> tuple[tuple[int, ImportAction], ...]:
+        """Read exact phase membership with keyset pagination and receipt filtering."""
+
+        page_size = max(1, min(int(limit or 500), 1000))
+        status_filter = ""
+        parameters: list[Any] = [batch_id, self.domain, int(after_ordinal)]
+        if result_statuses is not None:
+            selected_statuses = tuple(dict.fromkeys(str(value) for value in result_statuses))
+            allowed_statuses = {"", "submitted", "pending", "applied", "failed"}
+            if not selected_statuses or len(selected_statuses) > len(allowed_statuses):
+                raise ValueError("A receipt filter requires 1 to 5 result statuses.")
+            if set(selected_statuses) - allowed_statuses:
+                raise ValueError("The receipt filter contains an unsupported result status.")
+            placeholders = ",".join("?" for _ in selected_statuses)
+            status_filter = f" AND membership.result_status IN ({placeholders})"
+            parameters.extend(selected_statuses)
+        parameters.append(page_size)
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT membership.ordinal, actions.*
+                FROM execution_batch_actions AS membership
+                JOIN execution_batches AS batch ON batch.id = membership.batch_id
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                JOIN manifest_actions AS actions
+                  ON actions.manifest_id = batch.manifest_id
+                 AND actions.action_id = membership.action_id
+                WHERE membership.batch_id = ? AND run.domain = ?
+                  AND membership.ordinal > ?
+                  {status_filter}
+                ORDER BY membership.ordinal LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            if not rows and not conn.execute(
+                """
+                SELECT 1 FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                WHERE batch.id = ? AND run.domain = ?
+                """,
+                (batch_id, self.domain),
+            ).fetchone():
+                raise KeyError("OneRoster execution phase not found.")
+        return tuple((int(row["ordinal"]), _action_from_row(row)) for row in rows)
+
+    def execution_phase_action_counts(self, batch_id: str) -> Mapping[str, int]:
+        """Count current action states for exact durable phase membership."""
+
+        with closing(self._conn()) as conn:
+            batch = conn.execute(
+                """
+                SELECT batch.* FROM execution_batches AS batch
+                JOIN execution_runs AS run ON run.id = batch.run_id
+                WHERE batch.id = ? AND run.domain = ?
+                """,
+                (batch_id, self.domain),
+            ).fetchone()
+            if batch is None:
+                raise KeyError("OneRoster execution phase not found.")
+            _require_execution_membership_integrity(conn, batch)
+            rows = conn.execute(
+                """
+                SELECT actions.status, COUNT(*) AS count
+                FROM execution_batch_actions AS membership
+                JOIN manifest_actions AS actions
+                  ON actions.manifest_id = ?
+                 AND actions.action_id = membership.action_id
+                WHERE membership.batch_id = ? GROUP BY actions.status
+                """,
+                (str(batch["manifest_id"]), batch_id),
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def promote_submitted_phase_actions(
+        self,
+        batch_id: str,
+        manifest_id: str,
+        results: Mapping[str, tuple[str, str]],
+        *,
+        owner_id: str,
+        now: Optional[float] = None,
+    ) -> Mapping[str, int]:
+        """Persist one bounded reconciliation page for a submitted phase."""
+
+        owner = str(owner_id or "").strip()
+        normalized = {
+            str(action_id): (str(status), str(detail))
+            for action_id, (status, detail) in results.items()
+        }
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        if not normalized or len(normalized) > 500:
+            raise ValueError("A reconciliation page must contain 1 to 500 actions.")
+        if any(
+            status not in {"applied", "failed", "pending"}
+            for status, _detail in normalized.values()
+        ):
+            raise ValueError("Reconciled phase actions must be applied, failed, or pending.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["manifest_id"]) != manifest_id
+                or str(batch["status"]) not in {"submitted", "reconciling"}
+                or str(batch["run_status"]) not in {
+                    "running",
+                    "pause_requested",
+                    "recovery_required",
+                }
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise PermissionError("The reconciling phase does not own this manifest.")
+            _require_execution_membership_integrity(conn, batch)
+            source_statuses = ("submitted",)
+            source_placeholders = ",".join("?" for _ in source_statuses)
+            updated = conn.executemany(
+                f"""
+                UPDATE manifest_actions AS actions SET status = ?, detail = ?
+                WHERE actions.manifest_id = ? AND actions.action_id = ?
+                  AND actions.status IN ({source_placeholders})
+                  AND EXISTS (
+                      SELECT 1 FROM execution_batch_actions AS membership
+                      WHERE membership.batch_id = ?
+                        AND membership.action_id = actions.action_id
+                  )
+                """,
+                (
+                    (
+                        status,
+                        detail,
+                        manifest_id,
+                        action_id,
+                        *source_statuses,
+                        batch_id,
+                    )
+                    for action_id, (status, detail) in normalized.items()
+                ),
+            )
+            if updated.rowcount != len(normalized):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "A reconciliation result did not match submitted phase membership.",
+                )
+            membership_updated = conn.executemany(
+                """
+                UPDATE execution_batch_actions SET result_status = ?
+                WHERE batch_id = ? AND action_id = ?
+                  AND result_status = 'submitted'
+                """,
+                (
+                    (status, batch_id, action_id)
+                    for action_id, (status, _detail) in normalized.items()
+                ),
+            )
+            if membership_updated.rowcount != len(normalized):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "A reconciliation result did not match submitted phase receipts.",
+                )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            rows = conn.execute(
+                """
+                SELECT actions.status, COUNT(*) AS count
+                FROM execution_batch_actions AS membership
+                JOIN manifest_actions AS actions
+                  ON actions.manifest_id = ?
+                 AND actions.action_id = membership.action_id
+                WHERE membership.batch_id = ? GROUP BY actions.status
+                """,
+                (manifest_id, batch_id),
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def finish_execution_phase_reconciliation(
+        self,
+        batch_id: str,
+        manifest_id: str,
+        *,
+        owner_id: str,
+        verification_seconds: float = 0.0,
+        verification_attempts: int = 1,
+        error_code: str = "",
+        now: Optional[float] = None,
+    ) -> ExecutionBatch:
+        """Finish reconciliation only after every submitted member is classified."""
+
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("An execution owner is required.")
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            batch = _owned_execution_batch(conn, batch_id, self.domain, owner)
+            if (
+                batch is None
+                or str(batch["manifest_id"]) != manifest_id
+                or str(batch["status"]) not in {"submitted", "reconciling"}
+                or str(batch["run_status"]) not in {
+                    "running",
+                    "pause_requested",
+                    "recovery_required",
+                }
+                or str(batch["manifest_status"]) != "running"
+            ):
+                raise PermissionError("The reconciling phase does not own this manifest.")
+            _require_execution_membership_integrity(conn, batch)
+            counts = {
+                str(row["status"]): int(row["count"] or 0)
+                for row in conn.execute(
+                    """
+                    SELECT membership.result_status AS status, COUNT(*) AS count
+                    FROM execution_batch_actions AS membership
+                    WHERE membership.batch_id = ? GROUP BY membership.result_status
+                    """,
+                    (batch_id,),
+                ).fetchall()
+            }
+            if counts.get("submitted", 0) or counts.get("", 0):
+                raise OneRosterError(
+                    "OR-PHASE-RECONCILIATION-INCOMPLETE",
+                    "Phase receipts still require live reconciliation.",
+                )
+            succeeded = counts.get("applied", 0) == int(batch["action_count"])
+            terminal_status = "completed" if succeeded else "reconciled"
+            terminal_error = "" if succeeded else str(error_code or "").strip()
+            conn.execute(
+                """
+                UPDATE execution_batches
+                SET status = ?, completed_at = ?, error_code = ?,
+                    verification_seconds = ?, verification_attempts = ?
+                WHERE id = ? AND status IN ('submitted', 'reconciling')
+                """,
+                (
+                    terminal_status,
+                    timestamp,
+                    terminal_error,
+                    max(0.0, float(verification_seconds)),
+                    max(1, int(verification_attempts)),
+                    batch_id,
+                ),
+            )
+            _heartbeat_batch_run(conn, batch_id, timestamp)
+            row = conn.execute(
+                "SELECT * FROM execution_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        assert row is not None
+        return _execution_batch_from_row(row)
 
     def prepare_execution_batch(
         self,
@@ -1605,6 +3186,21 @@ class OneRosterStore:
                     "OR-BATCH-ACTIONS-CHANGED",
                     "Not every immutable batch action could be updated.",
                 )
+            membership_updated = conn.executemany(
+                """
+                UPDATE execution_batch_actions SET result_status = ?
+                WHERE batch_id = ? AND action_id = ? AND result_status = ''
+                """,
+                (
+                    (normalized[action_id][0], batch_id, action_id)
+                    for action_id in action_ids
+                ),
+            )
+            if membership_updated.rowcount != len(action_ids):
+                raise OneRosterError(
+                    "OR-BATCH-ACTIONS-CHANGED",
+                    "Verified results no longer match durable batch receipts.",
+                )
             failed = any(status == "failed" for status, _detail in normalized.values())
             persistence_seconds = time.perf_counter() - persist_started
             conn.execute(
@@ -1751,7 +3347,9 @@ class OneRosterStore:
                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
                         AS failed,
                     COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0)
-                        AS skipped
+                        AS skipped,
+                    COALESCE(SUM(CASE WHEN status = 'submitted' THEN 1 ELSE 0 END), 0)
+                        AS submitted
                 FROM manifest_actions WHERE manifest_id = ? GROUP BY kind
                 """,
                 (manifest_id,),
@@ -1792,9 +3390,10 @@ class OneRosterStore:
                                THEN apply_seconds + verification_seconds + persistence_seconds
                                ELSE 0 END
                            ), 0) AS seconds
-                    FROM execution_batches WHERE run_id = ?
+                    FROM execution_batches
+                    WHERE run_id = ? OR reconciliation_run_id = ?
                     """,
-                    (run_row["id"],),
+                    (run_row["id"], run_row["id"]),
                 ).fetchone()
                 completed_batches = int(batch_row["count"] or 0)
                 batch_actions = int(batch_row["actions"] or 0)
@@ -1808,11 +3407,11 @@ class OneRosterStore:
                     LEFT JOIN manifest_actions AS actions
                         ON actions.manifest_id = b.manifest_id
                         AND actions.action_id = membership.action_id
-                    WHERE b.run_id = ?
+                    WHERE b.run_id = ? OR b.reconciliation_run_id = ?
                     GROUP BY b.id
                     ORDER BY b.sequence_number DESC LIMIT 1
                     """,
-                    (run_row["id"],),
+                    (run_row["id"], run_row["id"]),
                 ).fetchone()
                 if latest_batch is not None:
                     worker_count = int(latest_batch["worker_count"] or 5)
@@ -1833,6 +3432,7 @@ class OneRosterStore:
                 "applied": 0,
                 "failed": 0,
                 "skipped": 0,
+                "submitted": 0,
             }
             for key, label, _kinds in _PROGRESS_PHASES
         }
@@ -1848,9 +3448,17 @@ class OneRosterStore:
                     "applied": 0,
                     "failed": 0,
                     "skipped": 0,
+                    "submitted": 0,
                 },
             )
-            for field_name in ("total", "pending", "applied", "failed", "skipped"):
+            for field_name in (
+                "total",
+                "pending",
+                "applied",
+                "failed",
+                "skipped",
+                "submitted",
+            ):
                 bucket[field_name] = int(bucket[field_name]) + int(row[field_name] or 0)
         phases = tuple(
             ExecutionPhaseProgress(
@@ -1861,6 +3469,7 @@ class OneRosterStore:
                 applied=int(bucket["applied"]),
                 failed=int(bucket["failed"]),
                 skipped=int(bucket["skipped"]),
+                submitted=int(bucket["submitted"]),
                 pending=int(bucket["pending"]),
             )
             for bucket in phase_totals.values()
@@ -1871,7 +3480,8 @@ class OneRosterStore:
         applied = sum(phase.applied for phase in phases)
         failed = sum(phase.failed for phase in phases)
         skipped = sum(phase.skipped for phase in phases)
-        complete = applied + failed + skipped
+        submitted = sum(phase.submitted for phase in phases)
+        complete = applied + failed + skipped + submitted
         run = _execution_run_from_row(run_row) if run_row is not None else None
         elapsed = max(0.0, timestamp - run.started_at) if run else 0.0
         rate = (
@@ -1903,6 +3513,7 @@ class OneRosterStore:
                 action_count=int(latest_batch["action_count"] or 0),
                 course_count=int(latest_batch["course_count"] or 0),
                 status=str(latest_batch["status"] or ""),
+                execution_mode=str(latest_batch["execution_mode"] or "verified"),
                 apply_seconds=float(latest_batch["apply_seconds"] or 0),
                 verification_seconds=float(
                     latest_batch["verification_seconds"] or 0
@@ -1913,6 +3524,15 @@ class OneRosterStore:
                 ),
                 worker_count=int(latest_batch["worker_count"] or 5),
                 throttling_count=int(latest_batch["throttling_count"] or 0),
+                native_progress_count=int(
+                    latest_batch["native_progress_count"] or 0
+                ),
+                native_progress_total=int(
+                    latest_batch["native_progress_total"] or 0
+                ),
+                native_progress_updated_at=float(
+                    latest_batch["native_progress_updated_at"] or 0
+                ),
             )
         return ExecutionProgress(
             run=run,
@@ -1921,6 +3541,7 @@ class OneRosterStore:
             applied=applied,
             failed=failed,
             skipped=skipped,
+            submitted=submitted,
             percent=(complete * 100.0 / total) if total else 100.0,
             completed_batches=completed_batches,
             total_batches_estimate=estimated_batches,
@@ -1979,6 +3600,36 @@ class OneRosterStore:
                     timestamp = time.time()
                     conn.execute(
                         """
+                        UPDATE manifest_actions AS actions
+                        SET status = 'submitted',
+                            detail = 'Native GAM phase was interrupted; reconciliation required.'
+                        WHERE actions.manifest_id = ? AND actions.status = 'pending'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM execution_batch_actions AS membership
+                              JOIN execution_batches AS batch
+                                ON batch.id = membership.batch_id
+                              WHERE batch.run_id = ?
+                                AND batch.status = 'running'
+                                AND batch.execution_mode = 'additions_first'
+                                AND membership.action_id = actions.action_id
+                          )
+                        """,
+                        (str(manifest["id"]), str(run["id"])),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE execution_batch_actions SET result_status = 'submitted'
+                        WHERE result_status = '' AND batch_id IN (
+                            SELECT id FROM execution_batches
+                            WHERE run_id = ? AND status = 'running'
+                              AND execution_mode = 'additions_first'
+                        )
+                        """,
+                        (str(run["id"]),),
+                    )
+                    conn.execute(
+                        """
                         UPDATE execution_runs
                         SET status = 'recovery_required', phase = 'reconciliation',
                             updated_at = ?, last_error_code = 'OR-RECOVERY-REQUIRED'
@@ -1990,7 +3641,7 @@ class OneRosterStore:
                         """
                         UPDATE execution_batches SET status = 'reconciling',
                             error_code = 'OR-EXECUTION-INTERRUPTED'
-                        WHERE run_id = ? AND status = 'running'
+                        WHERE run_id = ? AND status IN ('running', 'submitted')
                         """,
                         (run["id"],),
                     )
@@ -2829,12 +4480,17 @@ class OneRosterStore:
                     completed_at REAL NOT NULL DEFAULT 0,
                     attempt_number INTEGER NOT NULL DEFAULT 1,
                     error_code TEXT NOT NULL DEFAULT '',
+                    execution_mode TEXT NOT NULL DEFAULT 'verified',
+                    reconciliation_run_id TEXT NOT NULL DEFAULT '',
                     apply_seconds REAL NOT NULL DEFAULT 0,
                     verification_seconds REAL NOT NULL DEFAULT 0,
                     persistence_seconds REAL NOT NULL DEFAULT 0,
                     verification_attempts INTEGER NOT NULL DEFAULT 0,
                     worker_count INTEGER NOT NULL DEFAULT 5,
                     throttling_count INTEGER NOT NULL DEFAULT 0,
+                    native_progress_count INTEGER NOT NULL DEFAULT 0,
+                    native_progress_total INTEGER NOT NULL DEFAULT 0,
+                    native_progress_updated_at REAL NOT NULL DEFAULT 0,
                     UNIQUE(run_id, sequence_number),
                     FOREIGN KEY(run_id) REFERENCES execution_runs(id) ON DELETE CASCADE,
                     FOREIGN KEY(manifest_id) REFERENCES manifests(id) ON DELETE CASCADE
@@ -2843,10 +4499,25 @@ class OneRosterStore:
                     batch_id TEXT NOT NULL,
                     action_id TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
+                    result_status TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(batch_id, action_id),
                     UNIQUE(batch_id, ordinal),
                     FOREIGN KEY(batch_id) REFERENCES execution_batches(id) ON DELETE CASCADE
                 );
+                CREATE INDEX IF NOT EXISTS execution_batch_actions_action_receipt
+                    ON execution_batch_actions(action_id, result_status, batch_id);
+                CREATE TABLE IF NOT EXISTS bootstrap_missing_actions (
+                    manifest_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    cycle INTEGER NOT NULL,
+                    PRIMARY KEY(manifest_id, action_id),
+                    FOREIGN KEY(manifest_id, action_id)
+                        REFERENCES manifest_actions(manifest_id, action_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS bootstrap_missing_manifest_cycle
+                    ON bootstrap_missing_actions(manifest_id, cycle, action_id);
                 CREATE INDEX IF NOT EXISTS execution_batches_run_status
                     ON execution_batches(run_id, status, sequence_number);
                 CREATE TABLE IF NOT EXISTS student_gate (
@@ -2975,13 +4646,24 @@ class OneRosterStore:
                 _ensure_column(conn, "execution_runs", column, definition)
             for column, definition in (
                 ("apply_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("execution_mode", "TEXT NOT NULL DEFAULT 'verified'"),
+                ("reconciliation_run_id", "TEXT NOT NULL DEFAULT ''"),
                 ("verification_seconds", "REAL NOT NULL DEFAULT 0"),
                 ("persistence_seconds", "REAL NOT NULL DEFAULT 0"),
                 ("verification_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("worker_count", "INTEGER NOT NULL DEFAULT 5"),
                 ("throttling_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_progress_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_progress_total", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_progress_updated_at", "REAL NOT NULL DEFAULT 0"),
             ):
                 _ensure_column(conn, "execution_batches", column, definition)
+            _ensure_column(
+                conn,
+                "execution_batch_actions",
+                "result_status",
+                "TEXT NOT NULL DEFAULT ''",
+            )
 
     def _restrict_state_perms(self) -> None:
         _chmod(self.root, 0o700)
@@ -3006,6 +4688,140 @@ def _snapshot_conn(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def _bounded_text_values(values: Sequence[str], *, maximum: int) -> tuple[str, ...]:
+    selected = tuple(
+        dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip())
+    )
+    if len(selected) > maximum:
+        raise ValueError(f"At most {maximum} filter values are allowed.")
+    return selected
+
+
+def _bootstrap_missing_report_row(
+    value: Sequence[Any] | Mapping[str, Any],
+) -> tuple[str, str, int]:
+    if isinstance(value, Mapping):
+        action_id = str(value.get("action_id") or "").strip()
+        reason = str(value.get("reason") or "").strip()
+        cycle = int(value.get("cycle") or 0)
+    else:
+        if isinstance(value, (str, bytes)) or len(value) != 3:
+            raise ValueError(
+                "Missing report rows require action_id, reason, and cycle."
+            )
+        action_id = str(value[0] or "").strip()
+        reason = str(value[1] or "").strip()
+        cycle = int(value[2] or 0)
+    if not action_id or not reason or cycle < 0:
+        raise ValueError("Missing report rows require a reason and non-negative cycle.")
+    if len(action_id) > 256 or len(reason) > 1000:
+        raise ValueError("Missing report evidence exceeds its storage bound.")
+    return action_id, reason, cycle
+
+
+def _execution_membership_integrity(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    manifest_id: str,
+) -> tuple[str, int, bool]:
+    """Hash ordered membership as canonical JSON without retaining action IDs."""
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    count = 0
+    valid = True
+    rows = conn.execute(
+        """
+        SELECT membership.ordinal, membership.action_id,
+               actions.action_id AS manifest_action_id
+        FROM execution_batch_actions AS membership
+        LEFT JOIN manifest_actions AS actions
+          ON actions.manifest_id = ?
+         AND actions.action_id = membership.action_id
+        WHERE membership.batch_id = ? ORDER BY membership.ordinal
+        """,
+        (manifest_id, batch_id),
+    )
+    for row in rows:
+        if int(row["ordinal"]) != count or row["manifest_action_id"] is None:
+            valid = False
+        if count:
+            digest.update(b",")
+        digest.update(
+            json.dumps(
+                str(row["action_id"]),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        count += 1
+    digest.update(b"]")
+    return digest.hexdigest(), count, valid
+
+
+def _require_execution_membership_integrity(
+    conn: sqlite3.Connection,
+    batch: sqlite3.Row,
+) -> None:
+    digest, count, valid = _execution_membership_integrity(
+        conn,
+        str(batch["id"]),
+        str(batch["manifest_id"]),
+    )
+    if (
+        not valid
+        or count != int(batch["action_count"] or 0)
+        or digest != str(batch["action_ids_hash"] or "")
+    ):
+        raise OneRosterError(
+            "OR-BATCH-ACTIONS-CHANGED",
+            "Durable execution phase membership failed its integrity check.",
+        )
+
+
+def _owned_execution_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    domain: str,
+    owner_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT batch.*,
+               COALESCE(reconciliation.status, run.status) AS run_status,
+               manifest.status AS manifest_status, manifest.run_owner
+        FROM execution_batches AS batch
+        JOIN execution_runs AS run ON run.id = batch.run_id
+        LEFT JOIN execution_runs AS reconciliation
+          ON reconciliation.id = batch.reconciliation_run_id
+         AND reconciliation.domain = run.domain
+        JOIN manifests AS manifest ON manifest.id = batch.manifest_id
+        WHERE batch.id = ? AND run.domain = ? AND manifest.run_owner = ?
+        """,
+        (batch_id, domain, owner_id),
+    ).fetchone()
+
+
+def _heartbeat_batch_run(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    timestamp: float,
+) -> None:
+    conn.execute(
+        """
+        UPDATE execution_runs SET updated_at = ?, last_heartbeat_at = ?
+        WHERE id = (
+            SELECT CASE
+                     WHEN reconciliation_run_id != '' THEN reconciliation_run_id
+                     ELSE run_id
+                   END
+            FROM execution_batches WHERE id = ?
+        )
+        """,
+        (timestamp, timestamp, batch_id),
+    )
 
 
 def _execution_run_from_row(row: sqlite3.Row) -> ExecutionRun:
@@ -3041,6 +4857,7 @@ def _execution_batch_from_row(
         action_count=int(row["action_count"]),
         status=str(row["status"]),
         prepared_at=float(row["prepared_at"]),
+        execution_mode=str(row["execution_mode"] or "verified"),
         started_at=float(row["started_at"] or 0),
         completed_at=float(row["completed_at"] or 0),
         attempt_number=int(row["attempt_number"] or 1),
@@ -3051,6 +4868,9 @@ def _execution_batch_from_row(
         verification_attempts=int(row["verification_attempts"] or 0),
         worker_count=int(row["worker_count"] or 5),
         throttling_count=int(row["throttling_count"] or 0),
+        native_progress_count=int(row["native_progress_count"] or 0),
+        native_progress_total=int(row["native_progress_total"] or 0),
+        native_progress_updated_at=float(row["native_progress_updated_at"] or 0),
         action_ids=tuple(action_ids),
     )
 

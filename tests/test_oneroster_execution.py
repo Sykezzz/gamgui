@@ -1059,7 +1059,7 @@ async def test_executor_refuses_gam_when_exact_manifest_claim_is_missing(
 
 
 @pytest.mark.asyncio
-async def test_live_plan_resolves_directory_and_never_guesses_missing_users(tmp_path: Path):
+async def test_live_plan_omits_missing_student_without_quarantining_class(tmp_path: Path):
     service, import_id = _ready_service(tmp_path)
     connector = FakeClassroom()
     connector.users.pop("student@example.org")
@@ -1070,9 +1070,85 @@ async def test_live_plan_resolves_directory_and_never_guesses_missing_users(tmp_
         "teacher@example.org",
         "student@example.org",
     }
-    assert plan.actions == ()
+    assert any(action.kind == "course_create" for action in plan.actions)
+    assert not any(action.kind == "student_add" for action in plan.actions)
     assert {issue.code for issue in plan.issues} >= {"OR-USER-NOT-FOUND"}
+    student_issue = next(
+        issue for issue in plan.issues if issue.code == "OR-USER-NOT-FOUND"
+    )
+    assert student_issue.severity.value == "warning"
     assert connector.batches == []
+
+
+@pytest.mark.asyncio
+async def test_live_plan_omits_suspended_student_without_quarantining_class(
+    tmp_path: Path,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    connector.users["student@example.org"] = GAMUser(
+        "student@example.org",
+        suspended=True,
+        user_id="student-id",
+    )
+
+    plan = await service.build_live_plan(connector, import_id)
+
+    assert any(action.kind == "course_create" for action in plan.actions)
+    assert not any(action.kind == "student_add" for action in plan.actions)
+    assert "OR-USER-INACTIVE" in {issue.code for issue in plan.issues}
+
+
+@pytest.mark.asyncio
+async def test_live_plan_quarantines_class_without_active_teacher(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    connector.users["teacher@example.org"] = GAMUser(
+        "teacher@example.org",
+        suspended=True,
+        user_id="teacher-id",
+    )
+
+    plan = await service.build_live_plan(connector, import_id)
+
+    assert plan.actions == ()
+    assert {issue.code for issue in plan.issues} >= {
+        "OR-USER-INACTIVE",
+        "OR-COURSE-NO-ACTIVE-TEACHER",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_plan_uses_active_secondary_teacher_when_primary_is_suspended(
+    tmp_path: Path,
+):
+    files = valid_files()
+    files["users.csv"] += (
+        "teacher-2,active,teacher2,teacher2@example.org,Tess,Teacher,t2,school-1\n"
+    )
+    files["enrollments.csv"] += (
+        "enrollment-teacher-2,active,101,school-1,teacher-2,teacher,false,,\n"
+    )
+    service = OneRosterService("example.org", tmp_path / "secondary-teacher")
+    snapshot = service.upload(zip_bytes(files))
+    service.save_threshold_profile(ThresholdProfile(configured=True))
+    service.mark_scope_ready()
+    connector = FakeClassroom()
+    connector.users["teacher@example.org"] = GAMUser(
+        "teacher@example.org",
+        suspended=True,
+        user_id="teacher-id",
+    )
+    connector.users["teacher2@example.org"] = GAMUser(
+        "teacher2@example.org",
+        user_id="teacher2-id",
+    )
+
+    plan = await service.build_live_plan(connector, snapshot.id)
+
+    create = next(action for action in plan.actions if action.kind == "course_create")
+    assert json.loads(create.after)["owner_email"] == "teacher2@example.org"
+    assert "OR-OWNER-FALLBACK" in {issue.code for issue in plan.issues}
 
 
 @pytest.mark.asyncio
@@ -1307,6 +1383,65 @@ async def test_manifest_preflight_hashing_runs_off_event_loop(
     # Thread identity proves the blocking hash was offloaded. Windows timer
     # granularity can coalesce several of the nominal 5 ms heartbeats.
     assert heartbeat >= 1
+
+
+@pytest.mark.asyncio
+async def test_long_execution_preflight_refreshes_durable_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service, import_id = _ready_service(tmp_path)
+    connector = FakeClassroom()
+    planning = await service.build_live_plan(connector, import_id)
+    manifest = service.persist_live_plan(planning).ordinary
+    assert manifest is not None
+    executor = OneRosterExecutor(service.store, connector)
+    service.store.confirm_manifest(manifest.id, import_id)
+    manifest = service.store.claim_manifest(
+        manifest.id,
+        owner_id=executor._operation_owner,
+        owner_pid=os.getpid(),
+        owner_identity=executor._operation_identity,
+    )
+    run = service.store.start_execution_run(
+        manifest.id,
+        phase="preflight",
+        owner_id=executor._operation_owner,
+    )
+    heartbeats: list[str] = []
+    original_heartbeat = service.store.heartbeat_execution_run
+
+    def record_heartbeat(run_id: str, *, phase: str = ""):
+        heartbeats.append(phase)
+        return original_heartbeat(run_id, phase=phase)
+
+    async def slow_plan(*_args, **_kwargs):
+        await asyncio.sleep(0.04)
+        return planning
+
+    monkeypatch.setattr(
+        service.store,
+        "heartbeat_execution_run",
+        record_heartbeat,
+    )
+    monkeypatch.setattr(
+        "gamgui.components.oneroster.executor.EXECUTION_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "gamgui.components.oneroster.executor.OneRosterPlanner.plan",
+        slow_plan,
+    )
+
+    result = await executor._plan_with_heartbeat(
+        manifest,
+        run_id=run.id,
+        now=None,
+    )
+
+    assert result is planning
+    assert heartbeats
+    assert set(heartbeats) == {"preflight"}
 
 
 @pytest.mark.asyncio

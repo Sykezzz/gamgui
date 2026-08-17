@@ -447,6 +447,29 @@ class OneRosterService:
             now=now,
         )
 
+    async def execute_additions_first_bootstrap(
+        self,
+        connector: Any,
+        manifest_id: str,
+        *,
+        import_id_ack: str,
+        deferred_verification_ack: bool,
+        now: Optional[datetime] = None,
+    ) -> ExecutionSummary:
+        from .bootstrap_executor import AdditionsFirstBootstrapExecutor
+
+        self.require_scope_ready()
+        return await AdditionsFirstBootstrapExecutor(
+            self.store,
+            connector,
+            activity_registry=self.activity_registry,
+        ).execute(
+            manifest_id,
+            import_id_ack=import_id_ack,
+            deferred_verification_ack=deferred_verification_ack,
+            now=now,
+        )
+
     async def revalidate_scheduled_gate(
         self,
         connector: Any,
@@ -473,9 +496,16 @@ class OneRosterService:
         connector: Any,
         manifest_id: str,
     ) -> ExecutionSummary:
+        from .bootstrap_executor import AdditionsFirstBootstrapExecutor
         from .executor import OneRosterExecutor
 
         self.require_scope_ready()
+        if self.store.has_reconciling_additions_first_phase(manifest_id):
+            return await AdditionsFirstBootstrapExecutor(
+                self.store,
+                connector,
+                activity_registry=self.activity_registry,
+            ).reconcile_interrupted(manifest_id)
         return await OneRosterExecutor(
             self.store,
             connector,
@@ -585,6 +615,20 @@ class OneRosterService:
 
     def request_execution_pause(self, manifest_id: str):
         return self.store.request_execution_pause(manifest_id)
+
+    def pause_additions_first_at_dispatch_boundary(
+        self,
+        manifest_id: str,
+        batch_id: str,
+        dispatched_count: int,
+    ) -> Mapping[str, Any]:
+        """Create a resumable pause from an exact persisted native dispatch count."""
+
+        return self.store.pause_additions_first_at_dispatch_boundary(
+            manifest_id,
+            batch_id,
+            dispatched_count,
+        )
 
     def mark_action_result(
         self,

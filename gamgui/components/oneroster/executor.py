@@ -205,9 +205,9 @@ class OneRosterExecutor:
             )
             self._adaptive_workers = _AdaptiveWorkerTuner()
             try:
-                planning = await OneRosterPlanner(self.store, self.connector).plan(
-                    manifest.import_id,
-                    limited_import=manifest.plan_kind == "limited",
+                planning = await self._plan_with_heartbeat(
+                    manifest,
+                    run_id=run.id,
                     now=now,
                 )
                 self.store.record_execution_planning_receipt(
@@ -384,6 +384,36 @@ class OneRosterExecutor:
                     phase="reconciliation",
                 )
                 raise
+
+    async def _plan_with_heartbeat(
+        self,
+        manifest: ClassroomImportManifest,
+        *,
+        run_id: str,
+        now: Optional[datetime],
+    ) -> LivePlanningResult:
+        """Keep the durable execution lease current during long live preflight reads."""
+
+        async def pulse() -> None:
+            while True:
+                await asyncio.sleep(EXECUTION_HEARTBEAT_INTERVAL_SECONDS)
+                await asyncio.to_thread(
+                    self.store.heartbeat_execution_run,
+                    run_id,
+                    phase="preflight",
+                )
+
+        heartbeat_task = asyncio.create_task(pulse())
+        try:
+            return await OneRosterPlanner(self.store, self.connector).plan(
+                manifest.import_id,
+                limited_import=manifest.plan_kind == "limited",
+                now=now,
+            )
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
 
     async def _stabilized_planning(
         self,

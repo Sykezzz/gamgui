@@ -525,6 +525,7 @@ class ExecutionBatch:
     action_count: int
     status: str
     prepared_at: float
+    execution_mode: str = "verified"
     started_at: float = 0.0
     completed_at: float = 0.0
     attempt_number: int = 1
@@ -535,6 +536,9 @@ class ExecutionBatch:
     verification_attempts: int = 0
     worker_count: int = 5
     throttling_count: int = 0
+    native_progress_count: int = 0
+    native_progress_total: int = 0
+    native_progress_updated_at: float = 0.0
     action_ids: Tuple[str, ...] = ()
 
 
@@ -549,6 +553,7 @@ class ExecutionPhaseProgress:
     applied: int
     failed: int
     skipped: int
+    submitted: int
     pending: int
 
 
@@ -563,12 +568,16 @@ class ExecutionBatchProgress:
     action_count: int
     course_count: int
     status: str
+    execution_mode: str = "verified"
     apply_seconds: float = 0.0
     verification_seconds: float = 0.0
     persistence_seconds: float = 0.0
     verification_attempts: int = 0
     worker_count: int = 5
     throttling_count: int = 0
+    native_progress_count: int = 0
+    native_progress_total: int = 0
+    native_progress_updated_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -581,6 +590,7 @@ class ExecutionProgress:
     applied: int
     failed: int
     skipped: int
+    submitted: int
     percent: float
     completed_batches: int
     total_batches_estimate: int
