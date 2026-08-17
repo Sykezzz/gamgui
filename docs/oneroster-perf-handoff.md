@@ -86,19 +86,41 @@ cheaper path and avoids 134k redundant calls into the rate limiter.
 the app is safe. Triggering the bootstrap/reconcile action from the UI is what starts a multi-hour
 job — don't, until the benchmark is done.
 
-## What is still not done
+## Progress reporting
 
-- **Progress is plumbed but not persisted.** `list_course_participants_many` accepts a
-  `progress_callback` and will fire it, but nothing writes those numbers to the store yet, so the
-  UI still will not move during a read. That is the next code change.
-- `_oneroster_manifest.html` *already* renders `native_progress_count / native_progress_total` for
-  `additions_first` runs — the display exists, it just has no data during the read phase. This is
-  smaller than it looks.
-- The progress regex is a best guess at GAM's stderr format for `print course-participants`
-  (trailing `(n/total)`). It has not been seen against real GAM output. If progress stays at zero
-  during the benchmark, capture a few stderr lines and adjust
-  `_ROSTER_READ_PROGRESS_PATTERN` in `gamgui/core/connectors/gam_connector.py` — the read itself
-  is unaffected either way, since an unmatched line is simply ignored.
+The read now persists its own counter to `execution_runs`
+(`read_progress_count` / `read_progress_total` / `read_progress_updated_at`), added through the
+existing additive `_ensure_column` migration, so an existing 148 MB `state.db` upgrades in place
+with no manual step.
+
+While a read is in flight the manifest panel shows a dedicated bar and an `n / total courses`
+counter. Each write also renews `last_heartbeat_at`, so a moving read can never trip the
+stale-heartbeat alarm. Writes are throttled to one every two seconds; the final one always lands.
+
+If persisting fails it is swallowed — observability must not be able to kill the read it is
+observing.
+
+## The one thing that is still unverified
+
+**The progress regex is a best guess at GAM's stderr format** for `print course-participants`
+(a trailing `(n/total)`). It has never been seen against real GAM output — that could not be tested
+without a live tenant.
+
+If the counter stays at zero during the benchmark, the read is still fine; an unmatched line is
+simply ignored. To fix it, capture a few stderr lines and adjust `_ROSTER_READ_PROGRESS_PATTERN`
+in `gamgui/core/connectors/gam_connector.py`. The pattern is deliberately narrow — it also requires
+the total to equal the requested course count, so a counter for some other unit of work is ignored
+rather than displayed as a wrong total.
+
+Independent of the UI, liveness can always be confirmed from the process itself:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='gam.exe'" |
+  Select-Object ProcessId, ReadTransferCount, WriteTransferCount
+```
+
+A climbing `WriteTransferCount` means GAM is working. That is how the 3h15m read was confirmed
+alive before any of this existed.
 
 Remaining plan (verification cost removal, adaptive throttling, cached drift detection via
 `gam print courses ... countsonly`, removal phases, two-lane activity lease) is in the approved
