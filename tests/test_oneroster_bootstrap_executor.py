@@ -580,3 +580,98 @@ async def test_bootstrap_waits_for_existing_admin_activity(tmp_path: Path):
         "course_activate",
         "teacher_add",
     ]
+
+
+def test_accepts_progress_callback_probe_handles_each_connector_shape():
+    from gamgui.components.oneroster.bootstrap_executor import _accepts_progress_callback
+
+    async def modern(course_ids, role="all", *, progress_callback=None): ...
+
+    async def kwargs_shape(course_ids, role="all", **kwargs): ...
+
+    async def legacy(course_ids, role="all"): ...
+
+    assert _accepts_progress_callback(modern) is True
+    assert _accepts_progress_callback(kwargs_shape) is True
+    # Older connectors and existing test doubles must keep working untouched.
+    assert _accepts_progress_callback(legacy) is False
+    assert _accepts_progress_callback(object()) is False
+
+
+class _RecordingStore:
+    def __init__(self) -> None:
+        self.progress: list[tuple[str, int, int]] = []
+        self.cleared: list[str] = []
+
+    def record_read_progress(self, run_id, processed, total):
+        self.progress.append((run_id, processed, total))
+
+    def clear_read_progress(self, run_id):
+        self.cleared.append(run_id)
+
+
+async def test_bulk_read_persists_progress_and_clears_when_done():
+    """A multi-hour read must leave a durable trail proving it is alive."""
+
+    class ProgressConnector:
+        async def list_course_participants_many(
+            self, course_ids, role="all", *, progress_callback=None
+        ):
+            # The throttle only suppresses intermediate lines; the final one always lands.
+            await progress_callback(1, 3)
+            await progress_callback(3, 3)
+            return CourseRosterSnapshot.empty()
+
+    store = _RecordingStore()
+    executor = AdditionsFirstBootstrapExecutor(store, ProgressConnector())
+
+    result = await executor._read_rosters_with_progress(("a", "b", "c"), "run-1")
+
+    assert isinstance(result, CourseRosterSnapshot)
+    assert ("run-1", 3, 3) in store.progress
+    assert store.cleared == ["run-1"]
+
+
+async def test_bulk_read_falls_back_for_a_connector_without_progress():
+    class LegacyConnector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def list_course_participants_many(self, course_ids, role="all"):
+            self.calls += 1
+            return CourseRosterSnapshot.empty()
+
+    connector = LegacyConnector()
+    store = _RecordingStore()
+    executor = AdditionsFirstBootstrapExecutor(store, connector)
+
+    result = await executor._read_rosters_with_progress(("a",), "run-2")
+
+    assert isinstance(result, CourseRosterSnapshot)
+    assert connector.calls == 1
+    assert store.progress == []
+
+
+async def test_progress_persistence_failure_never_breaks_the_read():
+    """Observability must not be able to kill the read it is observing."""
+
+    class ExplodingStore(_RecordingStore):
+        def record_read_progress(self, run_id, processed, total):
+            raise RuntimeError("state.db is locked")
+
+        def clear_read_progress(self, run_id):
+            raise RuntimeError("state.db is locked")
+
+    class ProgressConnector:
+        async def list_course_participants_many(
+            self, course_ids, role="all", *, progress_callback=None
+        ):
+            await progress_callback(5, 5)
+            return CourseRosterSnapshot.empty()
+
+    executor = AdditionsFirstBootstrapExecutor(ExplodingStore(), ProgressConnector())
+
+    assert isinstance(
+        await executor._read_rosters_with_progress(("a",), "run-3"),
+        CourseRosterSnapshot,
+    )

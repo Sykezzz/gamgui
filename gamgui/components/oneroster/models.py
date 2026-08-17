@@ -510,6 +510,12 @@ class ExecutionRun:
     planning_seconds: float = 0.0
     directory_snapshot_seconds: float = 0.0
     classroom_snapshot_seconds: float = 0.0
+    # Live progress for the bulk Classroom read, which runs as one long GAM process
+    # outside any batch. Without this the reconciliation phase is indistinguishable
+    # from a hang for its entire duration.
+    read_progress_count: int = 0
+    read_progress_total: int = 0
+    read_progress_updated_at: float = 0.0
 
 
 @dataclass(frozen=True)

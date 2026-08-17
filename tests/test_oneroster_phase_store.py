@@ -825,3 +825,83 @@ def test_dispatch_boundary_pauses_without_resending_undispatched_suffix(
     assert reconciled.status == "reconciled"
     assert reconciled.action_count == 5
     assert reconciled.action_ids_hash == original_hash
+
+
+def _run_for_read_progress(tmp_path: Path):
+    service, import_id = _ready_service(tmp_path)
+    manifest = service.create_manifest(
+        import_id,
+        config_hash="config",
+        live_hash="live",
+        actions=(
+            ImportAction(
+                id="student-000",
+                kind="student_add",
+                subject="Section_101",
+                target="student-000@example.org",
+            ),
+        ),
+        limited_import=True,
+        plan_kind="limited",
+    )
+    return service, manifest, _claimed_run(service, manifest)
+
+
+def _stored_run(service, manifest):
+    return service.store.get_execution_progress(manifest.id).run
+
+
+def test_read_progress_persists_and_renews_heartbeat(tmp_path: Path):
+    """A long bulk read must be visibly distinguishable from a hang."""
+    service, manifest, run = _run_for_read_progress(tmp_path)
+
+    service.store.record_read_progress(run.id, 250, 9189, now=5_000.0)
+    stored = _stored_run(service, manifest)
+
+    assert stored.read_progress_count == 250
+    assert stored.read_progress_total == 9189
+    assert stored.read_progress_updated_at == 5_000.0
+    # The same write proves liveness, so a moving read can never look stale.
+    assert stored.last_heartbeat_at == 5_000.0
+
+
+def test_read_progress_is_monotonic_within_one_read(tmp_path: Path):
+    service, manifest, run = _run_for_read_progress(tmp_path)
+
+    service.store.record_read_progress(run.id, 500, 9189, now=5_000.0)
+    service.store.record_read_progress(run.id, 120, 9189, now=5_010.0)
+
+    assert _stored_run(service, manifest).read_progress_count == 500
+
+
+def test_read_progress_restarts_when_the_total_changes(tmp_path: Path):
+    """A different total is a different read, so the counter starts over."""
+    service, manifest, run = _run_for_read_progress(tmp_path)
+
+    service.store.record_read_progress(run.id, 500, 9189, now=5_000.0)
+    service.store.record_read_progress(run.id, 10, 40, now=5_010.0)
+
+    stored = _stored_run(service, manifest)
+    assert (stored.read_progress_count, stored.read_progress_total) == (10, 40)
+
+
+def test_read_progress_clamps_overrun_and_ignores_unknown_runs(tmp_path: Path):
+    service, manifest, run = _run_for_read_progress(tmp_path)
+
+    service.store.record_read_progress(run.id, 99_999, 9189, now=5_000.0)
+    assert _stored_run(service, manifest).read_progress_count == 9189
+
+    # An unknown run is a no-op rather than an error; observability must not raise
+    # into the read path it is observing.
+    service.store.record_read_progress("no-such-run", 5, 10, now=5_020.0)
+
+
+def test_clear_read_progress_stops_a_finished_read_looking_in_flight(tmp_path: Path):
+    service, manifest, run = _run_for_read_progress(tmp_path)
+
+    service.store.record_read_progress(run.id, 9189, 9189, now=5_000.0)
+    service.store.clear_read_progress(run.id, now=5_030.0)
+
+    stored = _stored_run(service, manifest)
+    assert stored.read_progress_count == 0
+    assert stored.read_progress_total == 0

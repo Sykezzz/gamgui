@@ -2232,6 +2232,76 @@ class OneRosterStore:
         assert row is not None
         return _execution_batch_from_row(row)
 
+    def record_read_progress(
+        self,
+        run_id: str,
+        processed: int,
+        total: int,
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        """Persist progress for the bulk Classroom read and renew the run heartbeat.
+
+        The read is one long GAM process that owns no batch, so this deliberately does
+        not require an owned running batch the way phase progress does. Its only job is
+        to make a multi-hour read distinguishable from a hang, so it stays permissive
+        and never raises into the read path.
+        """
+
+        processed_count = max(0, int(processed))
+        total_count = max(0, int(total))
+        if total_count and processed_count > total_count:
+            processed_count = total_count
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            row = conn.execute(
+                """
+                SELECT read_progress_count, read_progress_total
+                FROM execution_runs WHERE id = ? AND domain = ?
+                """,
+                (run_id, self.domain),
+            ).fetchone()
+            if row is None:
+                return
+            previous_count = int(row["read_progress_count"] or 0)
+            previous_total = int(row["read_progress_total"] or 0)
+            # A different total means a new read started; otherwise stay monotonic so a
+            # late-arriving line cannot make the bar jump backwards.
+            if total_count == previous_total and processed_count < previous_count:
+                return
+            conn.execute(
+                """
+                UPDATE execution_runs
+                SET read_progress_count = ?, read_progress_total = ?,
+                    read_progress_updated_at = ?, last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND domain = ?
+                """,
+                (
+                    processed_count,
+                    total_count,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    run_id,
+                    self.domain,
+                ),
+            )
+
+    def clear_read_progress(self, run_id: str, *, now: Optional[float] = None) -> None:
+        """Zero the read counters so a finished read stops looking in-flight."""
+
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                """
+                UPDATE execution_runs
+                SET read_progress_count = 0, read_progress_total = 0,
+                    read_progress_updated_at = ?, updated_at = ?
+                WHERE id = ? AND domain = ?
+                """,
+                (timestamp, timestamp, run_id, self.domain),
+            )
+
     def mark_execution_phase_submitted(
         self,
         batch_id: str,
@@ -4642,6 +4712,9 @@ class OneRosterStore:
                 ("planning_seconds", "REAL NOT NULL DEFAULT 0"),
                 ("directory_snapshot_seconds", "REAL NOT NULL DEFAULT 0"),
                 ("classroom_snapshot_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("read_progress_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("read_progress_total", "INTEGER NOT NULL DEFAULT 0"),
+                ("read_progress_updated_at", "REAL NOT NULL DEFAULT 0"),
             ):
                 _ensure_column(conn, "execution_runs", column, definition)
             for column, definition in (
@@ -4840,6 +4913,9 @@ def _execution_run_from_row(row: sqlite3.Row) -> ExecutionRun:
         planning_seconds=float(row["planning_seconds"] or 0),
         directory_snapshot_seconds=float(row["directory_snapshot_seconds"] or 0),
         classroom_snapshot_seconds=float(row["classroom_snapshot_seconds"] or 0),
+        read_progress_count=int(row["read_progress_count"] or 0),
+        read_progress_total=int(row["read_progress_total"] or 0),
+        read_progress_updated_at=float(row["read_progress_updated_at"] or 0),
     )
 
 

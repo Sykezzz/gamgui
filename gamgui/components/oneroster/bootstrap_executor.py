@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import secrets
 import time
@@ -39,6 +40,28 @@ BOOTSTRAP_PHASES = (
 BOOTSTRAP_HEARTBEAT_SECONDS = 5.0
 BOOTSTRAP_RETRY_DELAYS = (2.0, 5.0)
 BOOTSTRAP_ACTIVITY_WAIT_SECONDS = 30 * 60.0
+# The bulk read emits a progress line per course; persisting every one would mean
+# thousands of pointless SQLite writes. The final line always persists.
+BOOTSTRAP_READ_PROGRESS_INTERVAL_SECONDS = 2.0
+
+
+def _accepts_progress_callback(method: Any) -> bool:
+    """Whether a connector's bulk read supports progress reporting.
+
+    Older connectors and test doubles implement the two-argument shape, so the
+    callback is offered rather than assumed.
+    """
+
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    if "progress_callback" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class AdditionsFirstConnector(Protocol):
@@ -60,6 +83,9 @@ class AdditionsFirstConnector(Protocol):
         self,
         course_ids: Sequence[str],
         role: str = "all",
+        # Optional: connectors that accept it report (processed, total) during the read.
+        # Probed with _accepts_progress_callback rather than assumed.
+        **kwargs: Any,
     ) -> CourseRosterSnapshot: ...
 
 
@@ -430,7 +456,6 @@ class AdditionsFirstBootstrapExecutor:
         batches: Sequence[ExecutionBatch],
         run_id: str,
     ) -> _ReconciliationSnapshot:
-        del run_id
         aliases: set[str] = set()
         for batch in batches:
             after = -1
@@ -501,11 +526,10 @@ class AdditionsFirstBootstrapExecutor:
                         roster_course_ids.add(course_id)
                     after = ordinal
         requested_ids = tuple(sorted(roster_course_ids))
-        rosters = (
-            await self.connector.list_course_participants_many(requested_ids, "all")
-            if requested_ids
-            else CourseRosterSnapshot.empty()
-        )
+        if not requested_ids:
+            rosters: Any = CourseRosterSnapshot.empty()
+        else:
+            rosters = await self._read_rosters_with_progress(requested_ids, run_id)
         if not isinstance(rosters, CourseRosterSnapshot) or not rosters.covers(requested_ids):
             raise OneRosterError(
                 "OR-CLASSROOM-READ",
@@ -517,6 +541,48 @@ class AdditionsFirstBootstrapExecutor:
             rosters=rosters,
             create_actions=create_actions,
         )
+
+    async def _read_rosters_with_progress(
+        self,
+        requested_ids: Sequence[str],
+        run_id: str,
+    ) -> Any:
+        """Run the bulk roster read, persisting progress so it is visibly alive.
+
+        The read is a single GAM process that can run for hours. Without a durable
+        counter the reconciliation phase looks identical to a hang, which is exactly
+        how a healthy multi-hour read got mistaken for a frozen app.
+        """
+
+        reader = self.connector.list_course_participants_many
+        if not _accepts_progress_callback(reader):
+            return await reader(requested_ids, "all")
+
+        last_written = 0.0
+
+        async def on_progress(processed: int, total: int) -> None:
+            nonlocal last_written
+            elapsed = time.monotonic()
+            if (
+                processed < total
+                and elapsed - last_written < BOOTSTRAP_READ_PROGRESS_INTERVAL_SECONDS
+            ):
+                return
+            last_written = elapsed
+            # Observability must never break the read it is observing.
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    self.store.record_read_progress,
+                    run_id,
+                    processed,
+                    total,
+                )
+
+        try:
+            return await reader(requested_ids, "all", progress_callback=on_progress)
+        finally:
+            with suppress(Exception):
+                await asyncio.to_thread(self.store.clear_read_progress, run_id)
 
     async def _persist_reconciliation(
         self,
