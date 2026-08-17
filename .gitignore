@@ -8,6 +8,10 @@ venv/
 .pytest_cache/
 build/
 dist/
+# Hotfix/profile-suffixed PyInstaller output (e.g. build-hotfix/, dist-additions-first-*/).
+# The bare build/ and dist/ patterns do not match these, and each dist- dir is ~117MB.
+build-*/
+dist-*/
 node_modules/
 
 # Vendored GAM7 binary — fetched via scripts/fetch_gam.sh, never committed
