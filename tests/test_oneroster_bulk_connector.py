@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import gamgui.core.connectors.gam_connector as connector_module
 from gamgui.core.connectors.gam_connector import GAMConnector
+from gamgui.core.gam.errors import GAMError, GAMErrorKind
 from gamgui.core.gam.commands import (
     COURSE_INDEX_FIELDS,
     ONEROSTER_DIRECTORY_FIELDS,
@@ -82,6 +84,28 @@ class AliasLookupRunner(PrivateSpoolRunner):
             yield SimpleNamespace(path=path, stdout_bytes=path.stat().st_size)
         finally:
             path.unlink(missing_ok=True)
+
+
+class RateLimitedAliasLookupRunner(AliasLookupRunner):
+    def __init__(self, root: Path, courses: dict[str, dict]) -> None:
+        super().__init__(root, courses)
+        self.attempts = 0
+
+    @asynccontextmanager
+    async def run_authenticated_to_file(self, domain, argv, **kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise GAMError(
+                GAMErrorKind.RATE_LIMITED,
+                exit_code=1,
+                stderr="rate limit exceeded",
+            )
+        async with super().run_authenticated_to_file(
+            domain,
+            argv,
+            **kwargs,
+        ) as result:
+            yield result
 
 
 def _formatjson_participants_csv(rows: list[dict]) -> str:
@@ -305,22 +329,41 @@ async def test_sparse_alias_results_are_mapped_without_recursive_gam_calls(
     )
 
 
-async def test_fifty_thousand_missing_aliases_use_one_private_selector_process(
+async def test_missing_aliases_use_bounded_selector_chunks(
     tmp_path: Path,
 ):
     runner = AliasLookupRunner(tmp_path, {})
     connector = GAMConnector(runner, "example.org")  # type: ignore[arg-type]
-    aliases = [f"Section_{number}" for number in range(50_000)]
+    aliases = [f"Section_{number}" for number in range(1_000)]
 
     courses = await connector.list_oneroster_managed_courses(aliases)
 
     assert courses == []
-    assert len(runner.calls) == 1
-    assert len(runner.selector_values) == 1
-    assert runner.selector_values[0][0] == "d:Section_0"
-    assert runner.selector_values[0][-1] == "d:Section_49999"
-    assert len(runner.selector_values[0]) == 50_000
+    assert len(runner.calls) == 10
+    assert len(runner.selector_values) == 10
+    assert all(len(chunk) <= 100 for chunk in runner.selector_values)
+    assert {
+        alias for shard in runner.selector_values for alias in shard
+    } == {f"d:Section_{number}" for number in range(1_000)}
     assert all(not path.exists() for path in runner.selector_paths)
+
+
+async def test_course_selector_retries_transient_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = RateLimitedAliasLookupRunner(tmp_path, {})
+    connector = GAMConnector(runner, "example.org")  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        connector_module,
+        "ONEROSTER_RATE_LIMIT_RETRY_DELAYS",
+        (0.0, 0.0),
+    )
+
+    courses = await connector.list_oneroster_managed_courses(["Section_101"])
+
+    assert courses == []
+    assert runner.attempts == 2
 
 
 async def test_two_aliases_resolving_to_one_course_fail_closed(tmp_path: Path):

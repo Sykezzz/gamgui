@@ -245,6 +245,19 @@ class GAMCommands:
         ]
 
     @staticmethod
+    def print_oneroster_courses_snapshot() -> List[str]:
+        """Read all courses and their aliases in one tenant-wide inventory process."""
+
+        return [
+            "print",
+            "courses",
+            "aliases",
+            "fields",
+            ",".join(COURSE_INDEX_FIELDS),
+            "formatjson",
+        ]
+
+    @staticmethod
     def info_course(
         course_id: str,
         fields: Optional[Sequence[str]] = None,

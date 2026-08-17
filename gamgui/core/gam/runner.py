@@ -8,14 +8,19 @@ Everything else goes through :class:`GAMRunner`, which handles binary location, 
 from __future__ import annotations
 
 import asyncio
+import inspect
+import math
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Optional, Sequence
+from typing import AsyncIterator, Awaitable, Callable, Optional, Sequence
 
 from ..activity import ActivityRegistry
 from ..activity import activity_registry as global_activity_registry
@@ -27,6 +32,19 @@ from .errors import GAMError, GAMErrorKind, TokenPersistenceError
 GAM_BINARY_ENV = "GAMGUI_GAM_BINARY"
 
 DEFAULT_TIMEOUT = 120.0
+STREAM_DIAGNOSTIC_TAIL_LINES = 200
+STREAM_DIAGNOSTIC_LINE_CHARS = 8192
+STREAM_PROCESS_STOP_TIMEOUT = 5.0
+STREAM_PIPE_DRAIN_TIMEOUT = 2.0
+
+StreamingLineCallback = Callable[[str, str], Optional[Awaitable[None]]]
+
+
+def _consume_future_exception(future: asyncio.Future) -> None:
+    try:
+        future.exception()
+    except BaseException:
+        pass
 
 
 def strip_cfgdir_noise(stdout: str, cfgdir: Path) -> str:
@@ -54,6 +72,30 @@ class RunResult:
 class SpooledRunResult:
     path: Path
     stdout_bytes: int
+    accepted_error_kind: Optional[GAMErrorKind] = None
+
+
+@dataclass(frozen=True)
+class StreamingRunResult:
+    """Bounded result metadata for a subprocess whose output was drained live."""
+
+    returncode: int
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+    duration_seconds: float
+
+
+class StreamingGAMError(GAMError):
+    """A GAM failure that retains the bounded streaming process result."""
+
+    def __init__(self, cause: GAMError, result: StreamingRunResult) -> None:
+        self.result = result
+        super().__init__(
+            kind=cause.kind,
+            exit_code=cause.exit_code,
+            stderr=cause.stderr,
+            argv=cause.argv,
+        )
 
 
 def _strip_cfgdir_noise_file(path: Path, cfgdir: Path) -> None:
@@ -238,6 +280,16 @@ class GAMRunner:
             "pass_fds": pass_fds,
         }
 
+    def _streaming_subprocess_options(
+        self,
+        pass_fds: tuple[int, ...],
+    ) -> dict[str, object]:
+        options = self._subprocess_options(pass_fds)
+        if os.name == "posix":
+            # A separate session lets timeout cleanup terminate GAM's worker pool as one group.
+            options["start_new_session"] = True
+        return options
+
     def _subprocess_command(self, argv: Sequence[str]) -> list[str]:
         """Return a directly executable command for this platform.
 
@@ -319,6 +371,186 @@ class GAMRunner:
             returncode=proc.returncode if proc.returncode is not None else -1,
         )
 
+    async def _exec_streaming(
+        self,
+        argv: Sequence[str],
+        cfgdir: Path,
+        timeout: float,
+        *,
+        gam_threads: Optional[int] = None,
+        line_callback: Optional[StreamingLineCallback] = None,
+        tail_lines: int = STREAM_DIAGNOSTIC_TAIL_LINES,
+    ) -> StreamingRunResult:
+        """Drain both process pipes incrementally while retaining bounded tails."""
+
+        self._require_binary()
+        retained_lines = max(1, min(int(tail_lines), 1000))
+        stdout_tail: deque[str] = deque(maxlen=retained_lines)
+        stderr_tail: deque[str] = deque(maxlen=retained_lines)
+        started = time.perf_counter()
+        with self.activity_registry.subprocess_pass_fds() as pass_fds:
+            proc = await asyncio.create_subprocess_exec(
+                *self._subprocess_command(argv),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._build_env(cfgdir, gam_threads=gam_threads),
+                **self._streaming_subprocess_options(pass_fds),
+            )
+
+        async def drain(
+            reader: Optional[asyncio.StreamReader],
+            stream_name: str,
+            tail: deque[str],
+        ) -> None:
+            if reader is None:
+                return
+            cfgdir_text = str(cfgdir)
+            while raw_line := await reader.readline():
+                line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                if cfgdir_text and cfgdir_text in line:
+                    continue
+                bounded = line[-STREAM_DIAGNOSTIC_LINE_CHARS:]
+                tail.append(bounded)
+                if line_callback is not None:
+                    callback_result = line_callback(stream_name, bounded)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+
+        drain_tasks = (
+            asyncio.create_task(drain(proc.stdout, "stdout", stdout_tail)),
+            asyncio.create_task(drain(proc.stderr, "stderr", stderr_tail)),
+        )
+
+        async def stop_windows_process_tree() -> None:
+            system_root = os.environ.get("SystemRoot", "")
+            taskkill = (
+                str(Path(system_root) / "System32" / "taskkill.exe")
+                if system_root
+                else "taskkill.exe"
+            )
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    taskkill,
+                    "/PID",
+                    str(proc.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except OSError:
+                return
+            try:
+                await asyncio.wait_for(
+                    killer.wait(),
+                    timeout=STREAM_PROCESS_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    killer.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(killer.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        async def stop_process() -> None:
+            if proc.returncode is None:
+                if os.name == "nt":
+                    # GAM batch uses multiprocessing; kill its descendants while the parent PID
+                    # still anchors the Windows process tree.
+                    await stop_windows_process_tree()
+                elif os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(proc.wait()),
+                    timeout=STREAM_PROCESS_STOP_TIMEOUT,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(proc.wait()),
+                    timeout=STREAM_PROCESS_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        async def finish_pipe_drains() -> None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(completion),
+                    timeout=STREAM_PIPE_DRAIN_TIMEOUT,
+                )
+                return
+            except BaseException:
+                completion.cancel()
+                for task in drain_tasks:
+                    task.cancel()
+            _, pending = await asyncio.wait(
+                (completion, *drain_tasks),
+                timeout=STREAM_PIPE_DRAIN_TIMEOUT,
+            )
+            for task in pending:
+                task.add_done_callback(_consume_future_exception)
+
+        async def cleanup_after_cancellation() -> None:
+            async def cleanup_process() -> None:
+                await stop_process()
+                await finish_pipe_drains()
+
+            cleanup = asyncio.create_task(cleanup_process())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+
+        completion = asyncio.gather(*drain_tasks, proc.wait())
+        try:
+            # Shield the pipe drains so timeout handling can kill the process and then consume
+            # everything it already emitted instead of cancelling readers before the child exits.
+            await asyncio.wait_for(asyncio.shield(completion), timeout=timeout)
+        except asyncio.TimeoutError:
+            await stop_process()
+            await finish_pipe_drains()
+            detail = "\n".join(stderr_tail) or "command timed out"
+            raise GAMError(
+                GAMErrorKind.TIMEOUT,
+                exit_code=None,
+                stderr=detail,
+                argv=list(argv),
+            ) from None
+        except asyncio.CancelledError:
+            await cleanup_after_cancellation()
+            raise
+        except BaseException:
+            await stop_process()
+            await finish_pipe_drains()
+            raise
+
+        return StreamingRunResult(
+            returncode=proc.returncode if proc.returncode is not None else -1,
+            stdout_tail=tuple(stdout_tail),
+            stderr_tail=tuple(stderr_tail),
+            duration_seconds=time.perf_counter() - started,
+        )
+
     async def run_authenticated(
         self,
         domain: str,
@@ -375,6 +607,78 @@ class GAMRunner:
                 return await _do()
         return await _do()
 
+    async def run_authenticated_streaming(
+        self,
+        domain: str,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        serialize: bool = False,
+        gam_threads: Optional[int] = None,
+        line_callback: Optional[StreamingLineCallback] = None,
+        tail_lines: int = STREAM_DIAGNOSTIC_TAIL_LINES,
+    ) -> StreamingRunResult:
+        """Run authenticated GAM while draining stdout and stderr without buffering them.
+
+        Each decoded line is offered to ``line_callback`` on the event loop. Only bounded
+        diagnostic tails survive process completion. Non-zero GAM exits raise
+        :class:`StreamingGAMError`, a :class:`GAMError` subtype carrying that bounded result.
+        """
+
+        command = list(argv)
+        command_timeout = float(timeout)
+        if not math.isfinite(command_timeout) or command_timeout <= 0:
+            raise ValueError("streaming GAM timeout must be a positive finite value")
+
+        async def _do() -> StreamingRunResult:
+            result: Optional[StreamingRunResult] = None
+            token_persistence_failed = False
+            config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
+            try:
+                async with self._authenticated_config(config) as cfgdir:
+                    result = await self._exec_streaming(
+                        command,
+                        cfgdir,
+                        command_timeout,
+                        gam_threads=gam_threads,
+                        line_callback=line_callback,
+                        tail_lines=tail_lines,
+                    )
+            except TokenPersistenceError:
+                if not config.token_persistence_error_raised:
+                    raise
+                token_persistence_failed = True
+            if result is None:
+                raise RuntimeError("GAM did not return a command result.")
+            error_text = "\n".join(result.stderr_tail)
+            if token_persistence_failed:
+                gam_error_kind = (
+                    None
+                    if result.returncode == 0
+                    else GAMError.from_run(
+                        result.returncode,
+                        error_text,
+                        command,
+                    ).kind
+                )
+                raise TokenPersistenceError(
+                    command_succeeded=result.returncode == 0,
+                    gam_error_kind=gam_error_kind,
+                ) from None
+            if result.returncode != 0:
+                cause = GAMError.from_run(
+                    result.returncode,
+                    error_text,
+                    command,
+                )
+                raise StreamingGAMError(cause, result)
+            return result
+
+        if serialize:
+            async with self._write_lock:
+                return await _do()
+        return await _do()
+
     @asynccontextmanager
     async def run_authenticated_to_file(
         self,
@@ -382,6 +686,7 @@ class GAMRunner:
         argv: Sequence[str],
         timeout: Optional[float] = None,
         serialize: bool = False,
+        accepted_error_kinds: Sequence[GAMErrorKind] = (),
     ) -> AsyncIterator[SpooledRunResult]:
         """Stream authenticated GAM stdout to a private ``0600`` file.
 
@@ -391,11 +696,15 @@ class GAMRunner:
         """
         command = list(argv)
         command_timeout = timeout or self.timeout
+        accepted_kinds = frozenset(accepted_error_kinds)
+        if any(not isinstance(kind, GAMErrorKind) for kind in accepted_kinds):
+            raise ValueError("accepted_error_kinds must contain GAMErrorKind values")
 
         @asynccontextmanager
         async def _do() -> AsyncIterator[SpooledRunResult]:
             result: Optional[RunResult] = None
             token_persistence_failed = False
+            accepted_command_error: Optional[GAMError] = None
             config = EphemeralConfig(self.vault, domain, base_dir=self.base_dir)
             try:
                 async with self._authenticated_config(config) as cfgdir:
@@ -410,16 +719,38 @@ class GAMRunner:
                         result = await self._exec_to_file(
                             command, cfgdir, command_timeout, spool_path
                         )
+                        command_error = (
+                            GAMError.from_run(
+                                result.returncode,
+                                result.stderr,
+                                command,
+                            )
+                            if result.returncode != 0
+                            else None
+                        )
+                        if (
+                            command_error is not None
+                            and command_error.kind in accepted_kinds
+                        ):
+                            accepted_command_error = command_error
                         # Preserve the command failure if private-file cleanup also fails. The
                         # enclosing EphemeralConfig still wipes the whole private directory.
-                        failed = result.returncode != 0
-                        if result.returncode == 0:
+                        failed = (
+                            command_error is not None
+                            and accepted_command_error is None
+                        )
+                        if command_error is None or accepted_command_error is not None:
                             await asyncio.to_thread(
                                 _strip_cfgdir_noise_file, spool_path, cfgdir
                             )
                             yield SpooledRunResult(
                                 path=spool_path,
                                 stdout_bytes=spool_path.stat().st_size,
+                                accepted_error_kind=(
+                                    accepted_command_error.kind
+                                    if accepted_command_error is not None
+                                    else None
+                                ),
                             )
                     except BaseException:
                         failed = True
@@ -448,7 +779,7 @@ class GAMRunner:
                     command_succeeded=result.returncode == 0,
                     gam_error_kind=gam_error_kind,
                 ) from None
-            if result.returncode != 0:
+            if result.returncode != 0 and accepted_command_error is None:
                 raise GAMError.from_run(result.returncode, result.stderr, command)
 
         if serialize:

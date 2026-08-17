@@ -12,14 +12,17 @@ import csv
 import heapq
 import inspect
 import json
+import math
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Awaitable, Callable, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..audit import AuditLog
 from ..classroom.index import CourseIndex
@@ -47,6 +50,8 @@ from ..calendar_index import IndexedCalendar
 from ..gam.parser import iter_records_file, parse_one, parse_records
 from ..gam.runner import (
     GAMRunner,
+    StreamingGAMError,
+    StreamingRunResult,
     await_secure_remove_private_file,
     secure_remove_private_file,
 )
@@ -64,6 +69,80 @@ from .base import (
 from .person import ConnectorAccount, Person
 
 MAX_ONEROSTER_BULK_ROSTER_MEMBERS = 500_000
+ONEROSTER_COURSE_SELECTOR_CHUNK_SIZE = 100
+ONEROSTER_COURSE_SELECTOR_WORKERS = 2
+ONEROSTER_RATE_LIMIT_RETRY_DELAYS = (60.0, 120.0, 300.0)
+ONEROSTER_NATIVE_BATCH_WORKERS = 10
+ONEROSTER_NATIVE_BATCH_TIMEOUT = 86400.0
+
+ClassroomBatchCommandSink = Callable[[Sequence[str]], None]
+ClassroomBatchCommandSource = Union[
+    Iterable[Sequence[str]],
+    Callable[[ClassroomBatchCommandSink], None],
+]
+
+
+@dataclass(frozen=True)
+class NativeClassroomBatchProgress:
+    """Sanitized dispatch count parsed from one native GAM progress line."""
+
+    dispatched: int
+    total: int
+    raw_line: str
+
+
+@dataclass(frozen=True)
+class NativeClassroomBatchReceipt:
+    """Receipt for a whole OneRoster phase submitted to one GAM process.
+
+    ``progress_count`` is GAM's last observed dispatch count. It is not a child-command
+    completion count; the successful process result is the authoritative completion signal.
+    """
+
+    submitted_count: int
+    process_result: StreamingRunResult
+    progress_count: int
+    worker_count: int = ONEROSTER_NATIVE_BATCH_WORKERS
+    outcome: str = "completed"
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.process_result.duration_seconds
+
+    @property
+    def returncode(self) -> int:
+        return self.process_result.returncode
+
+
+class NativeClassroomBatchError(GAMError):
+    """A native GAM phase failed after its commands were durably submitted."""
+
+    def __init__(self, cause: GAMError, *, submitted_count: int) -> None:
+        self.submitted_count = int(submitted_count)
+        self.process_result = (
+            cause.result if isinstance(cause, StreamingGAMError) else None
+        )
+        super().__init__(
+            kind=cause.kind,
+            exit_code=cause.exit_code,
+            stderr=cause.stderr,
+            argv=GAMCommands.batch_file("<private-batch>", show_commands=False),
+        )
+
+    @property
+    def error_code(self) -> str:
+        return "GAM-NATIVE-BATCH-FAILED"
+
+
+NativeClassroomBatchProgressCallback = Callable[
+    [NativeClassroomBatchProgress],
+    Optional[Awaitable[None]],
+]
+
+_NATIVE_BATCH_PROGRESS_PATTERN = re.compile(
+    r"(?:^|,)\s*0\s*,\s*Processing item\s+(\d+)\s*/\s*(\d+)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _parse_signature(text: str) -> str:
@@ -469,6 +548,60 @@ def _read_oneroster_course_lookup_spool(
     ]
 
 
+def _read_oneroster_course_snapshot_spool(
+    path: Path,
+    requested_aliases: Sequence[str],
+) -> List[CourseDetail]:
+    """Filter one tenant inventory while rejecting ambiguous managed identities."""
+
+    requested_by_fold = {
+        alias.casefold(): alias
+        for alias in requested_aliases
+    }
+    if len(requested_by_fold) != len(requested_aliases):
+        raise ValueError("managed Classroom aliases must be unique")
+
+    courses_by_alias: dict[str, CourseDetail] = {}
+    aliases_by_course_id: dict[str, str] = {}
+    for record in iter_records_file(path):
+        detail = _without_course_raw(CourseDetail.from_json(record), ())
+        matches = [
+            requested_by_fold[alias.casefold()]
+            for alias in _read_oneroster_course_aliases(record)
+            if alias.casefold() in requested_by_fold
+        ]
+        if not matches:
+            continue
+        if not detail.id:
+            raise ValueError(
+                "Managed course inventory returned a requested alias without a course ID."
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                "Managed course inventory maps multiple requested aliases to one course."
+            )
+
+        matched = matches[0]
+        alias_key = matched.casefold()
+        if alias_key in courses_by_alias:
+            raise ValueError(
+                "Managed course inventory returned a duplicate or ambiguous alias."
+            )
+        previous_alias = aliases_by_course_id.get(detail.id)
+        if previous_alias is not None:
+            raise ValueError(
+                "Managed course inventory returned a duplicate or ambiguous course ID."
+            )
+        aliases_by_course_id[detail.id] = alias_key
+        courses_by_alias[alias_key] = _without_course_raw(detail, (matched,))
+
+    return [
+        courses_by_alias[alias.casefold()]
+        for alias in requested_aliases
+        if alias.casefold() in courses_by_alias
+    ]
+
+
 def _managed_course_alias(value: object) -> str:
     alias = str(value or "").strip()
     if alias.startswith("d:"):
@@ -510,6 +643,71 @@ def _write_private_selector(
             os.close(fd)
         _remove_private_batch(path)
         raise
+
+
+def _write_private_classroom_batch(
+    commands: ClassroomBatchCommandSource,
+    *,
+    spool_dir: Path,
+) -> tuple[Path, int]:
+    """Validate and serialize a command source exactly once without retaining it."""
+
+    fd, raw_path = tempfile.mkstemp(
+        prefix="gamgui-oneroster-native-batch-",
+        suffix=".txt",
+        dir=str(spool_dir),
+    )
+    path = Path(raw_path)
+    submitted_count = 0
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            fd = -1
+
+            def emit(command: Sequence[str]) -> None:
+                nonlocal submitted_count
+                selected = tuple(str(argument) for argument in command)
+                if not _is_allowed_classroom_batch_command(selected):
+                    raise ValueError(
+                        "Classroom batch contains a command outside the OneRoster allowlist."
+                    )
+                stream.write(GAMCommands.batch_line(selected))
+                stream.write("\n")
+                submitted_count += 1
+
+            if callable(commands):
+                commands(emit)
+            else:
+                for command in commands:
+                    emit(command)
+            if submitted_count == 0:
+                raise ValueError("Classroom phase batch must contain at least one command.")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path, submitted_count
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        _remove_private_batch(path)
+        raise
+
+
+def _native_batch_progress(
+    line: str,
+    submitted_count: int,
+) -> Optional[NativeClassroomBatchProgress]:
+    match = _NATIVE_BATCH_PROGRESS_PATTERN.search(line)
+    if match is None:
+        return None
+    dispatched = int(match.group(1))
+    total = int(match.group(2))
+    if total != submitted_count or dispatched < 1 or dispatched > total:
+        return None
+    return NativeClassroomBatchProgress(
+        dispatched=dispatched,
+        total=total,
+        raw_line=line,
+    )
 
 
 def _participant_role(record: dict, parsed: CourseParticipant) -> str:
@@ -839,7 +1037,7 @@ class GAMConnector(Connector):
         self,
         aliases: Sequence[str],
     ) -> List[CourseDetail]:
-        """Resolve one exact managed-alias set in a single streamed GAM process."""
+        """Resolve an exact managed-alias set through bounded GAM selector shards."""
 
         selected: list[str] = []
         seen: set[str] = set()
@@ -852,40 +1050,83 @@ class GAMConnector(Connector):
         if not selected:
             return []
 
-        selector_path = _write_private_selector(
-            selected,
-            prefix="gamgui-oneroster-course-selector-",
-            spool_dir=private_runtime_spool_dir(
-                getattr(self.runner, "base_dir", None)
-            ),
-        )
-        operation_succeeded = False
-        try:
-            timeout = min(
-                21600.0,
-                max(
-                    float(getattr(self.runner, "timeout", 120.0)),
-                    0.5 * len(selected),
+        chunks = [
+            selected[index:index + ONEROSTER_COURSE_SELECTOR_CHUNK_SIZE]
+            for index in range(0, len(selected), ONEROSTER_COURSE_SELECTOR_CHUNK_SIZE)
+        ]
+
+        async def read_shard(shard: Sequence[str]) -> List[CourseDetail]:
+            selector_path = _write_private_selector(
+                shard,
+                prefix="gamgui-oneroster-course-selector-",
+                spool_dir=private_runtime_spool_dir(
+                    getattr(self.runner, "base_dir", None)
                 ),
             )
-            async with self.runner.run_authenticated_to_file(
-                self.domain,
-                GAMCommands.print_oneroster_courses_file(str(selector_path)),
-                timeout=timeout,
-                serialize=False,
-            ) as result:
-                courses = await _parse_private_spool_off_loop(
-                    _read_oneroster_course_lookup_spool,
-                    result.path,
-                    selected,
+            operation_succeeded = False
+            try:
+                timeout = min(
+                    21600.0,
+                    max(
+                        float(getattr(self.runner, "timeout", 120.0)),
+                        0.5 * len(shard),
+                    ),
                 )
-            operation_succeeded = True
-        finally:
-            cleaned = await _await_private_batch_removal(selector_path)
-            if not cleaned and operation_succeeded:
-                raise RuntimeError(
-                    "Private Classroom selector could not be removed securely."
-                )
+                for attempt in range(len(ONEROSTER_RATE_LIMIT_RETRY_DELAYS) + 1):
+                    try:
+                        async with self.runner.run_authenticated_to_file(
+                            self.domain,
+                            GAMCommands.print_oneroster_courses_file(
+                                str(selector_path)
+                            ),
+                            timeout=timeout,
+                            serialize=False,
+                            accepted_error_kinds=(GAMErrorKind.NOT_FOUND,),
+                        ) as result:
+                            courses = await _parse_private_spool_off_loop(
+                                _read_oneroster_course_lookup_spool,
+                                result.path,
+                                shard,
+                            )
+                        break
+                    except GAMError as exc:
+                        if (
+                            exc.kind is not GAMErrorKind.RATE_LIMITED
+                            or attempt >= len(ONEROSTER_RATE_LIMIT_RETRY_DELAYS)
+                        ):
+                            raise
+                        await asyncio.sleep(
+                            ONEROSTER_RATE_LIMIT_RETRY_DELAYS[attempt]
+                        )
+                operation_succeeded = True
+                return courses
+            finally:
+                cleaned = await _await_private_batch_removal(selector_path)
+                if not cleaned and operation_succeeded:
+                    raise RuntimeError(
+                        "Private Classroom selector could not be removed securely."
+                    )
+
+        worker_limit = asyncio.Semaphore(ONEROSTER_COURSE_SELECTOR_WORKERS)
+
+        async def read_chunk(chunk: Sequence[str]) -> List[CourseDetail]:
+            async with worker_limit:
+                return await read_shard(chunk)
+
+        tasks = [asyncio.create_task(read_chunk(chunk)) for chunk in chunks]
+        try:
+            shard_results = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        courses = [course for result in shard_results for course in result]
+        selected_order = {alias.casefold(): index for index, alias in enumerate(selected)}
+        courses.sort(
+            key=lambda course: selected_order[course.aliases[0].casefold()]
+        )
 
         course_ids: set[str] = set()
         for course in courses:
@@ -895,6 +1136,35 @@ class GAMConnector(Connector):
                 )
             course_ids.add(course.id)
         return courses
+
+    async def snapshot_oneroster_managed_courses(
+        self,
+        aliases: Sequence[str],
+    ) -> List[CourseDetail]:
+        """Filter requested managed aliases from one tenant-wide course inventory."""
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        for raw in aliases:
+            alias = _managed_course_alias(raw)
+            key = alias.casefold()
+            if key not in seen:
+                seen.add(key)
+                selected.append(alias)
+        if not selected:
+            return []
+
+        async with self.runner.run_authenticated_to_file(
+            self.domain,
+            GAMCommands.print_oneroster_courses_snapshot(),
+            timeout=ONEROSTER_NATIVE_BATCH_TIMEOUT,
+            serialize=False,
+        ) as result:
+            return await _parse_private_spool_off_loop(
+                _read_oneroster_course_snapshot_spool,
+                result.path,
+                selected,
+            )
 
     async def refresh_course_index(self, index: CourseIndex) -> int:
         """Stream the tenant-wide cheap course projection into ``index`` off-loop."""
@@ -1226,6 +1496,107 @@ class GAMConnector(Connector):
                     "Private Classroom batch could not be removed securely."
                 )
         return receipt
+
+    async def run_classroom_phase_batch(
+        self,
+        commands: ClassroomBatchCommandSource,
+        *,
+        timeout: float = ONEROSTER_NATIVE_BATCH_TIMEOUT,
+        progress_callback: Optional[NativeClassroomBatchProgressCallback] = None,
+    ) -> NativeClassroomBatchReceipt:
+        """Execute one entire allowlisted OneRoster phase in one native GAM batch."""
+
+        command_timeout = float(timeout)
+        if not math.isfinite(command_timeout) or command_timeout <= 0:
+            raise ValueError("Classroom phase timeout must be a positive finite value.")
+
+        batch_path: Optional[Path] = None
+        submitted_count = 0
+        progress_count = 0
+        operation_succeeded = False
+        started = time.perf_counter()
+        try:
+            batch_path, submitted_count = await asyncio.to_thread(
+                _write_private_classroom_batch,
+                commands,
+                spool_dir=private_runtime_spool_dir(
+                    getattr(self.runner, "base_dir", None)
+                ),
+            )
+
+            async def observe_progress(_stream_name: str, line: str) -> None:
+                nonlocal progress_count
+                progress = _native_batch_progress(line, submitted_count)
+                if progress is None or progress.dispatched <= progress_count:
+                    return
+                progress_count = progress.dispatched
+                if progress_callback is not None:
+                    callback_result = progress_callback(progress)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+
+            process_result = await self.runner.run_authenticated_streaming(
+                self.domain,
+                GAMCommands.batch_file(str(batch_path), show_commands=False),
+                timeout=command_timeout,
+                serialize=True,
+                gam_threads=ONEROSTER_NATIVE_BATCH_WORKERS,
+                line_callback=observe_progress,
+            )
+            receipt = NativeClassroomBatchReceipt(
+                submitted_count=submitted_count,
+                process_result=process_result,
+                progress_count=progress_count,
+            )
+            self.audit.record(
+                "oneroster_classroom_phase_batch",
+                target=f"{submitted_count} actions",
+                argv=GAMCommands.batch_file(
+                    "<private-batch>",
+                    show_commands=False,
+                ),
+                ok=True,
+                extra={
+                    "duration_seconds": round(receipt.duration_seconds, 3),
+                    "worker_count": receipt.worker_count,
+                    "outcome": receipt.outcome,
+                    "submitted_count": receipt.submitted_count,
+                    "progress_count": receipt.progress_count,
+                },
+            )
+            operation_succeeded = True
+            return receipt
+        except GAMError as exc:
+            wrapped = NativeClassroomBatchError(
+                exc,
+                submitted_count=submitted_count,
+            )
+            self.audit.record(
+                "oneroster_classroom_phase_batch",
+                target=f"{submitted_count} actions",
+                argv=GAMCommands.batch_file(
+                    "<private-batch>",
+                    show_commands=False,
+                ),
+                ok=False,
+                extra={
+                    "duration_seconds": round(time.perf_counter() - started, 3),
+                    "worker_count": ONEROSTER_NATIVE_BATCH_WORKERS,
+                    "outcome": "failed",
+                    "submitted_count": submitted_count,
+                    "progress_count": progress_count,
+                    "error_code": wrapped.error_code,
+                    "gam_error_kind": wrapped.kind.value,
+                },
+            )
+            raise wrapped from exc
+        finally:
+            if batch_path is not None:
+                cleaned = await _await_private_batch_removal(batch_path)
+                if not cleaned and operation_succeeded:
+                    raise RuntimeError(
+                        "Private Classroom phase batch could not be removed securely."
+                    )
 
     async def create_course(
         self,

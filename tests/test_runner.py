@@ -276,6 +276,38 @@ async def test_authenticated_output_can_be_securely_spooled(vault, tmp_path, dom
     assert list(tmp_path.glob("gamcfg-*")) == []
 
 
+async def test_spooled_read_can_accept_not_found_and_preserve_sparse_output(
+    vault,
+    tmp_path,
+    domain,
+):
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = (
+        "import sys;"
+        "print('id,JSON,JSON-aliases');"
+        "print('123,{},[]');"
+        "sys.stderr.write('Course: d:Section_missing, Does not exist');"
+        "sys.exit(56)"
+    )
+
+    async with runner.run_authenticated_to_file(
+        domain,
+        ["-c", script],
+        accepted_error_kinds=(GAMErrorKind.NOT_FOUND,),
+    ) as result:
+        spool_path = result.path
+        assert "123,{},[]" in spool_path.read_text(encoding="utf-8")
+        assert result.accepted_error_kind is GAMErrorKind.NOT_FOUND
+
+    assert not spool_path.exists()
+    assert list(tmp_path.glob("gamcfg-*")) == []
+
+
 async def test_spool_is_removed_when_consumer_fails(vault, tmp_path, domain):
     runner = GAMRunner(
         vault=vault,
