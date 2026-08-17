@@ -536,14 +536,17 @@ def load_embedded_profile(path: Optional[Path] = None) -> EmbeddedProfile:
         default=ONEROSTER_PROFILE,
     )
     source_sha = os.environ.get("GAMGUI_SOURCE_SHA", "").lower()
+    source_platform = "windows" if sys.platform == "win32" else "macos"
     identity = ComponentArtifactId(
         source_sha=source_sha if _valid_sha(source_sha) else "",
         version=__version__,
         profile=profile,
         component_set_digest=component_set_digest(profile),
         architecture=_normalize_architecture(platform.machine()),
-        minimum_macos_version="12.0",
+        minimum_macos_version="10.0" if source_platform == "windows" else "12.0",
         packaging_revision="source",
+        platform=source_platform,
+        bundle_format=PLATFORM_BUNDLE_FORMATS[source_platform],
     )
     identity.validate(require_source_sha=False)
     return EmbeddedProfile(
@@ -791,10 +794,30 @@ class ComponentManager:
             return
         state = self.store.load()
         installed_sha = str(getattr(state, "installed_sha", "") or "")
+        installed_profile = str(getattr(state, "installed_profile", "") or "")
+        installed_components = set(
+            getattr(state, "installed_components", ()) or ()
+        )
+        try:
+            legacy_profile_matches = (
+                normalize_profile(installed_profile) == self.embedded.artifact.profile
+                and installed_components
+                == set(component_ids_for_profile(self.embedded.artifact.profile))
+            )
+        except ComponentError:
+            legacy_profile_matches = False
+        legacy_profile_only = (
+            not installed_sha
+            and getattr(state, "installed_artifact", None) is None
+            and not getattr(state, "pending_app", "")
+            and bool(getattr(state, "component_prompt_answered", False))
+            and legacy_profile_matches
+        )
         pristine = (
             not installed_sha
             and getattr(state, "installed_artifact", None) is None
             and not getattr(state, "pending_app", "")
+            and not legacy_profile_only
         )
         legacy_sha_only = (
             bool(installed_sha)
@@ -802,7 +825,25 @@ class ComponentManager:
             and not getattr(state, "pending_app", "")
             and installed_sha == self.embedded.artifact.source_sha
         )
-        if not pristine and not legacy_sha_only:
+        installed_artifact = getattr(state, "installed_artifact", None)
+        source_identity_repair = bool(
+            not getattr(sys, "frozen", False)
+            and isinstance(installed_artifact, ComponentArtifactId)
+            and installed_sha == self.embedded.artifact.source_sha
+            and installed_artifact.source_sha == self.embedded.artifact.source_sha
+            and installed_artifact.profile == self.embedded.artifact.profile
+            and installed_artifact.component_set_digest
+            == self.embedded.artifact.component_set_digest
+            and installed_artifact.packaging_revision == "source"
+            and self.embedded.artifact.packaging_revision == "source"
+            and not getattr(state, "pending_app", "")
+        )
+        if (
+            not pristine
+            and not legacy_sha_only
+            and not legacy_profile_only
+            and not source_identity_repair
+        ):
             return
         artifact = self.embedded.artifact
         runtime_bundle = _runtime_bundle_path()

@@ -554,6 +554,91 @@ def test_legacy_sha_only_state_backfills_running_sealed_artifact(tmp_path):
     assert saved.component_prompt_answered
 
 
+def test_legacy_profile_only_state_backfills_without_disabling(tmp_path):
+    store = UpdateStateStore(tmp_path / "state.json")
+    store.save(
+        UpdateState(
+            installed_profile=ONEROSTER_PROFILE,
+            desired_profile=ONEROSTER_PROFILE,
+            installed_components=[ONEROSTER_COMPONENT],
+            desired_components=[ONEROSTER_COMPONENT],
+            enabled_components=[ONEROSTER_COMPONENT],
+            component_prompt_answered=True,
+        )
+    )
+    embedded = EmbeddedProfile.from_json(
+        build_profile_payload(
+            ONEROSTER_PROFILE,
+            source_sha=SHA,
+            version="1",
+            architecture="x86_64",
+            minimum_macos_version="10.0",
+            packaging_revision="source-hotfix",
+            platform_name="windows",
+            bundle_format="onedir",
+        )
+    )
+
+    manager = ComponentManager(
+        store=store,
+        registry=ActivityRegistry(),
+        data_root=tmp_path / "data",
+        embedded=embedded,
+    )
+
+    saved = store.load()
+    assert saved.installed_sha == SHA
+    assert saved.installed_artifact == embedded.artifact
+    assert saved.enabled_components == [ONEROSTER_COMPONENT]
+    assert manager.status().state == "enabled"
+
+
+def test_source_identity_platform_repair_preserves_enabled_component(tmp_path):
+    store = UpdateStateStore(tmp_path / "state.json")
+    embedded = EmbeddedProfile.from_json(
+        build_profile_payload(
+            ONEROSTER_PROFILE,
+            source_sha=SHA,
+            version="1",
+            architecture="x86_64",
+            minimum_macos_version="10.0",
+            packaging_revision="source",
+            platform_name="windows",
+            bundle_format="onedir",
+        )
+    )
+    stale = replace(
+        embedded.artifact,
+        minimum_macos_version="12.0",
+        platform="macos",
+        bundle_format="app-bundle",
+    )
+    store.save(
+        UpdateState(
+            installed_sha=SHA,
+            installed_profile=ONEROSTER_PROFILE,
+            desired_profile=ONEROSTER_PROFILE,
+            installed_components=[ONEROSTER_COMPONENT],
+            desired_components=[ONEROSTER_COMPONENT],
+            enabled_components=[ONEROSTER_COMPONENT],
+            installed_artifact=stale,
+            component_prompt_answered=True,
+        )
+    )
+
+    manager = ComponentManager(
+        store=store,
+        registry=ActivityRegistry(),
+        data_root=tmp_path / "data",
+        embedded=embedded,
+    )
+
+    saved = store.load()
+    assert saved.installed_artifact == embedded.artifact
+    assert saved.enabled_components == [ONEROSTER_COMPONENT]
+    assert manager.status().state == "enabled"
+
+
 def test_legacy_sha_mismatch_is_not_backfilled(tmp_path):
     store = UpdateStateStore(tmp_path / "state.json")
     store.save(UpdateState(installed_sha="b" * 40))

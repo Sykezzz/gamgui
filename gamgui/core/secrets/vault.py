@@ -14,11 +14,14 @@ the real Keychain. The default backend uses ``keyring``, which maps to the macOS
 from __future__ import annotations
 
 import ctypes
+import base64
+import hashlib
 import json
 import os
 import sys
 import time
 from typing import Dict, Optional, Protocol, Tuple
+from uuid import uuid4
 
 # Logical credential name -> the filename GAM expects inside GAMCFGDIR.
 FILENAMES: Dict[str, str] = {
@@ -33,6 +36,11 @@ _REQUIRED = ("oauth2service", "oauth2")
 
 _INDEX_SERVICE = "gamgui"
 _INDEX_KEY = "_domains"
+
+# Windows Credential Manager rejects blobs above 2560 bytes, and keyring's
+# backend stores strings as UTF-16. Keep enough room for encoding details.
+_WINDOWS_CHUNK_SIZE = 1000
+_WINDOWS_CHUNK_MARKER = "gamgui-wincred-chunks-v1:"
 
 
 class VaultBackend(Protocol):
@@ -194,20 +202,137 @@ class _KeyringBackend:
             self._darwin_api = _DarwinSecurityAPI()
 
     def get_password(self, service: str, username: str) -> Optional[str]:
-        return self._keyring.get_password(service, username)
+        value = self._keyring.get_password(service, username)
+        if sys.platform != "win32" or not value or not value.startswith(_WINDOWS_CHUNK_MARKER):
+            return value
+        manifest = _windows_chunk_manifest(value)
+        if manifest is None:
+            return None
+        generation, count, expected_digest = manifest
+        parts = []
+        for index in range(count):
+            part = self._keyring.get_password(
+                service, _windows_chunk_key(username, generation, index)
+            )
+            if part is None:
+                return None
+            parts.append(part)
+        try:
+            raw = base64.b64decode("".join(parts), validate=True)
+            if hashlib.sha256(raw).hexdigest() != expected_digest:
+                return None
+            return raw.decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return None
 
     def set_password(self, service: str, username: str, password: str) -> None:
         if self._uses_darwin_api:
             _set_darwin_password(self._darwin_api, service, username, password)
             return
+        if sys.platform == "win32" and len(password.encode("utf-8")) > _WINDOWS_CHUNK_SIZE:
+            self._set_windows_chunked_password(service, username, password)
+            return
+        old_value = None
+        if sys.platform == "win32":
+            try:
+                old_value = self._keyring.get_password(service, username)
+            except Exception:
+                pass
         self._keyring.set_password(service, username, password)
+        if sys.platform == "win32":
+            self._delete_windows_chunks(service, username, old_value)
 
     def delete_password(self, service: str, username: str) -> None:
+        old_value = None
+        if sys.platform == "win32":
+            try:
+                old_value = self._keyring.get_password(service, username)
+            except Exception:
+                pass
         try:
             self._keyring.delete_password(service, username)
         except Exception:
             # keyring raises PasswordDeleteError if absent; deleting a missing item is a no-op.
             pass
+        self._delete_windows_chunks(service, username, old_value)
+
+    def _set_windows_chunked_password(self, service: str, username: str, password: str) -> None:
+        try:
+            old_value = self._keyring.get_password(service, username)
+        except Exception:
+            old_value = None
+        raw = password.encode("utf-8")
+        encoded = base64.b64encode(raw).decode("ascii")
+        chunks = [
+            encoded[offset:offset + _WINDOWS_CHUNK_SIZE]
+            for offset in range(0, len(encoded), _WINDOWS_CHUNK_SIZE)
+        ]
+        generation = uuid4().hex
+        written = 0
+        try:
+            for index, chunk in enumerate(chunks):
+                self._keyring.set_password(
+                    service, _windows_chunk_key(username, generation, index), chunk
+                )
+                written += 1
+            manifest = _WINDOWS_CHUNK_MARKER + json.dumps(
+                {
+                    "generation": generation,
+                    "count": len(chunks),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                },
+                separators=(",", ":"),
+            )
+            self._keyring.set_password(service, username, manifest)
+        except Exception:
+            self._delete_chunk_generation(service, username, generation, written)
+            raise
+        self._delete_windows_chunks(service, username, old_value)
+
+    def _delete_windows_chunks(
+        self, service: str, username: str, manifest_value: Optional[str]
+    ) -> None:
+        manifest = _windows_chunk_manifest(manifest_value)
+        if manifest is not None:
+            generation, count, _ = manifest
+            self._delete_chunk_generation(service, username, generation, count)
+
+    def _delete_chunk_generation(
+        self, service: str, username: str, generation: str, count: int
+    ) -> None:
+        for index in range(count):
+            try:
+                self._keyring.delete_password(
+                    service, _windows_chunk_key(username, generation, index)
+                )
+            except Exception:
+                pass
+
+
+def _windows_chunk_key(username: str, generation: str, index: int) -> str:
+    return f"{username}.__gamgui_chunk__.{generation}.{index}"
+
+
+def _windows_chunk_manifest(value: Optional[str]) -> Optional[Tuple[str, int, str]]:
+    if not value or not value.startswith(_WINDOWS_CHUNK_MARKER):
+        return None
+    try:
+        data = json.loads(value[len(_WINDOWS_CHUNK_MARKER):])
+        generation = data["generation"]
+        count = data["count"]
+        digest = data["sha256"]
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or not isinstance(count, int)
+            or not 0 < count <= 10000
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            return None
+        return generation, count, digest
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class SecretsVault:

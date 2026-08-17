@@ -379,6 +379,67 @@ def test_keyring_backend_keeps_keyring_write_path_off_darwin(monkeypatch):
     assert api.calls == []
 
 
+class _SizeLimitedKeyring:
+    def __init__(self, limit=1280):
+        self.values = {}
+        self.limit = limit
+
+    def get_keyring(self):
+        return object()
+
+    def get_password(self, service, username):
+        return self.values.get((service, username))
+
+    def set_password(self, service, username, password):
+        if len(password.encode("utf-8")) > self.limit:
+            raise PasswordSetError("credential is too large")
+        self.values[(service, username)] = password
+
+    def delete_password(self, service, username):
+        self.values.pop((service, username), None)
+
+
+def test_windows_keyring_chunks_large_credentials(monkeypatch):
+    keyring = _SizeLimitedKeyring()
+    monkeypatch.setattr(vault_module.sys, "platform", "win32")
+    backend = _KeyringBackend(keyring_module=keyring)
+    value = '{"token":"' + ("snow-\u96ea-" * 700) + '"}'
+
+    backend.set_password("gamgui:a.com", "oauth2", value)
+
+    assert backend.get_password("gamgui:a.com", "oauth2") == value
+    assert len(keyring.values) > 2
+    assert all(len(stored.encode("utf-8")) <= keyring.limit for stored in keyring.values.values())
+
+
+def test_windows_keyring_overwrite_and_delete_remove_chunks(monkeypatch):
+    keyring = _SizeLimitedKeyring()
+    monkeypatch.setattr(vault_module.sys, "platform", "win32")
+    backend = _KeyringBackend(keyring_module=keyring)
+    service, username = "gamgui:a.com", "oauth2"
+
+    backend.set_password(service, username, "x" * 6000)
+    assert len(keyring.values) > 2
+    backend.set_password(service, username, "small")
+    assert keyring.values == {(service, username): "small"}
+
+    backend.set_password(service, username, "y" * 6000)
+    backend.delete_password(service, username)
+    assert keyring.values == {}
+
+
+def test_windows_keyring_rejects_incomplete_chunk_sets(monkeypatch):
+    keyring = _SizeLimitedKeyring()
+    monkeypatch.setattr(vault_module.sys, "platform", "win32")
+    backend = _KeyringBackend(keyring_module=keyring)
+    service, username = "gamgui:a.com", "oauth2"
+    backend.set_password(service, username, "x" * 6000)
+    chunk_key = next(key for key in keyring.values if key[1] != username)
+    del keyring.values[chunk_key]
+
+    assert backend.get_password(service, username) is None
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Security.framework")
 def test_darwin_security_adapter_contract():
     api = _DarwinSecurityAPI()

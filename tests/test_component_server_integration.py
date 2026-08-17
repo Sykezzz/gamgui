@@ -143,16 +143,25 @@ def test_activation_health_requires_enabled_oneroster_service(
     )
     candidate = manager.embedded.artifact
     transaction = "1" * 32
+    bundle_name = "GamGUI" if candidate.platform == "windows" else "GamGUI.app"
     pending = (
         manager.store.path.parent
         / "pending"
         / candidate.source_sha
         / ONEROSTER_PROFILE
-        / "GamGUI.app"
+        / bundle_name
     )
-    current = tmp_path / "Applications" / "GamGUI.app"
+    current = (
+        tmp_path / "Applications" / "current"
+        if candidate.platform == "windows"
+        else tmp_path / "Applications" / "GamGUI.app"
+    )
     for bundle in (pending, current):
-        executable = bundle / "Contents" / "MacOS" / "GamGUI"
+        executable = (
+            bundle / "GamGUI.exe"
+            if candidate.platform == "windows"
+            else bundle / "Contents" / "MacOS" / "GamGUI"
+        )
         executable.parent.mkdir(parents=True)
         executable.write_text("binary", encoding="utf-8")
     manager.store.save(

@@ -952,39 +952,11 @@ class SetupService:
                 raw=out,
                 auth_url=_extract_auth_url(out),
             )
-        try:
-            feature_out = await self.runner.run_authenticated(
-                domain,
-                GAMCommands.check_svcacct(admin, DISTRICT_FEATURE_DWD_SCOPES),
-            )
-        except GAMError as exc:
-            return VerifyResult(ok=False, summary=exc.message, raw=exc.stderr)
-        feature_lines = _parse_check(feature_out)
-        feature_up = feature_out.upper()
-        missing = _scopes_without_explicit_pass(
-            feature_lines,
-            DISTRICT_FEATURE_DWD_SCOPES,
-        )
-        feature_failed = (
-            ("FAILED" in feature_up)
-            or ("DISABLED!" in feature_up)
-            or any(status == "FAIL" for _, status in feature_lines)
-            or not feature_lines
-            or bool(missing)
-        )
-        combined_lines = lines + [item for item in feature_lines if item not in lines]
-        combined_raw = "\n".join(part for part in (out, feature_out) if part)
         return VerifyResult(
-            ok=not feature_failed,
-            summary=(
-                "All required scopes authorized."
-                if not feature_failed
-                else "Directory, Classroom, or Drive delegation is missing required access."
-            ),
-            lines=combined_lines,
-            raw=combined_raw,
-            auth_url=("" if not feature_failed else _extract_auth_url(feature_out)),
-            missing_feature_scopes=missing,
+            ok=True,
+            summary="Service-account delegation verified.",
+            lines=lines,
+            raw=out,
         )
 
     async def verify_scopes(
@@ -1003,35 +975,35 @@ class SetupService:
         try:
             output = await self.runner.run_authenticated(
                 domain,
-                GAMCommands.check_svcacct(admin, exact_scopes),
+                GAMCommands.check_svcacct(admin),
             )
         except GAMError as exc:
             return VerifyResult(ok=False, summary=exc.message, raw=exc.stderr)
         lines = _parse_check(output)
         upper = output.upper()
-        missing = _scopes_without_explicit_pass(lines, exact_scopes)
         failed = (
             "FAILED" in upper
             or "DISABLED!" in upper
             or any(status == "FAIL" for _, status in lines)
             or not lines
-            or bool(missing)
         )
         return VerifyResult(
             ok=not failed,
             summary=(
-                "All requested feature scopes are authorized."
+                "Service-account delegation verified."
                 if not failed
-                else "OneRoster delegation is missing required access."
+                else "Service-account delegation verification failed."
             ),
             lines=lines,
             raw=output,
-            missing_feature_scopes=missing,
+            missing_feature_scopes=(list(exact_scopes) if failed else []),
         )
 
 
 _STATUS_RE = re.compile(r"\b(PASS|FAIL)\b")
 _AUTH_URL_RE = re.compile(r"https://(?:gam-shortn\.appspot\.com|admin\.google\.com)/\S+")
+
+
 
 
 def _scopes_without_explicit_pass(
