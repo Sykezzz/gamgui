@@ -339,6 +339,10 @@ class GAMRunner:
         cfgdir: Path,
         timeout: float,
         stdout_path: Path,
+        *,
+        gam_threads: Optional[int] = None,
+        line_callback: Optional[StreamingLineCallback] = None,
+        tail_lines: int = STREAM_DIAGNOSTIC_TAIL_LINES,
     ) -> RunResult:
         self._require_binary()
         with stdout_path.open("wb", buffering=0) as stdout_file:
@@ -347,29 +351,108 @@ class GAMRunner:
                     *self._subprocess_command(argv),
                     stdout=stdout_file,
                     stderr=asyncio.subprocess.PIPE,
-                    env=self._build_env(cfgdir),
+                    env=self._build_env(cfgdir, gam_threads=gam_threads),
                     **self._subprocess_options(pass_fds),
                 )
-            try:
-                _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                raise GAMError(
-                    GAMErrorKind.TIMEOUT,
-                    exit_code=None,
-                    stderr="command timed out",
-                    argv=list(argv),
+            if line_callback is None:
+                try:
+                    _, err = await asyncio.wait_for(
+                        proc.communicate(), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise GAMError(
+                        GAMErrorKind.TIMEOUT,
+                        exit_code=None,
+                        stderr="command timed out",
+                        argv=list(argv),
+                    )
+                except asyncio.CancelledError:
+                    proc.kill()
+                    await proc.wait()
+                    raise
+                stderr_text = (err or b"").decode("utf-8", "replace")
+            else:
+                stderr_text = await self._drain_stderr_to_callback(
+                    proc,
+                    cfgdir,
+                    timeout,
+                    argv,
+                    line_callback,
+                    tail_lines,
                 )
-            except asyncio.CancelledError:
-                proc.kill()
-                await proc.wait()
-                raise
         return RunResult(
             stdout="",
-            stderr=(err or b"").decode("utf-8", "replace"),
+            stderr=stderr_text,
             returncode=proc.returncode if proc.returncode is not None else -1,
         )
+
+    async def _drain_stderr_to_callback(
+        self,
+        proc: asyncio.subprocess.Process,
+        cfgdir: Path,
+        timeout: float,
+        argv: Sequence[str],
+        line_callback: StreamingLineCallback,
+        tail_lines: int,
+    ) -> str:
+        """Drain stderr line by line so a long export can report progress.
+
+        GAM writes its ``(n/total)`` progress to stderr while stdout goes straight to the
+        spool file, so progress is observable without ever buffering the export itself.
+        Only a bounded tail is retained for diagnostics, matching ``_exec_streaming``.
+        """
+
+        retained = max(1, min(int(tail_lines), 1000))
+        stderr_tail: deque[str] = deque(maxlen=retained)
+        cfgdir_text = str(cfgdir)
+
+        async def drain() -> None:
+            reader = proc.stderr
+            if reader is None:
+                return
+            while raw_line := await reader.readline():
+                line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                if cfgdir_text and cfgdir_text in line:
+                    continue
+                bounded = line[-STREAM_DIAGNOSTIC_LINE_CHARS:]
+                stderr_tail.append(bounded)
+                callback_result = line_callback("stderr", bounded)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+
+        drain_task = asyncio.create_task(drain())
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            await drain_task
+        except asyncio.TimeoutError:
+            await self._abandon_drain(drain_task, proc)
+            raise GAMError(
+                GAMErrorKind.TIMEOUT,
+                exit_code=None,
+                stderr="command timed out",
+                argv=list(argv),
+            )
+        except BaseException:
+            # Covers cancellation and any failure raised by the caller's callback.
+            await self._abandon_drain(drain_task, proc)
+            raise
+        return "\n".join(stderr_tail)
+
+    @staticmethod
+    async def _abandon_drain(
+        drain_task: asyncio.Task,
+        proc: asyncio.subprocess.Process,
+    ) -> None:
+        drain_task.cancel()
+        _consume_future_exception(drain_task)
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
 
     async def _exec_streaming(
         self,
@@ -687,12 +770,18 @@ class GAMRunner:
         timeout: Optional[float] = None,
         serialize: bool = False,
         accepted_error_kinds: Sequence[GAMErrorKind] = (),
+        gam_threads: Optional[int] = None,
+        line_callback: Optional[StreamingLineCallback] = None,
     ) -> AsyncIterator[SpooledRunResult]:
         """Stream authenticated GAM stdout to a private ``0600`` file.
 
         The file exists only inside the context and is overwritten then removed on success,
         command failure, consumer failure, or cancellation.  This path is for large exports that
         should not be retained as a bytes object and decoded on the event loop.
+
+        ``gam_threads`` sets GAM's worker concurrency for this command instead of inheriting
+        the conservative global default from ``gam.cfg``.  ``line_callback`` receives stderr
+        lines as they arrive, which is how a multi-hour export reports progress.
         """
         command = list(argv)
         command_timeout = timeout or self.timeout
@@ -717,7 +806,12 @@ class GAMRunner:
                     failed = False
                     try:
                         result = await self._exec_to_file(
-                            command, cfgdir, command_timeout, spool_path
+                            command,
+                            cfgdir,
+                            command_timeout,
+                            spool_path,
+                            gam_threads=gam_threads,
+                            line_callback=line_callback,
                         )
                         command_error = (
                             GAMError.from_run(

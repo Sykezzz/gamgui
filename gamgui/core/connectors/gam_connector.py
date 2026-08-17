@@ -74,6 +74,11 @@ ONEROSTER_COURSE_SELECTOR_WORKERS = 2
 ONEROSTER_RATE_LIMIT_RETRY_DELAYS = (60.0, 120.0, 300.0)
 ONEROSTER_NATIVE_BATCH_WORKERS = 10
 ONEROSTER_NATIVE_BATCH_TIMEOUT = 86400.0
+# The bulk roster read is read-only, and no observed rate limiting has come from read
+# phases (only from the write phases), so it can carry more concurrency than a write
+# batch. Override to benchmark the scaling curve without editing code.
+ONEROSTER_ROSTER_READ_WORKERS = 20
+ONEROSTER_ROSTER_READ_WORKERS_ENV = "GAMGUI_ONEROSTER_ROSTER_READ_WORKERS"
 
 ClassroomBatchCommandSink = Callable[[Sequence[str]], None]
 ClassroomBatchCommandSource = Union[
@@ -139,10 +144,49 @@ NativeClassroomBatchProgressCallback = Callable[
     Optional[Awaitable[None]],
 ]
 
+# Receives (processed, total) as the bulk roster read advances.
+RosterReadProgressCallback = Callable[[int, int], Optional[Awaitable[None]]]
+
 _NATIVE_BATCH_PROGRESS_PATTERN = re.compile(
     r"(?:^|,)\s*0\s*,\s*Processing item\s+(\d+)\s*/\s*(\d+)\s*$",
     re.IGNORECASE,
 )
+
+# GAM reports bulk-read progress on stderr as a trailing "(processed/total)" counter.
+# Deliberately narrow: it only matches that shape at end of line, so ordinary output
+# containing a slash is never mistaken for progress.
+_ROSTER_READ_PROGRESS_PATTERN = re.compile(r"\((\d+)\s*/\s*(\d+)\)\s*$")
+
+
+def _roster_read_workers() -> int:
+    """Worker count for the bulk roster read, overridable for benchmarking."""
+
+    raw = os.environ.get(ONEROSTER_ROSTER_READ_WORKERS_ENV, "").strip()
+    if not raw:
+        return ONEROSTER_ROSTER_READ_WORKERS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return ONEROSTER_ROSTER_READ_WORKERS
+    if parsed < 1:
+        return ONEROSTER_ROSTER_READ_WORKERS
+    return min(parsed, 1000)
+
+
+def _roster_read_progress(line: str, expected_total: int) -> Optional[Tuple[int, int]]:
+    """Parse a ``(processed/total)`` stderr counter, or ``None`` when absent."""
+
+    match = _ROSTER_READ_PROGRESS_PATTERN.search(line or "")
+    if match is None:
+        return None
+    processed = int(match.group(1))
+    total = int(match.group(2))
+    if total <= 0 or processed < 0 or processed > total:
+        return None
+    if expected_total > 0 and total != expected_total:
+        # A counter for some other unit of work; ignore rather than report a wrong total.
+        return None
+    return processed, total
 
 
 def _parse_signature(text: str) -> str:
@@ -1296,8 +1340,14 @@ class GAMConnector(Connector):
         self,
         course_ids: Sequence[str],
         role: str = "all",
+        *,
+        progress_callback: Optional[RosterReadProgressCallback] = None,
     ) -> CourseRosterSnapshot:
-        """Read an exact course-roster set in one streamed GAM process."""
+        """Read an exact course-roster set in one streamed GAM process.
+
+        ``progress_callback`` receives ``(processed, total)`` as GAM reports it. Without it
+        this read is silent for its entire duration, which for a full tenant is hours.
+        """
 
         selected = list(
             dict.fromkeys(
@@ -1334,6 +1384,23 @@ class GAMConnector(Connector):
                     2.0 * len(selected),
                 ),
             )
+            expected_total = len(selected)
+            reported = 0
+
+            async def observe_progress(_stream_name: str, line: str) -> None:
+                nonlocal reported
+                progress = _roster_read_progress(line, expected_total)
+                if progress is None:
+                    return
+                processed, total = progress
+                if processed <= reported:
+                    return
+                reported = processed
+                if progress_callback is not None:
+                    callback_result = progress_callback(processed, total)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+
             async with self.runner.run_authenticated_to_file(
                 self.domain,
                 GAMCommands.print_course_participants_file(
@@ -1342,6 +1409,8 @@ class GAMConnector(Connector):
                 ),
                 timeout=timeout,
                 serialize=True,
+                gam_threads=_roster_read_workers(),
+                line_callback=observe_progress,
             ) as result:
                 participants = await _parse_private_spool_off_loop(
                     _read_oneroster_participants_spool,

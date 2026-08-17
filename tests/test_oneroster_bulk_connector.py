@@ -615,3 +615,46 @@ async def test_oneroster_bulk_parse_failure_cleans_private_spool(
 
     assert len(runner.calls) == 1
     assert all(not path.exists() for path in runner.paths)
+
+
+async def test_roster_read_progress_parses_trailing_counter():
+    assert connector_module._roster_read_progress(
+        "Getting all Course Participants (25/9189)", 9189
+    ) == (25, 9189)
+
+
+async def test_roster_read_progress_ignores_counter_for_other_work():
+    """A counter whose total is not the requested course count is a different unit of work."""
+    assert connector_module._roster_read_progress("Processing (3/40)", 9189) is None
+
+
+async def test_roster_read_progress_ignores_incidental_slashes():
+    for line in (
+        "Reading /var/spool/some/path",
+        "Course 12/34 name",
+        "",
+    ):
+        assert connector_module._roster_read_progress(line, 9189) is None
+
+
+async def test_roster_read_progress_rejects_overrun_counter():
+    assert connector_module._roster_read_progress("Getting (12/9)", 0) is None
+
+
+async def test_roster_read_workers_default_and_env_override(monkeypatch):
+    env = connector_module.ONEROSTER_ROSTER_READ_WORKERS_ENV
+    default = connector_module.ONEROSTER_ROSTER_READ_WORKERS
+
+    monkeypatch.delenv(env, raising=False)
+    assert connector_module._roster_read_workers() == default
+
+    monkeypatch.setenv(env, "35")
+    assert connector_module._roster_read_workers() == 35
+
+    # Nonsense and out-of-range values fall back rather than breaking the read.
+    for bad in ("bogus", "0", "-4", ""):
+        monkeypatch.setenv(env, bad)
+        assert connector_module._roster_read_workers() == default
+
+    monkeypatch.setenv(env, "99999")
+    assert connector_module._roster_read_workers() == 1000

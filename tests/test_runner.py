@@ -204,11 +204,11 @@ async def test_token_persistence_failure_never_masks_runner_exception(
         timeout=15,
     )
 
-    async def buffered_failure(_argv, cfgdir, _timeout):
+    async def buffered_failure(_argv, cfgdir, _timeout, **_kwargs):
         (cfgdir / "oauth2.txt").write_text("refreshed-sensitive-token", encoding="utf-8")
         raise TypeError("runner programming defect")
 
-    async def streamed_failure(_argv, cfgdir, _timeout, _stdout_path):
+    async def streamed_failure(_argv, cfgdir, _timeout, _stdout_path, **_kwargs):
         (cfgdir / "oauth2.txt").write_text("refreshed-sensitive-token", encoding="utf-8")
         raise TypeError("runner programming defect")
 
@@ -651,3 +651,91 @@ async def test_runner_refuses_spawn_when_durable_descriptor_validation_fails(
     with pytest.raises(RuntimeError, match="durable lock unavailable"):
         await runner._exec(["version"], tmp_path, 15)
     assert not called
+
+
+async def test_exec_to_file_sets_gam_threads_for_child(vault, tmp_path):
+    """The spool path must honour per-command concurrency, not gam.cfg's global default."""
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = "import os, sys; sys.stdout.write(os.environ.get('GAM_THREADS', 'unset'))"
+    spool = tmp_path / "threads.tmp"
+
+    result = await runner._exec_to_file(
+        ["-c", script],
+        tmp_path,
+        15.0,
+        spool,
+        gam_threads=20,
+    )
+
+    assert result.returncode == 0
+    assert spool.read_text(encoding="utf-8").strip() == "20"
+
+
+async def test_exec_to_file_streams_stderr_lines_to_callback(vault, tmp_path):
+    """Progress must be observable while stdout still goes straight to the spool file."""
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = (
+        "import sys\n"
+        "print('payload-line')\n"
+        "for n in (1, 2, 3):\n"
+        "    print('Getting participants (%d/3)' % n, file=sys.stderr, flush=True)\n"
+    )
+    spool = tmp_path / "streamed.tmp"
+    seen: list[tuple[str, str]] = []
+
+    async def observe(stream_name: str, line: str) -> None:
+        seen.append((stream_name, line))
+
+    result = await runner._exec_to_file(
+        ["-c", script],
+        tmp_path,
+        15.0,
+        spool,
+        line_callback=observe,
+    )
+
+    assert result.returncode == 0
+    # stdout is untouched by the callback path.
+    assert spool.read_text(encoding="utf-8").strip() == "payload-line"
+    assert {name for name, _ in seen} == {"stderr"}
+    assert [line for _, line in seen] == [
+        "Getting participants (1/3)",
+        "Getting participants (2/3)",
+        "Getting participants (3/3)",
+    ]
+
+
+async def test_exec_to_file_without_callback_keeps_buffered_stderr(vault, tmp_path):
+    """Opting out must leave the original buffered behaviour exactly as it was."""
+    runner = GAMRunner(
+        vault=vault,
+        gam_binary=Path(sys.executable),
+        base_dir=tmp_path,
+        timeout=15,
+    )
+    script = (
+        "import sys\n"
+        "print('first', file=sys.stderr)\n"
+        "print('second', file=sys.stderr)\n"
+    )
+    spool = tmp_path / "buffered.tmp"
+
+    result = await runner._exec_to_file(
+        ["-c", script],
+        tmp_path,
+        15.0,
+        spool,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr.splitlines() == ["first", "second"]
