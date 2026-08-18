@@ -53,7 +53,7 @@ def update_versioned_sources(root: Path, version: str) -> None:
         rf"\g<1>{version}\g<2>",
     )
     _replace_once(
-        readme,
+        root / "docs" / "district-operations.md",
         r"(The tested pin is currently \*\*GAM )[0-9.]+(\*\*)",
         rf"\g<1>{version}\g<2>",
     )

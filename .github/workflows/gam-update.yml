@@ -99,8 +99,8 @@ jobs:
           EXISTING_PR: ${{ steps.branch.outputs.pr }}
         run: |
           PR="$EXISTING_PR"
-          git add README.md scripts/fetch_gam.sh scripts/gam_checksums.txt \
-            scripts/bump_gam.py gamgui/core/gam/commands.py \
+          git add README.md docs/district-operations.md scripts/fetch_gam.sh \
+            scripts/gam_checksums.txt scripts/bump_gam.py gamgui/core/gam/commands.py \
             gamgui/resources/gam7/VERSION gamgui/resources/gam7/command_catalog.json \
             tests/fixtures/mock_gam.sh tests/test_acceptance_privacy.py tests/test_bump_gam.py
           if ! git diff --cached --quiet; then

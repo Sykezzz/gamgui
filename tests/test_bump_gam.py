@@ -78,7 +78,11 @@ def test_update_versioned_sources_changes_every_contract(tmp_path):
     _write(
         tmp_path,
         "README.md",
-        "fetches the pinned version (`v1.2.3`) from releases.\n"
+        "fetches the pinned version (`v1.2.3`) from releases.\n",
+    )
+    _write(
+        tmp_path,
+        "docs/district-operations.md",
         "The tested pin is currently **GAM 1.2.3**.\n",
     )
 
@@ -89,8 +93,8 @@ def test_update_versioned_sources_changes_every_contract(tmp_path):
     assert "GAM 2.3.4 - mock" in (tmp_path / "tests/fixtures/mock_gam.sh").read_text()
     readme = (tmp_path / "README.md").read_text()
     assert "`v2.3.4`" in readme
-    assert "**GAM 2.3.4**" in readme
-
+    district_ops = (tmp_path / "docs/district-operations.md").read_text()
+    assert "**GAM 2.3.4**" in district_ops
 
 def test_update_versioned_sources_fails_when_marker_drifts(tmp_path):
     _write(tmp_path, "gamgui/core/gam/commands.py", "missing\n")
