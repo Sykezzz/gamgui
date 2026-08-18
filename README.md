@@ -1,6 +1,12 @@
 
 # GamGUI
 
+[![CI](https://github.com/Sykezzz/gamgui/actions/workflows/ci.yml/badge.svg?branch=district-main)](https://github.com/Sykezzz/gamgui/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Sykezzz/gamgui/actions/workflows/codeql.yml/badge.svg?branch=district-main)](https://github.com/Sykezzz/gamgui/actions/workflows/codeql.yml)
+[![Post-merge validation](https://github.com/Sykezzz/gamgui/actions/workflows/post-merge-validation.yml/badge.svg?branch=district-main)](https://github.com/Sykezzz/gamgui/actions/workflows/post-merge-validation.yml)
+[![Upstream sync](https://github.com/Sykezzz/gamgui/actions/workflows/upstream-sync.yml/badge.svg?branch=district-main)](https://github.com/Sykezzz/gamgui/actions/workflows/upstream-sync.yml)
+[![Windows prerelease](https://github.com/Sykezzz/gamgui/actions/workflows/windows-prerelease.yml/badge.svg?branch=district-main)](https://github.com/Sykezzz/gamgui/actions/workflows/windows-prerelease.yml)
+
 A free, local, open-source **macOS and Windows GUI for [GAM7](https://github.com/GAM-team/GAM)** — administer
 Google Workspace (users, groups, signatures, delegates, vacation responders, reports, and more)
 without memorizing CLI commands, with credentials kept in the operating system's user credential
@@ -19,21 +25,33 @@ then uncomment these to show them here:
 ![Offboarding](docs/screenshots/lifecycle.png)
 -->
 
-## District change-control gate
+## About This Fork
 
-Local source review, offline tests, documentation, and app builds do not contact Google and can be
-done without a live-change approval. **Stop and obtain recorded administrator sign-off before any
-live Google-side authorization, OAuth or Domain-Wide Delegation scope/policy change, updater
-canary, pilot, or mutation.** The approval must identify the Workspace tenant, the delegated canary
-subject (when applicable), the exact scopes or operation, the target set, and the approved window.
-A read-only canary is still a live Google-side action and is included in this gate.
+This repository began as a fork of [goetchstone/gamgui](https://github.com/goetchstone/gamgui), a
+free macOS GUI for GAM7. My district-focused branch adds and maintains:
 
-For an installed app, sign-off may explicitly authorize the four-probe read-only canary for manual
-acceptance or a user-initiated verified-file update. The automatic startup updater does not run that
-canary or read Workspace credentials. Without that standing approval, do not complete the canary
-configuration or initiate a verified-file update. An approval for setup or canary reads does not
-authorize Classroom roster changes, Drive ownership/sharing changes, or any other mutation; obtain a
-separate mutation or bounded-pilot approval.
+- Windows packaging, installation, updates, and rollback
+- Google Classroom administration and roster reconciliation
+- OneRoster ingestion, planning, manifests, gates, and recovery
+- District-scale indexing and bounded execution controls
+- Drive administration and ownership workflows
+- Expanded auditing, activity tracking, security controls, and CI
+
+See [MY-CONTRIBUTIONS.md](MY-CONTRIBUTIONS.md) for the full breakdown of what's upstream versus
+what I built, and [DEVELOPMENT-PROCESS.md](DEVELOPMENT-PROCESS.md) for how changes (including
+AI-assisted ones) get reviewed, tested, and authorized before touching a live tenant.
+
+## Why this fork exists
+
+- **171 commits ahead of upstream**, including a Windows platform (packaging, installer, updater)
+  that did not exist before.
+- **First-party OneRoster Import Studio** for district-scale (~25,000 user) Classroom provisioning,
+  with immutable manifests, additions-only planning, and a student-enrollment release gate.
+- **Every destructive action is guarded and audited** — preview → typed confirmation → audit log —
+  with a documented, evidence-based [live verification status](docs/live-verification.md) per
+  operation rather than a blanket "trust the tests" claim.
+- **A fail-closed cross-platform local updater** with exact-SHA promotion gates, a checksum-pinned
+  GAM binary, and automatic rollback on a failed activation health check.
 
 ## Status
 
@@ -77,33 +95,11 @@ You build and run it yourself; it is not yet notarized for distribution to other
 > account delete, calendar/event delete, data transfer, the offboarding routine, and bulk operations
 > all run behind a *preview → typed confirmation → audit-logged* path. That guard is well covered by
 > tests; what tests cannot prove is that a given GAM command behaves as expected against a real
-> tenant. See [Live verification status](#live-verification-status) for which writes have been
+> tenant. See [Live verification status](docs/live-verification.md) for which writes have been
 > confirmed against a production domain and which have not — and run anything in the second list
 > once on a **throwaway user/event/calendar** before you rely on it. Account deletion is reversible
 > only within Google's ~20-day window. GamGUI is provided **as-is under the MIT License, with no
 > warranty — use at your own risk**; you are responsible for what you run against your own tenant.
-
-### Live verification status
-
-Every write is audited, so this list is derived from real audit logs rather than memory. "Confirmed
-live" means the operation has succeeded at least once against a production Google Workspace domain.
-
-**Confirmed live:** calendar share (ACL) · calendar auto-subscribe (making a shared calendar appear
-in someone's sidebar) · add calendar event · delete calendar · add delegate · remove group member ·
-reset password · set organization fields · set signature · set vacation · transfer data · plus all
-reads (a read-only pass over the parsers ships as `scripts/acceptance.py`).
-
-**Not yet confirmed live** — treat as unproven and test on a throwaway target first: unshare a
-calendar (remove ACL) · remove delegate · clear vacation · add group member · sign out everywhere ·
-delete event · delete user · the group fan-out of a calendar share (the individual calls it makes —
-ACL add and subscribe — are each confirmed live, but the group expansion itself is not) · and the two
-offboarding repairs described below.
-
-**Known-good repairs awaiting live re-run.** Two offboarding bugs were found in real audit logs and
-fixed, but the fixes have not themselves been exercised live yet: Drive and calendar are now
-transferred in a *single* data-transfer call (two separate calls collided with a `409 conflict`),
-and "remove from everyone's calendars" now tolerates the `cannotChangeOwnAcl` error that used to
-abort the sweep.
 
 ## Design goals
 
@@ -133,104 +129,6 @@ Wrapped in a `pywebview` native window (WKWebView). See [CONTRIBUTING.md](CONTRI
 layout and conventions, and [docs/builder-commands.md](docs/builder-commands.md) for the Builder
 catalog.
 
-## Performance and local-index behavior
-
-GamGUI avoids putting full-tenant payloads into ordinary pages:
-
-- The user/group directory index is a persistent, domain-isolated SQLite snapshot containing only
-  list/search fields. The first request builds the required snapshot; after 15 minutes it serves
-  the existing snapshot while one background refresh runs. User detail remains a live exact lookup.
-- The Classroom course index is also domain-isolated and persistent. Course pages search locally,
-  return at most 50 rows, and schedule one background refresh when the 15-minute snapshot is stale.
-  Course details, owners, and rosters are re-read live before a change.
-- Drive does not cache a tenant-wide content listing. It queries one delegated user with narrow
-  fields and cursor pagination, capped at 50 files per page.
-- Directory and Classroom list pages are capped at 50. Builder pickers show at most 25 matches.
-  A selected report finding returns at most 50 users. The audit page defaults to 25 entries and
-  cannot request more than 50.
-- Report summaries aggregate directly in SQLite. The audit index advances from the last indexed
-  JSONL byte rather than re-reading the complete audit log on every page.
-
-Indexes are derived local data, not credentials, but they can contain district identifiers. Keep
-the app-data directory and backups owner-only. Deleting a directory or Classroom index is
-recoverable—the next refresh rebuilds it from Google—but deleting the append-only audit JSONL is
-not.
-
-## Classroom and Drive administration
-
-### Classroom
-
-Classroom search is local and paginated; selection loads live detail and roster data. GamGUI can
-create a course in `PROVISIONED`, edit writable course metadata, activate a provisioned course,
-archive/reactivate an active course, transfer ownership to a verified active internal user, and
-add/remove teachers or students. Direct enrollment is restricted to the connected domain.
-
-Bulk roster input accepts pasted text or CSV, computes an exact add/remove diff, and persists a
-restart-safe manifest. Apply re-reads the live roster and refuses a stale preview. A preview cannot
-be reused; removals require typing the exact course ID. Owner transfer requires both the exact
-course ID and exact destination email. The course owner cannot be removed from the teacher roster.
-
-Classroom Teacher Access is a separate Classroom page for the domain's existing special Classroom
-Teachers group. Its live directory pickers can combine multiple AD/GCDS-synchronized Google groups
-with active users from one or more organizational units, including child OUs. CSV remains an
-explicit alternative source. Every source or exception change creates a fresh exact preview;
-source membership is re-read before apply, and scheduled runs hold on drift or safety thresholds.
-
-### Drive
-
-Drive search is scoped to one delegated user and their owned, non-trashed My Drive files. GamGUI can
-show narrow metadata and permissions, edit metadata, add/update/remove eligible internal-user or
-internal-group permissions, preview supported content, and transfer ownership after a live
-capability/owner check. Owner and inherited permissions are not editable here.
-
-Single-file and recursive ownership transfers require the exact destination email. Recursive
-folder transfers and Classroom ownership claims create persistent exact-file manifests, process
-targets serially, and retain per-file status for retry/review. Shared Drive content is
-organization-owned and is never transferred or claimed by these workflows.
-
-### Optional OneRoster component
-
-OneRoster Import Studio is a first-party optional application profile. The `core` profile keeps
-all ordinary Classroom and Drive administration but omits the OneRoster executable package,
-templates, and migrations. The `classroom-oneroster` profile adds validated OneRoster ZIP
-ingestion, import thresholds, immutable district manifests, and the student-enrollment release
-gate. Each retained import also has a local class-naming step with common schemes and a safe custom
-template using `{course_title}`, `{class_code}`, `{class_title}`, and `{school_year}`. Naming
-changes rebuild the bounded preview and GAM-ready exports without changing stable `Section_`
-aliases or contacting Google.
-
-New installations offer the component during first-run setup. It can also be installed, disabled,
-enabled, or removed from **Settings → Components**. Installing or removing it stages a complete
-matching GamGUI bundle and activates it on restart; GamGUI never loads downloaded Python from
-Application Support. Component discovery and installation do not contact Google or read Workspace
-credentials.
-
-Removing the component preserves its protected audit and import state. Raw and normalized
-OneRoster snapshots retain their 30-day expiry and are purged by Core. Permanent local data removal
-is a separate typed-confirmation action.
-
-See [Classroom OneRoster guided operations](docs/classroom-oneroster.md) for the guided flow,
-verified-step Monitoring behavior, heartbeat escalation, safe pause, Recovery, sanitized receipts,
-and the cross-platform exact-SHA update boundary.
-
-### Enforced bounds and confirmation rules
-
-| Surface | Enforced bound or confirmation |
-| --- | --- |
-| Directory, Classroom, and Drive pages | Maximum 50 results per page |
-| Builder target picker / sequence | 25 picker matches; 25 command steps |
-| Report detail / audit | 50 report rows; 25 audit rows by default and 50 maximum |
-| Classroom roster upload | 1,000,000 bytes maximum |
-| Classroom roster reconciliation | 200 total adds plus removals per preview |
-| OneRoster live planning | 50,000 classes, 300,000 active source enrollments, and 300,000 resulting actions; larger valid snapshots remain inspectable/exportable |
-| OneRoster live roster snapshot | 500,000 deduplicated Classroom memberships |
-| Drive content preview | 10 MiB maximum and only the supported safe MIME types |
-| Drive folder/claim manifest | 500 exact files maximum |
-| Generic action guard | Bulk starts at 10 targets; destructive bulk requires typed confirmation; over 200 is an explicit warning threshold, not an automatic refusal |
-
-These controls reduce blast radius; they do not replace administrator approval, a reviewed target
-list, a small pilot, or post-change verification.
-
 ## Security model
 
 GAM stores credentials as plaintext files (`client_secrets.json`, `oauth2.txt`,
@@ -258,63 +156,6 @@ Beyond the credentials themselves:
 - **The vendored `gam` binary is checksum-pinned and verified fail-closed.** A release asset with no
   committed pin is refused rather than installed, since a swapped binary would inherit
   domain-wide impersonation.
-
-## District setup and acceptance runbook
-
-This is the handoff order for a new administrator. Do not skip the approval checkpoints.
-
-1. **Prepare locally.** Install Python, clone the repository, run `make setup`, vendor the pinned
-   GAM build with `make gam`, and run `make test`. These steps need no tenant credentials.
-2. **Record setup approval.** Before opening a Google authorization page, get administrator
-   sign-off for the tenant, super-admin/canary subject, GAM OAuth setup, and the exact feature scopes
-   below. Decide whether the approval covers recurring read-only updater canaries.
-3. **Run setup.** In the Setup screen, either import an existing GAM credential directory or use
-   the fresh flow. The fresh flow provides these GAM7 commands in this order:
-
-   ```bash
-   gam create project <super-admin-email>
-   gam oauth create
-   gam create svcacct
-   ```
-
-   Use the commands rendered by the app so the bundled binary path and private `GAMCFGDIR` are
-   correct. GamGUI imports the resulting credentials into Keychain.
-4. **Authorize Domain-Wide Delegation.** Preserve the scopes already created by GAM. Add exactly
-   these district feature scopes—do not replace the existing list with only these six:
-
-   ```text
-   https://www.googleapis.com/auth/admin.directory.user.readonly
-   https://www.googleapis.com/auth/classroom.courses
-   https://www.googleapis.com/auth/classroom.rosters
-   https://www.googleapis.com/auth/classroom.profile.emails
-   https://www.googleapis.com/auth/admin.directory.group.readonly
-   https://www.googleapis.com/auth/drive
-   ```
-
-   The setup screen renders the same comma-separated value and the service-account client ID.
-   Changing these scopes or any Admin Console policy requires the recorded sign-off from step 2.
-5. **Verify setup.** Click **Verify access**. GamGUI first verifies GAM's existing service-account
-   authorization, then checks those six feature scopes. A passing verification activates the
-   connector and stores the approved canary subject locally for manual acceptance or a
-   user-initiated verified-file update.
-6. **Approve and run the live acceptance pass.** A live canary requires explicit sign-off even
-   though it is read-only:
-
-   ```bash
-   .venv/bin/python scripts/acceptance.py
-   ```
-
-   The fixed denominator is one exact user read with two projected fields, one Directory group page
-   with `maxResults=1`, one Classroom course page with `pageSize=1`, and one Drive file page with
-   `page_size=1`, plus a local GAM-version check. Output contains only fixed check names,
-   PASS/FAIL, and elapsed milliseconds. Persisted canary evidence contains only check names,
-   booleans, timings, and a timestamp—never tenant identifiers, full records, resource IDs, tokens,
-   or exception text. Exit codes are `0` pass, `1` failed check, and `2` missing/incomplete canary
-   setup.
-7. **Approve a bounded pilot before mutations.** Use throwaway or specifically approved targets,
-   start add-only where possible, review the exact preview/manifest, stay below the documented
-   caps, and verify Google-side results before expanding. Setup or canary approval alone is not
-   mutation approval.
 
 ## Build from source
 
@@ -418,163 +259,31 @@ actions doesn't re-prompt; tune with `GAMGUI_SECRET_CACHE_TTL` (seconds; `0` dis
 On macOS, refreshed OAuth data updates the existing Keychain item in place so its per-item
 **Always Allow** authorization survives token refreshes.
 
-### District branch topology
+## Before you point this at a live tenant
 
-| Branch | Purpose |
-| --- | --- |
-| `main` | A no-force mirror of upstream `goetchstone/gamgui:main`. Do not land district-only code or deploy from this branch. |
-| `district-main` | The protected default and deployment branch. It contains upstream plus the district upgrade and is the only branch the installed updater follows. |
+Building, testing, and local development never touch Google and need no approval. **Before any
+live Google-side authorization, OAuth/Domain-Wide Delegation change, updater canary, or mutation
+against a real domain, read [docs/change-control.md](docs/change-control.md)** — it covers the
+required administrator sign-off, the district setup and acceptance runbook, and the approval
+checkpoints in order. Skipping it is how you end up authorizing scopes or running a canary without
+the recorded sign-off this project expects.
 
-`.github/workflows/upstream-sync.yml` advances the local `main` mirror, creates a temporary
-integration branch from `district-main`, merges `main` there, and opens a PR back to
-`district-main`. A conflict opens/updates an issue and leaves `district-main` unchanged. Upstream
-sync and GAM-pin maintenance share the `district-maintenance` concurrency group, so those writers
-run serially.
+## Detailed operations reference
 
-CI runs on integration PRs. A push to `district-main` dispatches post-merge validation for the exact
-40-character commit SHA. That workflow rejects a moving/mismatched branch, runs Linux, macOS, and
-Windows tests on Python 3.10/3.12/3.14, checks GAM contracts, and builds/self-tests both profiles on
-macOS and Windows. Windows validation uses an ephemeral runner certificate and labels its bundles
-validation-only. It publishes `update-ready` only when every platform gate passes. A green PR check
-alone is not local-update evidence; the updater requires `update-ready` on the exact current
-`district-main` SHA.
+The sections above are the overview; the following documents carry the depth:
 
-### Staying current with GAM (and not breaking on updates)
-
-GamGUI pins a tested GAM7 version — `EXPECTED_GAM_VERSION` in `gamgui/core/gam/commands.py`, matched by
-`scripts/fetch_gam.sh`. The tested pin is currently **GAM 7.47.06**. The running app never downloads
-or substitutes an unpinned GAM binary:
-
-- **Automated pin PR** (`.github/workflows/gam-update.yml`) compares the latest GAM release with the
-  pin, runs `scripts/bump_gam.py`, downloads both supported macOS assets using GitHub-published
-  SHA-256 metadata, regenerates the catalog/version contracts, runs focused tests, and opens an
-  auto-merge PR to `district-main`. Branch protection and exact-SHA post-merge validation still
-  gate deployment.
-- **Compatibility checks** assert every GAM sub-command our builders use still exists in the
-  vendored command reference. Post-merge validation checks both the pin and current latest release,
-  so a renamed/removed command fails before an installed app can see `update-ready`.
-- **Runtime self-check** — if the running `gam` differs from the tested version (e.g. a
-  `GAMGUI_GAM_BINARY` override), the setup screen shows a soft warning. It never blocks.
-
-**To perform or reproduce a GAM bump manually:**
-
-1. Run `python3 scripts/bump_gam.py --tag vX.Y.Z`. It fails closed unless signed release metadata
-   contains SHA-256 digests for both supported macOS architectures, then updates the checksum
-   catalog, version constants, mock, README marker, vendored reference, and command catalog.
-2. Review the diff and `gamgui/resources/gam7/GamUpdate.txt` for behavior or scope changes.
-3. Run `pytest -q tests/test_command_contract.py tests/test_bump_gam.py`, then `make test`.
-4. After separate administrator sign-off for a live canary, run
-   `.venv/bin/python scripts/acceptance.py`.
-5. Open the scoped PR to `district-main`; do not bypass protected-branch CI or exact-SHA post-merge
-   validation.
-
-### Fail-closed cross-platform local updater
-
-The updater runs only from an installed macOS `GamGUI.app` or Windows
-`%LOCALAPPDATA%\Programs\GamGUI\current`; a source checkout or headless development server does not
-self-update.
-
-1. At app startup, a background worker checks the head of `district-main`. It defers while an
-   administrative job or Classroom/Drive manifest is active.
-2. It accepts only a new, non-blocklisted 40-character SHA whose completed check runs include a
-   successful `update-ready` for that same SHA.
-3. It clones and checks out that exact SHA detached, requires exactly `uv 0.11.7`, synchronizes the
-   committed frozen lock, fetches checksum-pinned GAM, and builds the selected profile. Windows uses
-   the bundled, version-checked MinGit and uv toolchain; macOS uses its existing local builder. It
-   never falls back from `classroom-oneroster` to `core`. It requires the pinned local `GamGUI Local`
-   signing identity, verifies the signature and complete bundle manifest, and runs the offline
-   self-test.
-4. Exact-SHA CI, the sealed artifact identity, local signing verification, and the bundled offline
-   self-test establish automatic-update readiness. The automatic startup path does not run the live
-   Workspace canary or read operating-system credentials.
-5. A passing build is staged while the current app keeps running. On the next launch, a native
-   dialog explains the restart and lets the administrator install now or defer. If accepted, a
-   helper snapshots the current app and all local SQLite databases, tests schema preparation on a
-   copy, swaps the bundle, and obtains a startup health marker from a hidden verification window
-   within 45 seconds before reopening the normal app. Windows uses a per-user named mutex and a
-   detached helper so no process inside `current` replaces itself.
-6. If the helper's migration-copy self-test, bundle swap, or startup health check fails, it restores
-   the prior app and database snapshot, relaunches the old app, and blocklists that SHA. Successful
-   activation keeps at most two rollback backups, and backups older than 30 days are pruned.
-
-Network, toolchain, signing, or self-test preparation failures leave the installed version untouched
-and are retryable; they do not blocklist the SHA. The app shows only a generic local notice, not
-paths, commands, or tenant data. A user-initiated verified-file update separately runs the four
-bounded, read-only canary probes in a disposable app-data directory and requires prior administrator
-approval for the configured canary subject. The updater never changes OAuth/DWD scopes, Admin Console
-policy, or tenant data, and it never treats a missing/failed required canary as approval to proceed.
-
-After `update-ready` advances, verify an actual computer separately. On Windows, inspect
-`%LOCALAPPDATA%\GamGUI\updates\state.json` and `%LOCALAPPDATA%\Programs\GamGUI\current.artifact.json`,
-run `GamGUI.exe --self-test --json`, confirm `gam.exe version`, and use `Get-AuthenticodeSignature`
-plus the pinned signer SHA-256. On macOS, inspect the corresponding Application Support state and
-artifact receipt, run the bundle self-test and bundled GAM version, and verify `codesign`. In both
-cases the installed source SHA, profile, component digest, architecture, GAM version, signature,
-self-test, runtime health, and preserved application data must agree before calling the machine
-updated.
-
-### Tests & CI
-
-`pytest` is fully offline (mock GAM + in-memory secret store). CI runs it on Ubuntu, macOS, and
-Windows across Python 3.10, 3.12, and 3.14 — see
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-
-**Static analysis.** CodeQL runs on every push and PR to `main`, plus weekly, over both the Python
-code and the workflows themselves — configured in-tree so it is reviewable rather than hidden in
-repository settings: [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) with
-[`.github/codeql/codeql-config.yml`](.github/codeql/codeql-config.yml). It uses the broader
-`security-extended` suite, and skips `tests/`, the vendored GAM release, and vendored browser
-libraries — the config explains why for each.
-
-## Email signatures
-
-The **Signatures** screen designs one HTML signature with variables, previews it rendered for a real
-person, and applies it in bulk — scoped to a single user (for testing), a group, an org unit, a
-department, a location, or the whole company. Each user's current signature is also shown *rendered*
-on their detail page.
-
-**Template variables** (filled per user from the directory):
-`{name}` `{first}` `{last}` `{email}` `{title}` (`{role}` is an alias) `{phone}` `{department}`
-`{location}` `{ou}`. Wrap a fragment in `[[ … ]]` to drop it when a variable inside is empty — e.g.
-`[[{title} · ]]` vanishes for people with no title, so one template can roll out before every profile
-is filled in.
-
-### Hosting signature images (logo, social icons)
-
-Gmail does **not** allow inline/base64 images or Google Drive links in signatures — every image must
-be a file at a **public HTTPS URL**. GamGUI is a local app and doesn't host images itself; you point
-the template's `<img src="…">` at wherever you host them. Whatever host you choose, the URL must be:
-
-- **HTTPS** and **anonymously reachable** — Gmail fetches images through its own proxy (no
-  cookies/referer) and caches them. Test a URL in a private/incognito window; if it loads there,
-  Gmail can fetch it.
-- served with the correct **`Content-Type`** (`image/png`, …) and **no hotlink/referer protection**
-  — referer-based protection is the usual cause of "the logo shows for me but not for recipients."
-- **versioned by filename** when an image changes (`logo-2026.png`) — Gmail caches by URL, so
-  overwriting the same name can keep serving the old one.
-
-Size icons ~2× their display size and set explicit `width`/`height` on each `<img>`.
-
-**Where to host — pick one:**
-
-- **A web host you already have (simplest).** Drop the files in a public folder, e.g.
-  `https://yourdomain.com/email/logo.png`. Done.
-- **Google Cloud Storage** (Google-native; reuse the GCP project GAM created). Requires a **billing
-  account** linked to the project — but small signature assets fall under the Always-Free tier, so
-  the bill rounds to **$0**:
-  1. Cloud Console → **Billing** → link a billing account to the project (if not already).
-  2. **Cloud Storage → Create bucket** — globally-unique name, a US region, Standard class, Uniform
-     bucket-level access.
-  3. Make objects public: bucket **Permissions → Grant access → principal `allUsers` → role
-     `Storage Object Viewer`**. (If your org enforces *Public access prevention*, allow it on this
-     bucket.)
-  4. Upload the images.
-  5. Reference them at `https://storage.googleapis.com/<bucket>/<path>/logo.png`.
-  (Pricing changes — confirm the current free-tier limits, but for a handful of small PNGs it is
-  effectively free.)
-- **GitHub + jsDelivr (free, no billing).** Commit the images to a public repo and serve them via the
-  jsDelivr CDN: `https://cdn.jsdelivr.net/gh/<user>/<repo>@<branch>/path/logo.png`. CDN-fast, no card.
-- **Cloudflare R2 / Amazon S3** — or any public-object store — also work.
+- [docs/change-control.md](docs/change-control.md) — district change-control gate and the full
+  setup/acceptance runbook.
+- [docs/live-verification.md](docs/live-verification.md) — which mutations are confirmed live
+  against a production tenant versus still unproven.
+- [docs/district-operations.md](docs/district-operations.md) — performance and local-index
+  behavior, Classroom/Drive administration detail, enforced bounds, the district branch topology,
+  staying current with GAM, the fail-closed updater's internals, tests/CI, and email-signature
+  hosting.
+- [docs/windows-setup.md](docs/windows-setup.md) — Windows setup, SmartScreen, GPO, and recovery.
+- [docs/classroom-oneroster.md](docs/classroom-oneroster.md) — guided OneRoster → Classroom flow.
+- [docs/builder-commands.md](docs/builder-commands.md) — the Command Builder catalog.
+- [docs/drive-integration.md](docs/drive-integration.md) — Drive administration detail.
 
 ## Where this is going
 
