@@ -623,6 +623,26 @@ class PlanningPerformanceReceipt:
     cached_teacher_scopes: int = 0
     cached_student_scopes: int = 0
     audit_courses_requested: int = 0
+    metadata_chunk_count: int = 0
+    teacher_roster_chunk_count: int = 0
+    student_roster_chunk_count: int = 0
+    completed_chunk_count: int = 0
+    retried_chunk_count: int = 0
+    failed_chunk_count: int = 0
+    rate_limit_count: int = 0
+    timeout_retry_count: int = 0
+    incomplete_coverage_count: int = 0
+    latency_regression_count: int = 0
+    largest_metadata_chunk: int = 0
+    largest_roster_chunk: int = 0
+    maximum_observed_read_concurrency: int = 0
+    final_recommended_read_concurrency: int = 1
+    metadata_final_read_concurrency: int = 1
+    teacher_final_read_concurrency: int = 1
+    student_final_read_concurrency: int = 1
+    metadata_chunk_worker_levels: Tuple[int, ...] = ()
+    teacher_roster_chunk_worker_levels: Tuple[int, ...] = ()
+    student_roster_chunk_worker_levels: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

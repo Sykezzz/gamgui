@@ -305,12 +305,12 @@ async def test_sparse_alias_results_are_mapped_without_recursive_gam_calls(
     )
 
 
-async def test_fifty_thousand_missing_aliases_use_one_private_selector_process(
+async def test_one_bounded_missing_alias_chunk_uses_one_private_selector_process(
     tmp_path: Path,
 ):
     runner = AliasLookupRunner(tmp_path, {})
     connector = GAMConnector(runner, "example.org")  # type: ignore[arg-type]
-    aliases = [f"Section_{number}" for number in range(50_000)]
+    aliases = [f"Section_{number}" for number in range(200)]
 
     courses = await connector.list_oneroster_managed_courses(aliases)
 
@@ -318,8 +318,8 @@ async def test_fifty_thousand_missing_aliases_use_one_private_selector_process(
     assert len(runner.calls) == 1
     assert len(runner.selector_values) == 1
     assert runner.selector_values[0][0] == "d:Section_0"
-    assert runner.selector_values[0][-1] == "d:Section_49999"
-    assert len(runner.selector_values[0]) == 50_000
+    assert runner.selector_values[0][-1] == "d:Section_199"
+    assert len(runner.selector_values[0]) == 200
     assert all(not path.exists() for path in runner.selector_paths)
 
 

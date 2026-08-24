@@ -11,15 +11,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 import sqlite3
 import time
 from collections import Counter, defaultdict
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 
 from gamgui.core.classroom.models import CourseRosterSnapshot
+from gamgui.core.connectors.gam_connector import (
+    ONEROSTER_MANAGED_ALIAS_CHUNK_CAP,
+    ONEROSTER_ROSTER_CHUNK_CAP,
+)
 from gamgui.core.gam.errors import GAMError, GAMErrorKind
 
 from .ingest import district_roster_date
@@ -45,6 +50,13 @@ PLANNER_SCHEMA_VERSION = 3
 DIRECTORY_CONCURRENCY = 12
 COURSE_CONCURRENCY = 8
 DEFAULT_AUDIT_SAMPLE_SIZE = 25
+ONEROSTER_READ_MAX_CONCURRENCY = 4
+ONEROSTER_READ_MAX_ATTEMPTS = 3
+ONEROSTER_READ_BACKOFF_BASE_SECONDS = 1.0
+ONEROSTER_READ_BACKOFF_CAP_SECONDS = 8.0
+ONEROSTER_READ_BACKOFF_JITTER_RATIO = 0.25
+ONEROSTER_READ_LATENCY_REGRESSION_FACTOR = 2.0
+ONEROSTER_READ_LATENCY_REGRESSION_FLOOR_SECONDS = 1.0
 # The current planner uses compact in-memory participant/action models. Keep
 # district planning comfortably below the measured memory cliff; larger valid
 # snapshots remain available for inspection and CSV export.
@@ -124,6 +136,109 @@ class _ActionPayload:
     live_evidence: Mapping[str, Any]
 
 
+class _IncompleteReadCoverage(ValueError):
+    """A bounded read returned data that cannot prove its requested scope."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedReadChunk:
+    value: Any
+    duration_seconds: float
+    clean: bool
+
+
+@dataclass(slots=True)
+class _ReadTuner:
+    maximum: int
+    level: int = 1
+    clean_streak: int = 0
+    baseline_seconds: Optional[float] = None
+
+    def penalize(self) -> None:
+        self.level = max(1, self.level - 1)
+        self.clean_streak = 0
+
+    def completed_cleanly(self, duration_seconds: float) -> bool:
+        duration = max(0.0, float(duration_seconds))
+        regressed = bool(
+            self.baseline_seconds is not None
+            and duration
+            > max(
+                ONEROSTER_READ_LATENCY_REGRESSION_FLOOR_SECONDS,
+                self.baseline_seconds * ONEROSTER_READ_LATENCY_REGRESSION_FACTOR,
+            )
+        )
+        if regressed:
+            self.penalize()
+        else:
+            self.clean_streak += 1
+            if self.clean_streak >= 2 and self.level < self.maximum:
+                self.level += 1
+                self.clean_streak = 0
+        self.baseline_seconds = (
+            duration
+            if self.baseline_seconds is None
+            else (self.baseline_seconds * 0.75) + (duration * 0.25)
+        )
+        return regressed
+
+
+@dataclass(slots=True)
+class _ReadPerformance:
+    metadata_chunk_count: int = 0
+    teacher_roster_chunk_count: int = 0
+    student_roster_chunk_count: int = 0
+    completed_chunk_count: int = 0
+    retried_chunk_count: int = 0
+    failed_chunk_count: int = 0
+    rate_limit_count: int = 0
+    timeout_retry_count: int = 0
+    incomplete_coverage_count: int = 0
+    latency_regression_count: int = 0
+    largest_metadata_chunk: int = 0
+    largest_roster_chunk: int = 0
+    active_chunks: int = 0
+    maximum_observed_read_concurrency: int = 0
+    metadata_final_read_concurrency: int = 1
+    teacher_final_read_concurrency: int = 1
+    student_final_read_concurrency: int = 1
+    metadata_chunk_worker_levels: list[int] = field(default_factory=list)
+    teacher_roster_chunk_worker_levels: list[int] = field(default_factory=list)
+    student_roster_chunk_worker_levels: list[int] = field(default_factory=list)
+
+    def scheduled(self, category: str, size: int, worker_level: int) -> None:
+        if category == "metadata":
+            self.metadata_chunk_count += 1
+            self.largest_metadata_chunk = max(self.largest_metadata_chunk, size)
+            self.metadata_chunk_worker_levels.append(worker_level)
+        elif category == "teachers":
+            self.teacher_roster_chunk_count += 1
+            self.largest_roster_chunk = max(self.largest_roster_chunk, size)
+            self.teacher_roster_chunk_worker_levels.append(worker_level)
+        else:
+            self.student_roster_chunk_count += 1
+            self.largest_roster_chunk = max(self.largest_roster_chunk, size)
+            self.student_roster_chunk_worker_levels.append(worker_level)
+
+    def set_final_level(self, category: str, level: int) -> None:
+        if category == "metadata":
+            self.metadata_final_read_concurrency = level
+        elif category == "teachers":
+            self.teacher_final_read_concurrency = level
+        else:
+            self.student_final_read_concurrency = level
+
+    def final_recommendation(self) -> int:
+        levels: list[int] = []
+        if self.metadata_chunk_count:
+            levels.append(self.metadata_final_read_concurrency)
+        if self.teacher_roster_chunk_count:
+            levels.append(self.teacher_final_read_concurrency)
+        if self.student_roster_chunk_count:
+            levels.append(self.student_final_read_concurrency)
+        return min(levels) if levels else 1
+
+
 def planner_configuration_hash(
     *,
     limited_import: bool,
@@ -153,6 +268,12 @@ class OneRosterPlanner:
         directory_concurrency: int = DIRECTORY_CONCURRENCY,
         course_concurrency: int = COURSE_CONCURRENCY,
         audit_sample_size: Optional[int] = None,
+        read_max_concurrency: Optional[int] = None,
+        read_max_attempts: Optional[int] = None,
+        read_backoff_base_seconds: Optional[float] = None,
+        read_backoff_cap_seconds: Optional[float] = None,
+        read_sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        read_jitter: Optional[Callable[[], float]] = None,
     ) -> None:
         self.store = store
         self.connector = connector
@@ -164,6 +285,67 @@ class OneRosterPlanner:
             else audit_sample_size
         )
         self.audit_sample_size = max(0, min(int(configured_audit), 25))
+        configured_read_concurrency = (
+            getattr(
+                connector,
+                "oneroster_read_max_concurrency",
+                ONEROSTER_READ_MAX_CONCURRENCY,
+            )
+            if read_max_concurrency is None
+            else read_max_concurrency
+        )
+        configured_read_attempts = (
+            getattr(
+                connector,
+                "oneroster_read_max_attempts",
+                ONEROSTER_READ_MAX_ATTEMPTS,
+            )
+            if read_max_attempts is None
+            else read_max_attempts
+        )
+        configured_backoff_base = (
+            getattr(
+                connector,
+                "oneroster_read_backoff_base_seconds",
+                ONEROSTER_READ_BACKOFF_BASE_SECONDS,
+            )
+            if read_backoff_base_seconds is None
+            else read_backoff_base_seconds
+        )
+        configured_backoff_cap = (
+            getattr(
+                connector,
+                "oneroster_read_backoff_cap_seconds",
+                ONEROSTER_READ_BACKOFF_CAP_SECONDS,
+            )
+            if read_backoff_cap_seconds is None
+            else read_backoff_cap_seconds
+        )
+        self.read_max_concurrency = max(
+            1,
+            min(int(configured_read_concurrency), ONEROSTER_READ_MAX_CONCURRENCY),
+        )
+        self.read_max_attempts = max(1, min(int(configured_read_attempts), 6))
+        self.read_backoff_base_seconds = max(
+            0.0,
+            min(float(configured_backoff_base), 60.0),
+        )
+        self.read_backoff_cap_seconds = max(
+            self.read_backoff_base_seconds,
+            min(float(configured_backoff_cap), 120.0),
+        )
+        self._read_sleep = read_sleep or getattr(
+            connector,
+            "oneroster_read_sleep",
+            asyncio.sleep,
+        )
+        self._read_jitter = read_jitter or getattr(
+            connector,
+            "oneroster_read_jitter",
+            random.random,
+        )
+        self._read_performance = _ReadPerformance()
+        self._checkpointed_scopes: set[tuple[str, str]] = set()
 
     async def plan(
         self,
@@ -174,6 +356,8 @@ class OneRosterPlanner:
         required_metadata_aliases: Sequence[str] = (),
     ) -> LivePlanningResult:
         planning_started = time.perf_counter()
+        self._read_performance = _ReadPerformance()
+        self._checkpointed_scopes = set()
         snapshot = self.store.refresh_schedule_scope(
             import_id,
             today=district_roster_date(now),
@@ -224,30 +408,34 @@ class OneRosterPlanner:
             or state.metadata_dirty
             or state.recovery_required
         )
-
         async def timed_directory_snapshot() -> tuple[Optional[dict[str, Any]], float]:
             started = time.perf_counter()
             value = await self._read_directory_snapshot()
             return value, time.perf_counter() - started
 
-        async def timed_classroom_snapshot(
-            aliases: Sequence[str],
-        ) -> tuple[Optional[dict[str, Any]], float]:
+        async def timed_bootstrap_snapshot() -> tuple[Optional[dict[str, Any]], float]:
             started = time.perf_counter()
-            value = await self._read_managed_course_snapshot(aliases)
+            value = await self._read_managed_course_snapshot(
+                bootstrap_metadata_aliases
+            )
             return value, time.perf_counter() - started
 
-        if bootstrap_metadata_aliases:
+        bootstrap_read_concurrently = bool(
+            0 < len(bootstrap_metadata_aliases) <= ONEROSTER_MANAGED_ALIAS_CHUNK_CAP
+        )
+        if bootstrap_read_concurrently:
             directory_result, bootstrap_result = await asyncio.gather(
                 timed_directory_snapshot(),
-                timed_classroom_snapshot(bootstrap_metadata_aliases),
+                timed_bootstrap_snapshot(),
             )
-            bootstrap_courses, classroom_snapshot_seconds = bootstrap_result
+            directory_snapshot, directory_snapshot_seconds = directory_result
+            bootstrap_courses, bootstrap_snapshot_seconds = bootstrap_result
         else:
-            directory_result = await timed_directory_snapshot()
+            directory_snapshot, directory_snapshot_seconds = (
+                await timed_directory_snapshot()
+            )
             bootstrap_courses = {}
-            classroom_snapshot_seconds = 0.0
-        directory_snapshot, directory_snapshot_seconds = directory_result
+            bootstrap_snapshot_seconds = 0.0
         resolved, resolution_issues = await self._resolve_directory(
             desired,
             directory_snapshot,
@@ -321,64 +509,106 @@ class OneRosterPlanner:
             if (intent := read_plan.get(alias.casefold())) is not None
             and intent.metadata
         )
-        try:
-            remaining_metadata_aliases = tuple(
-                alias
-                for alias in metadata_aliases
-                if alias.casefold()
-                not in {item.casefold() for item in bootstrap_metadata_aliases}
-            )
-            managed_courses = bootstrap_courses
-            if remaining_metadata_aliases and managed_courses is not None:
-                additional_courses, additional_seconds = (
-                    await timed_classroom_snapshot(remaining_metadata_aliases)
-                )
-                classroom_snapshot_seconds += additional_seconds
-                if additional_courses is None:
-                    managed_courses = None
-                else:
-                    managed_courses = {**managed_courses, **additional_courses}
-            roster_started = time.perf_counter()
-            live_courses = await self._read_live_courses(
-                eligible,
-                managed_courses,
-                directory_snapshot,
-                read_plan=read_plan,
-                managed_states=managed_states,
-                cached_members=cached_members,
-            )
-            live_courses, live_resolution_issues = await self._resolve_live_participants(
-                live_courses,
-                resolved,
-                directory_snapshot,
-            )
-            issues.extend(live_resolution_issues)
-            roster_snapshot_seconds = time.perf_counter() - roster_started
-            self._persist_live_verification(
+        eligible_by_alias = {course.alias.casefold(): course for course in eligible}
+        aliases_by_key = {alias.casefold(): alias for alias in relevant_aliases}
+        known_course_ids: dict[str, str] = {}
+        if bootstrap_read_concurrently and bootstrap_courses is not None:
+            await self._persist_metadata_chunk(
                 import_id,
-                eligible,
-                live_courses,
-                read_plan,
+                bootstrap_metadata_aliases,
+                bootstrap_courses,
+                eligible_by_alias,
+                directory_snapshot,
+                required_metadata_keys,
             )
-        except BaseException:
-            dirty = tuple(
-                ManagedCourseDirty(
-                    alias=alias,
-                    metadata=intent.metadata,
-                    teachers=intent.teachers,
-                    students=intent.students,
-                )
-                for alias, intent in (
-                    (course.alias, read_plan.get(course.alias.casefold()))
-                    for course in eligible
-                )
-                if intent is not None
+            known_course_ids.update(
+                (_text(detail, "id"), key)
+                for key, detail in bootstrap_courses.items()
+                if _text(detail, "id")
             )
-            self.store.mark_managed_course_dirty(
-                dirty,
-                error_code="OR-LIVE-READ-INCOMPLETE",
+
+        async def checkpoint_metadata(
+            chunk: tuple[str, ...],
+            indexed: Mapping[str, Any],
+        ) -> Mapping[str, Any]:
+            for key, detail in indexed.items():
+                course_id = _text(detail, "id")
+                previous_key = known_course_ids.get(course_id) if course_id else None
+                if previous_key is not None and previous_key != key:
+                    self.store.mark_managed_course_dirty(
+                        tuple(
+                            ManagedCourseDirty(aliases_by_key[item], metadata=True)
+                            for item in (previous_key, key)
+                        ),
+                        error_code="OR-ALIAS-COLLISION",
+                        recovery_required=True,
+                    )
+                    raise OneRosterError(
+                        "OR-ALIAS-COLLISION",
+                        "More than one managed alias resolves to the same live Classroom course.",
+                    )
+            await self._persist_metadata_chunk(
+                import_id,
+                chunk,
+                indexed,
+                eligible_by_alias,
+                directory_snapshot,
+                required_metadata_keys,
             )
-            raise
+            known_course_ids.update(
+                (_text(detail, "id"), key)
+                for key, detail in indexed.items()
+                if _text(detail, "id")
+            )
+            return indexed
+
+        bootstrap_keys = {
+            alias.casefold() for alias in bootstrap_metadata_aliases
+        } if bootstrap_read_concurrently else set()
+        remaining_metadata_aliases = tuple(
+            alias
+            for alias in metadata_aliases
+            if alias.casefold() not in bootstrap_keys
+        )
+        managed_courses = bootstrap_courses
+        classroom_snapshot_seconds = bootstrap_snapshot_seconds
+        if remaining_metadata_aliases and managed_courses is not None:
+            classroom_started = time.perf_counter()
+            additional_courses = await self._read_managed_course_snapshot(
+                remaining_metadata_aliases,
+                on_chunk=checkpoint_metadata,
+            )
+            classroom_snapshot_seconds += time.perf_counter() - classroom_started
+            if additional_courses is None:
+                managed_courses = None
+            else:
+                managed_courses = {**managed_courses, **additional_courses}
+        roster_started = time.perf_counter()
+        live_courses = await self._read_live_courses(
+            import_id,
+            eligible,
+            managed_courses,
+            directory_snapshot,
+            read_plan=read_plan,
+            managed_states=managed_states,
+            cached_members=cached_members,
+        )
+        live_courses, live_resolution_issues = await self._resolve_live_participants(
+            live_courses,
+            resolved,
+            directory_snapshot,
+        )
+        issues.extend(live_resolution_issues)
+        roster_snapshot_seconds = time.perf_counter() - roster_started
+        # Optional legacy connectors without exact bulk capabilities checkpoint
+        # their bounded fallback reads here. Normal GAM bulk scopes were already
+        # committed chunk-by-chunk and are skipped by this final compatibility pass.
+        self._persist_live_verification(
+            import_id,
+            eligible,
+            live_courses,
+            read_plan,
+        )
 
         archive_actions, archive_basis, archive_issues = await self._archive_actions(
             import_id,
@@ -469,6 +699,50 @@ class OneRosterPlanner:
                     for course in eligible
                 ),
                 audit_courses_requested=len(audit_aliases),
+                metadata_chunk_count=self._read_performance.metadata_chunk_count,
+                teacher_roster_chunk_count=(
+                    self._read_performance.teacher_roster_chunk_count
+                ),
+                student_roster_chunk_count=(
+                    self._read_performance.student_roster_chunk_count
+                ),
+                completed_chunk_count=self._read_performance.completed_chunk_count,
+                retried_chunk_count=self._read_performance.retried_chunk_count,
+                failed_chunk_count=self._read_performance.failed_chunk_count,
+                rate_limit_count=self._read_performance.rate_limit_count,
+                timeout_retry_count=self._read_performance.timeout_retry_count,
+                incomplete_coverage_count=(
+                    self._read_performance.incomplete_coverage_count
+                ),
+                latency_regression_count=(
+                    self._read_performance.latency_regression_count
+                ),
+                largest_metadata_chunk=self._read_performance.largest_metadata_chunk,
+                largest_roster_chunk=self._read_performance.largest_roster_chunk,
+                maximum_observed_read_concurrency=(
+                    self._read_performance.maximum_observed_read_concurrency
+                ),
+                final_recommended_read_concurrency=(
+                    self._read_performance.final_recommendation()
+                ),
+                metadata_final_read_concurrency=(
+                    self._read_performance.metadata_final_read_concurrency
+                ),
+                teacher_final_read_concurrency=(
+                    self._read_performance.teacher_final_read_concurrency
+                ),
+                student_final_read_concurrency=(
+                    self._read_performance.student_final_read_concurrency
+                ),
+                metadata_chunk_worker_levels=tuple(
+                    self._read_performance.metadata_chunk_worker_levels
+                ),
+                teacher_roster_chunk_worker_levels=tuple(
+                    self._read_performance.teacher_roster_chunk_worker_levels
+                ),
+                student_roster_chunk_worker_levels=tuple(
+                    self._read_performance.student_roster_chunk_worker_levels
+                ),
             ),
             desired_course_hashes=desired_states,
         )
@@ -490,27 +764,367 @@ class OneRosterPlanner:
     async def _read_managed_course_snapshot(
         self,
         aliases: Sequence[str],
+        *,
+        on_chunk: Optional[
+            Callable[
+                [tuple[str, ...], Mapping[str, Any]],
+                Awaitable[Mapping[str, Any]],
+            ]
+        ] = None,
     ) -> Optional[dict[str, Any]]:
-        if not aliases:
+        selected_by_key: dict[str, str] = {}
+        for raw_alias in aliases:
+            alias = str(raw_alias or "").strip()
+            if alias.startswith("d:"):
+                alias = alias[2:]
+            key = _managed_alias_key(alias)
+            if not key:
+                raise OneRosterError(
+                    "OR-ALIAS-INVALID",
+                    "A managed Classroom alias must use the exact Section_<SectionID> form.",
+                )
+            selected_by_key.setdefault(key, alias)
+        selected = tuple(sorted(selected_by_key.values(), key=str.casefold))
+        if not selected:
             return {}
         bulk = getattr(self.connector, "list_oneroster_managed_courses", None)
         if not callable(bulk):
             return None
+        chunks = tuple(
+            tuple(selected[offset : offset + ONEROSTER_MANAGED_ALIAS_CHUNK_CAP])
+            for offset in range(0, len(selected), ONEROSTER_MANAGED_ALIAS_CHUNK_CAP)
+        )
+        merged: dict[str, Any] = {}
+        course_ids: dict[str, str] = {}
+
+        async def read_chunk(chunk: tuple[str, ...]) -> Mapping[str, Any]:
+            raw = await bulk(chunk)
+            return _index_managed_courses(raw, requested_aliases=chunk)
+
+        async def accept_chunk(
+            chunk: tuple[str, ...],
+            indexed: Mapping[str, Any],
+        ) -> None:
+            for alias_key, detail in indexed.items():
+                course_id = _text(detail, "id")
+                previous_alias = course_ids.get(course_id) if course_id else None
+                if previous_alias is not None and previous_alias != alias_key:
+                    affected = tuple(
+                        ManagedCourseDirty(alias, metadata=True)
+                        for alias in (
+                            selected_by_key[previous_alias],
+                            selected_by_key[alias_key],
+                        )
+                    )
+                    self.store.mark_managed_course_dirty(
+                        affected,
+                        error_code="OR-ALIAS-COLLISION",
+                        recovery_required=True,
+                    )
+                    raise OneRosterError(
+                        "OR-ALIAS-COLLISION",
+                        "More than one managed alias resolves to the same live Classroom course.",
+                    )
+                if course_id:
+                    course_ids[course_id] = alias_key
+            if on_chunk is not None:
+                await on_chunk(chunk, indexed)
+            merged.update(indexed)
+
+        async def fail_chunk(chunk: tuple[str, ...], error_code: str) -> None:
+            self.store.mark_managed_course_dirty(
+                tuple(ManagedCourseDirty(alias, metadata=True) for alias in chunk),
+                error_code=error_code,
+            )
+
+        await self._coordinate_read_chunks(
+            chunks,
+            category="metadata",
+            read_chunk=read_chunk,
+            accept_chunk=accept_chunk,
+            fail_chunk=fail_chunk,
+        )
+        return merged
+
+    async def _coordinate_read_chunks(
+        self,
+        chunks: Sequence[tuple[str, ...]],
+        *,
+        category: str,
+        read_chunk: Callable[[tuple[str, ...]], Awaitable[Any]],
+        accept_chunk: Callable[[tuple[str, ...], Any], Awaitable[None]],
+        fail_chunk: Callable[[tuple[str, ...], str], Awaitable[None]],
+    ) -> None:
+        tuner = _ReadTuner(self.read_max_concurrency)
+        offset = 0
         try:
-            raw = await bulk(aliases)
-            return _index_managed_courses(raw)
-        except GAMError:
-            # The exact-set bulk command is an optimization. Fall back to
-            # bounded per-alias reads, which distinguish absent new courses
-            # from genuine authentication and permission failures.
-            return None
-        except OneRosterError:
-            raise
-        except Exception as exc:
-            raise OneRosterError(
+            while offset < len(chunks):
+                worker_level = tuner.level
+                wave = tuple(chunks[offset : offset + worker_level])
+                for chunk in wave:
+                    self._read_performance.scheduled(
+                        category,
+                        len(chunk),
+                        worker_level,
+                    )
+                outcomes = await asyncio.gather(
+                    *(
+                        self._attempt_bounded_read(chunk, read_chunk, tuner)
+                        for chunk in wave
+                    ),
+                    return_exceptions=True,
+                )
+                first_failure: Optional[tuple[OneRosterError, BaseException]] = None
+                for chunk, outcome in zip(wave, outcomes):
+                    if isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
+                    failure: Optional[BaseException] = (
+                        outcome if isinstance(outcome, BaseException) else None
+                    )
+                    completed: Optional[_CompletedReadChunk] = (
+                        outcome if isinstance(outcome, _CompletedReadChunk) else None
+                    )
+                    if completed is not None:
+                        try:
+                            await accept_chunk(chunk, completed.value)
+                        except BaseException as exc:
+                            if isinstance(exc, asyncio.CancelledError):
+                                raise
+                            failure = exc
+                            if isinstance(exc, _IncompleteReadCoverage):
+                                self._read_performance.incomplete_coverage_count += 1
+                                tuner.penalize()
+                    if failure is not None:
+                        self._read_performance.failed_chunk_count += 1
+                        safe_error = self._safe_read_error(failure, category)
+                        await fail_chunk(chunk, safe_error.code)
+                        if first_failure is None:
+                            first_failure = (safe_error, failure)
+                        continue
+                    assert completed is not None
+                    self._read_performance.completed_chunk_count += 1
+                    if completed.clean and tuner.completed_cleanly(
+                        completed.duration_seconds
+                    ):
+                        self._read_performance.latency_regression_count += 1
+                if first_failure is not None:
+                    safe_error, cause = first_failure
+                    if safe_error is cause:
+                        raise safe_error
+                    raise safe_error from cause
+                offset += len(wave)
+        finally:
+            self._read_performance.set_final_level(category, tuner.level)
+
+    async def _attempt_bounded_read(
+        self,
+        chunk: tuple[str, ...],
+        read_chunk: Callable[[tuple[str, ...]], Awaitable[Any]],
+        tuner: _ReadTuner,
+    ) -> _CompletedReadChunk:
+        self._read_performance.active_chunks += 1
+        self._read_performance.maximum_observed_read_concurrency = max(
+            self._read_performance.maximum_observed_read_concurrency,
+            self._read_performance.active_chunks,
+        )
+        retried = False
+        try:
+            for attempt in range(self.read_max_attempts):
+                started = time.perf_counter()
+                try:
+                    value = await read_chunk(chunk)
+                except _IncompleteReadCoverage:
+                    self._read_performance.incomplete_coverage_count += 1
+                    tuner.penalize()
+                    raise
+                except GAMError as exc:
+                    retryable = exc.kind in {
+                        GAMErrorKind.RATE_LIMITED,
+                        GAMErrorKind.TIMEOUT,
+                    }
+                    if not retryable:
+                        raise
+                    tuner.penalize()
+                    if exc.kind is GAMErrorKind.RATE_LIMITED:
+                        self._read_performance.rate_limit_count += 1
+                    if attempt + 1 >= self.read_max_attempts:
+                        raise
+                    if exc.kind is GAMErrorKind.TIMEOUT:
+                        self._read_performance.timeout_retry_count += 1
+                    if not retried:
+                        retried = True
+                        self._read_performance.retried_chunk_count += 1
+                    await self._read_sleep(self._read_backoff_delay(attempt))
+                    continue
+                return _CompletedReadChunk(
+                    value=value,
+                    duration_seconds=time.perf_counter() - started,
+                    clean=not retried,
+                )
+            raise RuntimeError("bounded OneRoster read exhausted unexpectedly")
+        finally:
+            self._read_performance.active_chunks -= 1
+
+    def _read_backoff_delay(self, retry_index: int) -> float:
+        jitter = max(0.0, min(float(self._read_jitter()), 1.0))
+        exponential = self.read_backoff_base_seconds * (2 ** max(0, retry_index))
+        return min(
+            self.read_backoff_cap_seconds,
+            exponential * (1.0 + (ONEROSTER_READ_BACKOFF_JITTER_RATIO * jitter)),
+        )
+
+    @staticmethod
+    def _safe_read_error(error: BaseException, category: str) -> OneRosterError:
+        if isinstance(error, OneRosterError):
+            return error
+        if isinstance(error, GAMError):
+            if error.kind is GAMErrorKind.RATE_LIMITED:
+                return OneRosterError(
+                    "OR-ONEROSTER-READ-RATE-LIMITED",
+                    "Google continued to rate-limit a bounded OneRoster read; completed chunks were preserved.",
+                )
+            if error.kind is GAMErrorKind.TIMEOUT:
+                return OneRosterError(
+                    "OR-ONEROSTER-READ-TIMEOUT",
+                    "A bounded OneRoster read timed out after finite retries; completed chunks were preserved.",
+                )
+            if error.kind in {
+                GAMErrorKind.AUTH_EXPIRED,
+                GAMErrorKind.NOT_AUTHENTICATED,
+            }:
+                return OneRosterError(
+                    "OR-ONEROSTER-READ-AUTH",
+                    "OneRoster live reads require renewed Google authentication.",
+                )
+            if error.kind in {
+                GAMErrorKind.PERMISSION_DENIED,
+                GAMErrorKind.SCOPE_MISSING,
+            }:
+                return OneRosterError(
+                    "OR-ONEROSTER-READ-PERMISSION",
+                    "The authorized account cannot safely complete OneRoster live reads.",
+                )
+        if category == "metadata":
+            return OneRosterError(
                 "OR-CLASSROOM-READ",
                 "Live Classroom course resolution failed; no import plan was created.",
+            )
+        return OneRosterError(
+            "OR-CLASSROOM-ROSTER-READ",
+            "Live Classroom rosters could not be read safely.",
+        )
+
+    async def _persist_metadata_chunk(
+        self,
+        import_id: str,
+        chunk: Sequence[str],
+        indexed: Mapping[str, Any],
+        courses_by_alias: Mapping[str, _DesiredCourse],
+        directory_snapshot: Optional[Mapping[str, Any]],
+        manifest_guard_aliases: set[str],
+    ) -> None:
+        states = self.store.get_managed_course_states(chunk)
+        aliases_by_key = {
+            _managed_alias_key(alias): str(alias).removeprefix("d:")
+            for alias in chunk
+        }
+        verifications: list[ManagedCourseVerification] = []
+        verified_keys: list[str] = []
+        for key, detail in indexed.items():
+            alias = aliases_by_key.get(key, "")
+            state = states.get(key)
+            if state is None and key not in courses_by_alias:
+                # A pre-registry accepted alias can still supply fresh archive
+                # evidence, but there is no durable Branch 1 row to checkpoint.
+                continue
+            if not alias or state is None:
+                raise _IncompleteReadCoverage(
+                    "A returned managed course has no registered exact alias."
+                )
+            course_id = _text(detail, "id")
+            if state.course_id and state.course_id != course_id:
+                self.store.mark_managed_course_dirty(
+                    (ManagedCourseDirty(alias, metadata=True),),
+                    error_code="OR-MANAGED-COURSE-ID-DRIFT",
+                    recovery_required=True,
+                )
+                if key in manifest_guard_aliases:
+                    # Executor/gate revalidation must retain the fresh live basis
+                    # so its manifest comparison can persist an exact drift report.
+                    continue
+                raise OneRosterError(
+                    "OR-MANAGED-COURSE-ID-DRIFT",
+                    "The exact managed alias resolved to a different Classroom course.",
+                )
+            owner_email = await self._normalize_live_identity(
+                _text(detail, "owner_email", "ownerEmail"),
+                _text(detail, "owner_id", "ownerId"),
+                directory_snapshot,
+            )
+            course_state = _text(detail, "course_state", "courseState").upper()
+            if not (
+                course_id
+                and _has_exact_alias(detail, alias)
+                and owner_email
+                and course_state
+            ):
+                raise _IncompleteReadCoverage(
+                    "A managed-course metadata chunk returned incomplete exact coverage."
+                )
+            desired_course = courses_by_alias.get(key)
+            verifications.append(
+                ManagedCourseVerification(
+                    alias=alias,
+                    course_id=course_id,
+                    source_class_id=(
+                        desired_course.class_id
+                        if desired_course is not None
+                        else state.source_class_id
+                    ),
+                    last_seen_import_id=import_id,
+                    metadata_hash=metadata_hash(
+                        alias,
+                        _text(detail, "name"),
+                        owner_email,
+                        _text(detail, "room"),
+                        _text(detail, "section"),
+                        course_state,
+                    ),
+                    course_state=course_state,
+                )
+            )
+            verified_keys.append(key)
+        self.store.record_managed_course_verifications(tuple(verifications))
+        self._checkpointed_scopes.update(
+            (key, "metadata") for key in verified_keys
+        )
+
+    async def _normalize_live_identity(
+        self,
+        email: str,
+        user_id: str,
+        directory_snapshot: Optional[Mapping[str, Any]],
+    ) -> str:
+        email_key = _directory_identifier(email)
+        id_key = _directory_id_key(user_id)
+        if directory_snapshot is not None:
+            return _snapshot_primary(
+                directory_snapshot.get(email_key)
+                or directory_snapshot.get(id_key)
+            )
+        reference = email_key or str(user_id or "").strip()
+        if not reference:
+            return ""
+        try:
+            user = await self.connector.get_user(reference)
+        except Exception as exc:
+            if _is_not_found(exc):
+                return ""
+            raise OneRosterError(
+                "OR-DIRECTORY-READ",
+                "Live Directory resolution failed; no import plan was created.",
             ) from exc
+        return _snapshot_primary(user)
 
     async def _resolve_directory(
         self,
@@ -554,6 +1168,7 @@ class OneRosterPlanner:
 
     async def _read_live_courses(
         self,
+        import_id: str,
         courses: Sequence[_DesiredCourse],
         managed_courses: Optional[Mapping[str, Any]] = None,
         directory_snapshot: Optional[Mapping[str, Any]] = None,
@@ -613,7 +1228,13 @@ class OneRosterPlanner:
                 return course.alias.casefold(), detail
 
             details = dict(await asyncio.gather(*(read(course) for course in courses)))
-        rosters = await self._read_rosters(details, intents)
+        rosters = await self._read_rosters(
+            import_id,
+            courses,
+            details,
+            intents,
+            directory_snapshot,
+        )
         result: dict[str, Optional[_LiveCourse]] = {}
         for course in courses:
             key = course.alias.casefold()
@@ -623,7 +1244,10 @@ class OneRosterPlanner:
                 continue
             course_id = _text(detail, "id")
             cached_teachers, cached_students = retained_members.get(key, ((), ()))
-            read_teachers, read_students = rosters.get(course_id, (None, None))
+            read_teachers, read_students, unresolved_members = rosters.get(
+                course_id,
+                (None, None, ()),
+            )
             teachers = (
                 tuple(read_teachers)
                 if read_teachers is not None
@@ -652,6 +1276,7 @@ class OneRosterPlanner:
                 teachers,
                 students,
                 owner_email,
+                unresolved_members=tuple(unresolved_members),
                 metadata_loaded=bool(
                     (intent := intents.get(key)) and intent.metadata
                 ),
@@ -710,7 +1335,8 @@ class OneRosterPlanner:
                 continue
             unresolved = tuple(
                 sorted(
-                    {
+                    set(live.unresolved_members)
+                    | {
                         email
                         for email in (*live.teachers, *live.students)
                         if not mapping.get(email)
@@ -743,70 +1369,190 @@ class OneRosterPlanner:
 
     async def _read_rosters(
         self,
+        import_id: str,
+        courses: Sequence[_DesiredCourse],
         details: Mapping[str, Optional[Any]],
         read_plan: Mapping[str, _CourseReadIntent],
+        directory_snapshot: Optional[Mapping[str, Any]],
     ) -> dict[
         str,
-        tuple[Optional[tuple[str, ...]], Optional[tuple[str, ...]]],
+        tuple[
+            Optional[tuple[str, ...]],
+            Optional[tuple[str, ...]],
+            tuple[str, ...],
+        ],
     ]:
-        requested: dict[str, tuple[bool, bool]] = {}
+        courses_by_alias = {course.alias.casefold(): course for course in courses}
+        manifest_guard_aliases = {
+            alias
+            for alias, intent in read_plan.items()
+            if "execution_identity_guard" in intent.reasons
+        }
+        requested: dict[
+            str,
+            tuple[str, _DesiredCourse, Any, bool, bool],
+        ] = {}
         for alias, detail in details.items():
             intent = read_plan.get(alias)
             course_id = _text(detail, "id") if detail is not None else ""
             if not intent or not course_id or not (intent.teachers or intent.students):
                 continue
-            requested[course_id] = (intent.teachers, intent.students)
+            course = courses_by_alias.get(alias)
+            if course is None:
+                continue
+            previous = requested.get(course_id)
+            if previous is not None and previous[0] != alias:
+                self.store.mark_managed_course_dirty(
+                    (
+                        ManagedCourseDirty(
+                            previous[1].alias,
+                            teachers=previous[3],
+                            students=previous[4],
+                        ),
+                        ManagedCourseDirty(
+                            course.alias,
+                            teachers=intent.teachers,
+                            students=intent.students,
+                        ),
+                    ),
+                    error_code="OR-ALIAS-COLLISION",
+                    recovery_required=True,
+                )
+                raise OneRosterError(
+                    "OR-ALIAS-COLLISION",
+                    "More than one managed alias resolves to the same live Classroom course.",
+                )
+            requested[course_id] = (
+                alias,
+                course,
+                detail,
+                intent.teachers,
+                intent.students,
+            )
         if not requested:
             return {}
-        both_ids = sorted(
-            course_id
-            for course_id, (teachers, students) in requested.items()
-            if teachers and students
-        )
         teacher_ids = sorted(
             course_id
-            for course_id, (teachers, students) in requested.items()
-            if teachers and not students
+            for course_id, (_alias, _course, _detail, teachers, _students) in requested.items()
+            if teachers
         )
         student_ids = sorted(
             course_id
-            for course_id, (teachers, students) in requested.items()
-            if students and not teachers
+            for course_id, (_alias, _course, _detail, _teachers, students) in requested.items()
+            if students
         )
         result: dict[
             str,
-            tuple[Optional[tuple[str, ...]], Optional[tuple[str, ...]]],
+            tuple[
+                Optional[tuple[str, ...]],
+                Optional[tuple[str, ...]],
+                tuple[str, ...],
+            ],
         ] = {}
         bulk = getattr(self.connector, "list_course_participants_many", None)
         if callable(bulk):
             for course_ids, role in (
-                (both_ids, "all"),
                 (teacher_ids, "teachers"),
                 (student_ids, "students"),
             ):
                 if not course_ids:
                     continue
-                try:
-                    participants = await bulk(course_ids, role)
+                chunks = tuple(
+                    tuple(course_ids[offset : offset + ONEROSTER_ROSTER_CHUNK_CAP])
+                    for offset in range(0, len(course_ids), ONEROSTER_ROSTER_CHUNK_CAP)
+                )
+
+                async def read_chunk(
+                    chunk: tuple[str, ...],
+                    *,
+                    selected_role: str = role,
+                ) -> Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+                    participants = await bulk(chunk, selected_role)
+                    requested_ids = frozenset(chunk)
                     if (
                         not isinstance(participants, CourseRosterSnapshot)
-                        or not participants.covers(course_ids)
+                        or participants.seen_course_ids != requested_ids
+                        or not set(participants.rosters) <= requested_ids
                     ):
-                        raise ValueError(
-                            "The Classroom roster snapshot did not prove complete "
-                            "coverage of the requested courses."
+                        raise _IncompleteReadCoverage(
+                            "The Classroom roster snapshot did not prove exact complete coverage."
                         )
-                except Exception as exc:
-                    raise OneRosterError(
-                        "OR-CLASSROOM-ROSTER-READ",
-                        "Live Classroom rosters could not be read safely.",
-                    ) from exc
-                for course_id in course_ids:
-                    teachers, students = participants.for_course(course_id)
-                    result[course_id] = (
-                        tuple(sorted(teachers)) if role in {"all", "teachers"} else None,
-                        tuple(sorted(students)) if role in {"all", "students"} else None,
+                    normalized: dict[
+                        str,
+                        tuple[tuple[str, ...], tuple[str, ...]],
+                    ] = {}
+                    for course_id in chunk:
+                        teachers, students = participants.for_course(course_id)
+                        selected_members = (
+                            teachers if selected_role == "teachers" else students
+                        )
+                        unexpected_members = (
+                            students if selected_role == "teachers" else teachers
+                        )
+                        if unexpected_members:
+                            raise _IncompleteReadCoverage(
+                                "A role-specific Classroom roster read returned another role."
+                            )
+                        normalized[course_id] = await self._normalize_roster_members(
+                            selected_members,
+                            directory_snapshot,
+                        )
+                    return normalized
+
+                async def accept_chunk(
+                    chunk: tuple[str, ...],
+                    normalized: Mapping[
+                        str,
+                        tuple[tuple[str, ...], tuple[str, ...]],
+                    ],
+                    *,
+                    selected_role: str = role,
+                ) -> None:
+                    self._persist_roster_chunk(
+                        import_id,
+                        selected_role,
+                        chunk,
+                        normalized,
+                        requested,
+                        manifest_guard_aliases,
                     )
+                    for course_id in chunk:
+                        members, unresolved = normalized[course_id]
+                        old_teachers, old_students, old_unresolved = result.get(
+                            course_id,
+                            (None, None, ()),
+                        )
+                        result[course_id] = (
+                            members if selected_role == "teachers" else old_teachers,
+                            members if selected_role == "students" else old_students,
+                            tuple(sorted({*old_unresolved, *unresolved})),
+                        )
+
+                async def fail_chunk(
+                    chunk: tuple[str, ...],
+                    error_code: str,
+                    *,
+                    selected_role: str = role,
+                ) -> None:
+                    self.store.mark_managed_course_dirty(
+                        tuple(
+                            ManagedCourseDirty(
+                                requested[course_id][1].alias,
+                                teachers=selected_role == "teachers",
+                                students=selected_role == "students",
+                            )
+                            for course_id in chunk
+                        ),
+                        error_code=error_code,
+                    )
+
+                await self._coordinate_read_chunks(
+                    chunks,
+                    category=role,
+                    read_chunk=read_chunk,
+                    accept_chunk=accept_chunk,
+                    fail_chunk=fail_chunk,
+                )
             return result
 
         semaphore = asyncio.Semaphore(self.course_concurrency)
@@ -819,6 +1565,7 @@ class OneRosterPlanner:
             str,
             Optional[tuple[str, ...]],
             Optional[tuple[str, ...]],
+            tuple[str, ...],
         ]:
             async with semaphore:
                 try:
@@ -835,25 +1582,167 @@ class OneRosterPlanner:
                         "OR-CLASSROOM-ROSTER-READ",
                         "Live Classroom rosters could not be read safely.",
                     ) from exc
+            normalized_teachers: Optional[tuple[str, ...]] = None
+            normalized_students: Optional[tuple[str, ...]] = None
+            unresolved: set[str] = set()
+            if teachers_needed:
+                normalized_teachers, missing = await self._normalize_roster_members(
+                    tuple(
+                        _participant_email(item)
+                        for item in teachers
+                        if _participant_email(item)
+                    ),
+                    directory_snapshot,
+                )
+                unresolved.update(missing)
+                self._persist_roster_chunk(
+                    import_id,
+                    "teachers",
+                    (course_id,),
+                    {course_id: (normalized_teachers, missing)},
+                    requested,
+                    manifest_guard_aliases,
+                )
+            if students_needed:
+                normalized_students, missing = await self._normalize_roster_members(
+                    tuple(
+                        _participant_email(item)
+                        for item in students
+                        if _participant_email(item)
+                    ),
+                    directory_snapshot,
+                )
+                unresolved.update(missing)
+                self._persist_roster_chunk(
+                    import_id,
+                    "students",
+                    (course_id,),
+                    {course_id: (normalized_students, missing)},
+                    requested,
+                    manifest_guard_aliases,
+                )
             return (
                 course_id,
-                tuple(sorted({_participant_email(item) for item in teachers if _participant_email(item)}))
-                if teachers_needed
-                else None,
-                tuple(sorted({_participant_email(item) for item in students if _participant_email(item)}))
-                if students_needed
-                else None,
+                normalized_teachers,
+                normalized_students,
+                tuple(sorted(unresolved)),
             )
 
         return {
-            course_id: (teachers, students)
-            for course_id, teachers, students in await asyncio.gather(
+            course_id: (teachers, students, unresolved)
+            for course_id, teachers, students, unresolved in await asyncio.gather(
                 *(
                     read(course_id, teachers, students)
-                    for course_id, (teachers, students) in requested.items()
+                    for course_id, (
+                        _alias,
+                        _course,
+                        _detail,
+                        teachers,
+                        students,
+                    ) in requested.items()
                 )
             )
         }
+
+    async def _normalize_roster_members(
+        self,
+        members: Iterable[str],
+        directory_snapshot: Optional[Mapping[str, Any]],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        normalized: set[str] = set()
+        unresolved: set[str] = set()
+        for raw_email in sorted(
+            {_directory_identifier(email) for email in members} - {""}
+        ):
+            primary = await self._normalize_live_identity(
+                raw_email,
+                "",
+                directory_snapshot,
+            )
+            if primary:
+                normalized.add(primary)
+            else:
+                unresolved.add(raw_email)
+        return tuple(sorted(normalized)), tuple(sorted(unresolved))
+
+    def _persist_roster_chunk(
+        self,
+        import_id: str,
+        role: str,
+        chunk: Sequence[str],
+        normalized: Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]],
+        requested: Mapping[
+            str,
+            tuple[str, _DesiredCourse, Any, bool, bool],
+        ],
+        manifest_guard_aliases: set[str],
+    ) -> None:
+        aliases = tuple(requested[course_id][1].alias for course_id in chunk)
+        states = self.store.get_managed_course_states(aliases)
+        verifications: list[ManagedCourseVerification] = []
+        dirty: list[ManagedCourseDirty] = []
+        verified_keys: list[str] = []
+        for course_id in chunk:
+            alias_key, course, detail, _teachers, _students = requested[course_id]
+            state = states.get(alias_key)
+            if (
+                state is None
+                or not _has_exact_alias(detail, course.alias)
+                or state.course_id not in {"", course_id}
+            ):
+                if state is not None and state.course_id not in {"", course_id}:
+                    self.store.mark_managed_course_dirty(
+                        (
+                            ManagedCourseDirty(
+                                course.alias,
+                                metadata=True,
+                                teachers=role == "teachers",
+                                students=role == "students",
+                            ),
+                        ),
+                        error_code="OR-MANAGED-COURSE-ID-DRIFT",
+                        recovery_required=True,
+                    )
+                    if alias_key in manifest_guard_aliases:
+                        # Do not adopt the rebound ID. The executor still needs
+                        # this live roster basis to produce OR-MANIFEST-DRIFT.
+                        continue
+                    raise OneRosterError(
+                        "OR-MANAGED-COURSE-ID-DRIFT",
+                        "The exact managed alias resolved to a different Classroom course.",
+                    )
+                raise _IncompleteReadCoverage(
+                    "A roster chunk did not retain exact managed-course identity."
+                )
+            members, unresolved = normalized[course_id]
+            if unresolved:
+                dirty.append(
+                    ManagedCourseDirty(
+                        course.alias,
+                        teachers=role == "teachers",
+                        students=role == "students",
+                    )
+                )
+                continue
+            verifications.append(
+                ManagedCourseVerification(
+                    alias=course.alias,
+                    course_id=course_id,
+                    source_class_id=course.class_id,
+                    last_seen_import_id=import_id,
+                    teacher_hash=teacher_hash(members) if role == "teachers" else None,
+                    student_hash=student_hash(members) if role == "students" else None,
+                    teacher_members=members if role == "teachers" else None,
+                    student_members=members if role == "students" else None,
+                )
+            )
+            verified_keys.append(alias_key)
+        self.store.record_managed_course_verifications(tuple(verifications))
+        self.store.mark_managed_course_dirty(
+            tuple(dirty),
+            error_code="OR-LIVE-PARTICIPANT-UNRESOLVED",
+        )
+        self._checkpointed_scopes.update((key, role) for key in verified_keys)
 
     def _persist_live_verification(
         self,
@@ -874,22 +1763,33 @@ class OneRosterPlanner:
             live = live_courses.get(key)
             if intent is None or live is None:
                 continue
+            metadata_requested = bool(
+                intent.metadata and (key, "metadata") not in self._checkpointed_scopes
+            )
+            teachers_requested = bool(
+                intent.teachers and (key, "teachers") not in self._checkpointed_scopes
+            )
+            students_requested = bool(
+                intent.students and (key, "students") not in self._checkpointed_scopes
+            )
+            if not (metadata_requested or teachers_requested or students_requested):
+                continue
             course_id = _text(live.detail, "id")
             known = known_states.get(key)
             if known is not None and known.course_id and course_id != known.course_id:
                 identity_dirty.append(
                     ManagedCourseDirty(
                         course.alias,
-                        metadata=True,
-                        teachers=intent.teachers,
-                        students=intent.students,
+                        metadata=metadata_requested,
+                        teachers=teachers_requested,
+                        students=students_requested,
                     )
                 )
                 continue
             exact_alias = _has_exact_alias(live.detail, course.alias)
             state = _text(live.detail, "course_state", "courseState").upper()
             metadata_covered = bool(
-                intent.metadata
+                metadata_requested
                 and course_id
                 and exact_alias
                 and live.owner_email
@@ -898,13 +1798,17 @@ class OneRosterPlanner:
             roster_covered = bool(
                 course_id and exact_alias and not live.unresolved_members
             )
-            if intent.metadata and not metadata_covered:
+            if metadata_requested and not metadata_covered:
                 dirty.append(ManagedCourseDirty(course.alias, metadata=True))
-            if intent.teachers and not roster_covered:
+            if teachers_requested and not roster_covered:
                 dirty.append(ManagedCourseDirty(course.alias, teachers=True))
-            if intent.students and not roster_covered:
+            if students_requested and not roster_covered:
                 dirty.append(ManagedCourseDirty(course.alias, students=True))
-            if not (metadata_covered or (intent.teachers and roster_covered) or (intent.students and roster_covered)):
+            if not (
+                metadata_covered
+                or (teachers_requested and roster_covered)
+                or (students_requested and roster_covered)
+            ):
                 continue
             verified.append(
                 ManagedCourseVerification(
@@ -926,22 +1830,22 @@ class OneRosterPlanner:
                     ),
                     teacher_hash=(
                         teacher_hash(live.teachers)
-                        if intent.teachers and roster_covered
+                        if teachers_requested and roster_covered
                         else None
                     ),
                     student_hash=(
                         student_hash(live.students)
-                        if intent.students and roster_covered
+                        if students_requested and roster_covered
                         else None
                     ),
                     teacher_members=(
                         tuple(live.teachers)
-                        if intent.teachers and roster_covered
+                        if teachers_requested and roster_covered
                         else None
                     ),
                     student_members=(
                         tuple(live.students)
-                        if intent.students and roster_covered
+                        if students_requested and roster_covered
                         else None
                     ),
                     course_state=state if metadata_covered else None,
@@ -1341,7 +2245,11 @@ def _resolve_snapshot_user(
     )
 
 
-def _index_managed_courses(raw: Any) -> dict[str, Any]:
+def _index_managed_courses(
+    raw: Any,
+    *,
+    requested_aliases: Sequence[str],
+) -> dict[str, Any]:
     if (
         isinstance(raw, (str, bytes, Mapping))
         or not isinstance(raw, Sequence)
@@ -1350,30 +2258,46 @@ def _index_managed_courses(raw: Any) -> dict[str, Any]:
             "OR-CLASSROOM-READ",
             "The live Classroom snapshot had an invalid shape; no import plan was created.",
         )
+    requested = {
+        _managed_alias_key(alias): str(alias).removeprefix("d:")
+        for alias in requested_aliases
+        if _managed_alias_key(alias)
+    }
+    if len(requested) != len(requested_aliases):
+        raise OneRosterError(
+            "OR-ALIAS-COLLISION",
+            "The managed-course metadata chunk did not contain unique exact aliases.",
+        )
     indexed: dict[str, Any] = {}
     course_ids: dict[str, str] = {}
     for detail in raw:
-        aliases = {
+        matches = {
             key
             for alias in _aliases(detail)
             if (key := _managed_alias_key(alias))
+            and key in requested
         }
-        for key in aliases:
-            if key in indexed:
+        if len(matches) != 1:
+            raise OneRosterError(
+                "OR-ALIAS-COLLISION",
+                "A live Classroom course did not map to exactly one requested managed alias.",
+            )
+        key = next(iter(matches))
+        if key in indexed:
+            raise OneRosterError(
+                "OR-ALIAS-COLLISION",
+                "More than one live Classroom course claims the same managed alias.",
+            )
+        indexed[key] = detail
+        course_id = _text(detail, "id")
+        if course_id:
+            existing_alias = course_ids.get(course_id)
+            if existing_alias is not None and existing_alias != key:
                 raise OneRosterError(
                     "OR-ALIAS-COLLISION",
-                    "More than one live Classroom course claims the same managed alias.",
+                    "More than one managed alias resolves to the same live Classroom course.",
                 )
-            indexed[key] = detail
-            course_id = _text(detail, "id")
-            if course_id:
-                existing_alias = course_ids.get(course_id)
-                if existing_alias is not None and existing_alias != key:
-                    raise OneRosterError(
-                        "OR-ALIAS-COLLISION",
-                        "More than one managed alias resolves to the same live Classroom course.",
-                    )
-                course_ids[course_id] = key
+            course_ids[course_id] = key
     return indexed
 
 

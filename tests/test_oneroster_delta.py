@@ -185,7 +185,10 @@ async def test_first_baseline_then_identical_plan_skips_live_course_reads(
 
     assert first.actions == ()
     assert connector.metadata_calls == [("Section_101",)]
-    assert connector.roster_calls == [(('1000',), "all")]
+    assert connector.roster_calls == [
+        (("1000",), "teachers"),
+        (("1000",), "students"),
+    ]
     state = service.store.get_managed_course_states(["Section_101"])["section_101"]
     assert state.course_id == "1000"
     assert state.desired_metadata_hash == state.verified_metadata_hash

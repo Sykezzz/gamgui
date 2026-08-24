@@ -64,6 +64,8 @@ from .base import (
 from .person import ConnectorAccount, Person
 
 MAX_ONEROSTER_BULK_ROSTER_MEMBERS = 500_000
+ONEROSTER_MANAGED_ALIAS_CHUNK_CAP = 200
+ONEROSTER_ROSTER_CHUNK_CAP = 100
 
 
 def _parse_signature(text: str) -> str:
@@ -851,6 +853,10 @@ class GAMConnector(Connector):
                 selected.append(alias)
         if not selected:
             return []
+        if len(selected) > ONEROSTER_MANAGED_ALIAS_CHUNK_CAP:
+            raise ValueError(
+                "managed Classroom alias request exceeds the OneRoster chunk cap"
+            )
 
         selector_path = _write_private_selector(
             selected,
@@ -1041,6 +1047,10 @@ class GAMConnector(Connector):
             raise ValueError("invalid Classroom roster role")
         if not selected:
             return CourseRosterSnapshot.empty()
+        if len(selected) > ONEROSTER_ROSTER_CHUNK_CAP:
+            raise ValueError(
+                "Classroom roster request exceeds the OneRoster chunk cap"
+            )
         if any(
             len(course_id) > 512
             or any(character in course_id for character in "\r\n\x00")
@@ -1071,7 +1081,7 @@ class GAMConnector(Connector):
                     normalized_role,
                 ),
                 timeout=timeout,
-                serialize=True,
+                serialize=False,
             ) as result:
                 participants = await _parse_private_spool_off_loop(
                     _read_oneroster_participants_spool,
