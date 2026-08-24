@@ -463,6 +463,11 @@ class LivePlanningResult:
         compare=False,
         repr=False,
     )
+    desired_course_hashes: Mapping[str, "ManagedCourseDesired"] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
     def actions_for(self, plan_kind: str) -> Tuple[ImportAction, ...]:
         kind = str(plan_kind or "").strip().casefold()
@@ -608,6 +613,104 @@ class PlanningPerformanceReceipt:
     directory_snapshot_seconds: float = 0.0
     classroom_snapshot_seconds: float = 0.0
     roster_snapshot_seconds: float = 0.0
+    total_managed_aliases: int = 0
+    candidate_aliases: int = 0
+    unchanged_aliases: int = 0
+    metadata_reads_requested: int = 0
+    teacher_rosters_requested: int = 0
+    student_rosters_requested: int = 0
+    cached_metadata_scopes: int = 0
+    cached_teacher_scopes: int = 0
+    cached_student_scopes: int = 0
+    audit_courses_requested: int = 0
+    metadata_chunk_count: int = 0
+    teacher_roster_chunk_count: int = 0
+    student_roster_chunk_count: int = 0
+    completed_chunk_count: int = 0
+    retried_chunk_count: int = 0
+    failed_chunk_count: int = 0
+    rate_limit_count: int = 0
+    timeout_retry_count: int = 0
+    incomplete_coverage_count: int = 0
+    latency_regression_count: int = 0
+    largest_metadata_chunk: int = 0
+    largest_roster_chunk: int = 0
+    maximum_observed_read_concurrency: int = 0
+    final_recommended_read_concurrency: int = 1
+    metadata_final_read_concurrency: int = 1
+    teacher_final_read_concurrency: int = 1
+    student_final_read_concurrency: int = 1
+    metadata_chunk_worker_levels: Tuple[int, ...] = ()
+    teacher_roster_chunk_worker_levels: Tuple[int, ...] = ()
+    student_roster_chunk_worker_levels: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManagedCourseState:
+    """Durable, independently scoped verification state for one managed alias."""
+
+    domain: str
+    alias: str
+    course_id: str
+    source_class_id: str
+    last_seen_import_id: str
+    desired_metadata_hash: str = ""
+    desired_teacher_hash: str = ""
+    desired_student_hash: str = ""
+    verified_metadata_hash: str = ""
+    verified_teacher_hash: str = ""
+    verified_student_hash: str = ""
+    last_metadata_verified_at: float = 0.0
+    last_teacher_verified_at: float = 0.0
+    last_student_verified_at: float = 0.0
+    verified_course_state: str = ""
+    metadata_dirty: bool = True
+    teacher_roster_dirty: bool = True
+    student_roster_dirty: bool = True
+    recovery_required: bool = False
+    last_error_code: str = ""
+    version: int = 1
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class ManagedCourseDesired:
+    """Accepted desired hashes; recording these never establishes live proof."""
+
+    alias: str
+    import_id: str
+    metadata_hash: str
+    teacher_hash: str
+    student_hash: str
+    source_class_id: str = ""
+
+
+@dataclass(frozen=True)
+class ManagedCourseVerification:
+    """Fresh live evidence for only the explicitly populated verification scopes."""
+
+    alias: str
+    course_id: str
+    source_class_id: str = ""
+    last_seen_import_id: str = ""
+    metadata_hash: Optional[str] = None
+    teacher_hash: Optional[str] = None
+    student_hash: Optional[str] = None
+    teacher_members: Optional[Tuple[str, ...]] = None
+    student_members: Optional[Tuple[str, ...]] = None
+    course_state: Optional[str] = None
+    verified_at: float = 0.0
+    clear_recovery: bool = True
+
+
+@dataclass(frozen=True)
+class ManagedCourseDirty:
+    """Exact registry scopes whose live outcome is incomplete or uncertain."""
+
+    alias: str
+    metadata: bool = False
+    teachers: bool = False
+    students: bool = False
 
 
 @dataclass(frozen=True)

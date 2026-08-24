@@ -125,7 +125,11 @@ jobs:
           if ($actual -ne $expected -or $actual -ne $manifest.setup.sha256) { throw "Setup checksum receipt mismatch." }
           if ((Get-Item -LiteralPath $setup).Length -ge 2GB) { throw "Setup exceeds GitHub's asset limit." }
           if (@($manifest.profiles.profile | Sort-Object) -join ',' -ne 'classroom-oneroster,core') { throw "Both profiles were not embedded." }
-          if ($manifest.gam_version -ne '7.47.02') { throw "Bundled GAM pin mismatch." }
+          $gamVersionOutput = & .venv\Scripts\python.exe -c "from gamgui.core.gam.commands import EXPECTED_GAM_VERSION; print(EXPECTED_GAM_VERSION)"
+          $gamVersionExitCode = $LASTEXITCODE
+          $expectedGamVersion = ($gamVersionOutput | Out-String).Trim()
+          if ($gamVersionExitCode -ne 0 -or $expectedGamVersion -notmatch '^\d+\.\d+\.\d+$') { throw "Repository GAM source pin is invalid." }
+          if ([string]$manifest.gam_version -cne $expectedGamVersion) { throw "Bundled GAM pin mismatch." }
       - name: Exercise fail-closed setup, both profiles, signatures, and uninstall
         shell: pwsh
         run: |

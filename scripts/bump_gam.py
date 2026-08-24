@@ -17,7 +17,8 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 MAC_ASSET_RE = re.compile(
-    r"^gam-[0-9.]+-macos(?P<platform>[0-9.]+)-(?P<arch>arm64|x86_64)\.tar\.xz$"
+    r"^gam-(?P<version>\d+\.\d+\.\d+)-macos"
+    r"(?P<platform>[0-9.]+)-(?P<arch>arm64|x86_64)\.tar\.xz$"
 )
 
 
@@ -40,6 +41,11 @@ def update_versioned_sources(root: Path, version: str) -> None:
         root / "scripts" / "fetch_gam.sh",
         r'^TAG="v[^"]+"$',
         f'TAG="v{version}"',
+    )
+    _replace_once(
+        root / "scripts" / "fetch_gam_windows.ps1",
+        r'^([ \t]*\[string\]\$Tag = ")v[^"]+("[ \t]*)$',
+        rf"\g<1>v{version}\g<2>",
     )
     _replace_once(
         root / "tests" / "fixtures" / "mock_gam.sh",
@@ -76,7 +82,9 @@ def record_checksum(root: Path) -> None:
 
 
 def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str, str]]:
-    """Return the newest-platform SHA-256 pin for each supported Mac architecture."""
+    """Return authenticated pins for every supported release platform."""
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        raise RuntimeError(f"Invalid GAM release tag {tag!r}.")
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "GamGUI-GAM-Bump",
@@ -93,21 +101,31 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
     tls_context = ssl.create_default_context(cafile=requests.certs.where())
     with opener(request, timeout=30, context=tls_context) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    selected: dict[str, tuple[tuple[int, ...], str, str]] = {}
-    for asset in payload.get("assets", ()) if isinstance(payload, dict) else ():
+
+    if not isinstance(payload, dict) or payload.get("tag_name") != tag:
+        raise RuntimeError(f"GitHub release metadata did not match requested tag {tag}.")
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError(f"GitHub release metadata for {tag} did not contain an asset list.")
+
+    version = tag.removeprefix("v")
+    selected: dict[str, tuple[tuple[int, ...], dict[str, object]]] = {}
+    windows_name = f"gam-{version}-windows-x86_64.zip"
+    windows_assets: list[dict[str, object]] = []
+    for asset in assets:
         if not isinstance(asset, dict):
             continue
         name = str(asset.get("name") or "")
-        match = MAC_ASSET_RE.fullmatch(name)
-        if not match:
+        if name == windows_name:
+            windows_assets.append(asset)
             continue
-        digest = str(asset.get("digest") or "")
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-            raise RuntimeError(f"GitHub did not publish a SHA-256 digest for {name}.")
+        match = MAC_ASSET_RE.fullmatch(name)
+        if not match or match.group("version") != version:
+            continue
         platform = tuple(
             int(part) for part in match.group("platform").split(".") if part
         )
-        record = (platform, name, digest.split(":", 1)[1])
+        record = (platform, asset)
         current = selected.get(match.group("arch"))
         if current is None or record[0] > current[0]:
             selected[match.group("arch")] = record
@@ -117,10 +135,25 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
             "GAM release is missing supported macOS assets for: "
             + ", ".join(sorted(missing))
         )
-    return [
-        (selected[arch][2], selected[arch][1])
-        for arch in ("arm64", "x86_64")
-    ]
+    if not windows_assets:
+        raise RuntimeError(f"GAM release is missing required Windows asset {windows_name}.")
+    if len(windows_assets) != 1:
+        raise RuntimeError(
+            f"GAM release contains {len(windows_assets)} copies of required Windows asset "
+            f"{windows_name}."
+        )
+
+    required_assets = [
+        selected[arch][1] for arch in ("arm64", "x86_64")
+    ] + windows_assets
+    records: list[tuple[str, str]] = []
+    for asset in required_assets:
+        name = str(asset.get("name") or "")
+        digest = str(asset.get("digest") or "")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise RuntimeError(f"GitHub did not publish a valid SHA-256 digest for {name}.")
+        records.append((digest.removeprefix("sha256:"), name))
+    return records
 
 
 def record_release_checksums(
@@ -128,7 +161,8 @@ def record_release_checksums(
 ) -> None:
     checksums = root / "scripts" / "gam_checksums.txt"
     version = tag.removeprefix("v")
-    prefix = f"gam-{version}-macos"
+    mac_prefix = f"gam-{version}-macos"
+    windows_name = f"gam-{version}-windows-x86_64.zip"
     kept = [
         line
         for line in checksums.read_text(encoding="utf-8").splitlines()
@@ -136,7 +170,10 @@ def record_release_checksums(
             line.strip()
             and not line.lstrip().startswith("#")
             and len(line.split()) >= 2
-            and line.split()[1].startswith(prefix)
+            and (
+                line.split()[1].startswith(mac_prefix)
+                or line.split()[1] == windows_name
+            )
         )
     ]
     additions = [f"{digest}  {name}" for digest, name in records]
@@ -156,10 +193,9 @@ def main() -> int:
     version = match.group(1)
     tag = f"v{version}"
 
-    # Pin both supported Mac assets from GitHub's signed release metadata before the
-    # downloader is allowed to execute either binary.  fetch_gam.sh deliberately
-    # fails closed when the selected asset is not already present in the committed
-    # checksum catalog.
+    # Pin every supported platform asset from GitHub release metadata before any
+    # version marker changes. fetch_gam.sh deliberately fails closed when the
+    # selected Mac asset is not already present in the checksum catalog.
     records = release_checksums(tag)
     record_release_checksums(ROOT, tag, records)
     subprocess.run([str(ROOT / "scripts" / "fetch_gam.sh"), "--tag", tag], cwd=ROOT, check=True)

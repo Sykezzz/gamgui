@@ -7,6 +7,9 @@
 #ifndef SourceSha
   #error SourceSha must be supplied by build_windows_setup.ps1
 #endif
+#ifndef GamVersion
+  #error GamVersion must be supplied by build_windows_setup.ps1
+#endif
 #ifndef CoreBootstrap
   #error CoreBootstrap must be supplied by build_windows_setup.ps1
 #endif
@@ -311,7 +314,7 @@ begin
   DetailsMemo.ReadOnly := True;
   DetailsMemo.ScrollBars := ssVertical;
   DetailsMemo.Text := 'Windows 11 x64' + #13#10 + 'Per-user installation' + #13#10 +
-    'Exact source: {#SourceSha}' + #13#10 + 'Bundled GAM: 7.47.02';
+    'Exact source: {#SourceSha}' + #13#10 + 'Bundled GAM: {#GamVersion}';
   DetailsMemo.Visible := False;
   UpdateSummary;
 

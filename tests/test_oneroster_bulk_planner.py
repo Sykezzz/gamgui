@@ -52,26 +52,28 @@ class BulkPlannerConnector:
 
     async def list_course_participants_many(self, course_ids, role="all"):
         self.calls["rosters"] += 1
-        assert role == "all"
+        assert role in {"teachers", "students"}
         requested = set(course_ids)
         participants = []
         for course in self.courses:
             if course.id not in requested:
                 continue
-            participants.extend(
-                [
+            if role == "teachers":
+                participants.append(
                     CourseParticipant(
                         course_id=course.id,
                         email="teacher@example.org",
                         role="teachers",
-                    ),
+                    )
+                )
+            else:
+                participants.append(
                     CourseParticipant(
                         course_id=course.id,
                         email="student@example.org",
                         role="students",
-                    ),
-                ]
-            )
+                    )
+                )
         return CourseRosterSnapshot.from_participants(
             participants,
             requested,
@@ -98,9 +100,9 @@ class BulkLookupFailureConnector(BulkPlannerConnector):
     async def list_oneroster_managed_courses(self, aliases):
         self.calls["courses"] += 1
         raise GAMError(
-            kind=GAMErrorKind.NOT_FOUND,
+            kind=self.detail_error_kind,
             exit_code=1,
-            stderr="Requested Classroom course alias was not found.",
+            stderr="Bounded Classroom lookup failed.",
         )
 
     async def get_course(self, *_args, **_kwargs):
@@ -155,7 +157,7 @@ def _managed_course(
 
 
 @pytest.mark.asyncio
-async def test_directory_and_classroom_snapshots_begin_concurrently(tmp_path: Path):
+async def test_directory_and_first_bounded_classroom_chunk_begin_concurrently(tmp_path: Path):
     service, import_id = _ready_service(tmp_path)
     connector = ConcurrentSnapshotConnector()
 
@@ -185,34 +187,35 @@ async def test_planner_reuses_each_bulk_snapshot_and_never_reads_details(
         {
             "directory": 1,
             "courses": 1,
-            "rosters": 1,
+            "rosters": 2,
         }
     )
 
 
 @pytest.mark.asyncio
-async def test_bulk_alias_not_found_falls_back_to_bounded_detail_reads(
+async def test_bulk_alias_failure_does_not_fan_out_to_detail_reads(
     tmp_path: Path,
 ):
     service, import_id = _ready_service(tmp_path)
     connector = BulkLookupFailureConnector(GAMErrorKind.NOT_FOUND)
 
-    plan = await service.build_live_plan(
-        connector,
-        import_id,
-        limited_import=True,
-    )
+    with pytest.raises(OneRosterError) as failure:
+        await service.build_live_plan(
+            connector,
+            import_id,
+            limited_import=True,
+        )
 
-    assert service.scope_readiness().ready
-    assert any(action.kind == "course_create" for action in plan.actions)
+    assert failure.value.code == "OR-CLASSROOM-READ"
+    assert not service.scope_readiness().ready
     assert connector.calls["directory"] == 1
     assert connector.calls["courses"] == 1
-    assert connector.calls["get_course"] >= 1
+    assert connector.calls["get_course"] == 0
     assert connector.calls["rosters"] == 0
 
 
 @pytest.mark.asyncio
-async def test_bulk_alias_fallback_still_fails_closed_on_permission_error(
+async def test_bulk_alias_permission_failure_does_not_fan_out(
     tmp_path: Path,
 ):
     service, import_id = _ready_service(tmp_path)
@@ -225,10 +228,10 @@ async def test_bulk_alias_fallback_still_fails_closed_on_permission_error(
             limited_import=True,
         )
 
-    assert failure.value.code == "OR-CLASSROOM-READ"
+    assert failure.value.code == "OR-ONEROSTER-READ-PERMISSION"
     assert not service.scope_readiness().ready
     assert connector.calls["courses"] == 1
-    assert connector.calls["get_course"] >= 1
+    assert connector.calls["get_course"] == 0
 
 
 @pytest.mark.asyncio
@@ -396,7 +399,7 @@ async def test_limited_plan_does_not_reactivate_existing_archived_course(
         {
             "directory": 1,
             "courses": 1,
-            "rosters": 1,
+            "rosters": 2,
         }
     )
 
