@@ -26,11 +26,14 @@ from .models import (
     GateState,
     ImportAction,
     LivePlanningResult,
+    ManagedCourseDirty,
+    ManagedCourseVerification,
     OneRosterError,
     StudentEnrollmentGate,
     canonical_hash,
 )
 from .planner import OneRosterPlanner
+from .semantic import metadata_hash, student_hash, teacher_hash
 from .store import OneRosterStore, action_sequence_hash
 
 
@@ -91,6 +94,12 @@ class _AdaptiveWorkerTuner:
         if self.clean_batches >= 2 and self.level_index < len(ADAPTIVE_WORKER_LEVELS) - 1:
             self.level_index += 1
             self.clean_batches = 0
+
+
+@dataclass(frozen=True)
+class _VerificationRead:
+    results: Mapping[str, bool]
+    verifications: tuple[ManagedCourseVerification, ...]
 
 
 class ExecutableClassroomConnector(Protocol):
@@ -209,6 +218,7 @@ class OneRosterExecutor:
                     manifest.import_id,
                     limited_import=manifest.plan_kind == "limited",
                     now=now,
+                    required_metadata_aliases=tuple(manifest.live_evidence),
                 )
                 self.store.record_execution_planning_receipt(
                     run.id,
@@ -403,6 +413,7 @@ class OneRosterExecutor:
                 manifest.import_id,
                 limited_import=manifest.plan_kind == "limited",
                 now=now,
+                required_metadata_aliases=tuple(manifest.live_evidence),
             )
 
         first = await observe()
@@ -474,6 +485,7 @@ class OneRosterExecutor:
                     manifest.import_id,
                     limited_import=manifest.plan_kind == "limited",
                     now=now,
+                    required_metadata_aliases=tuple(manifest.live_evidence),
                 )
                 await self._validate_preflight(
                     manifest,
@@ -535,7 +547,22 @@ class OneRosterExecutor:
                     actions = self.store.get_manifest_actions_by_id(
                         manifest_id, batch.action_ids
                     )
-                    verified = await self._verify(actions)
+                    verification_read = await self._verify(actions)
+                    verified = verification_read.results
+                    self.store.record_managed_course_verifications(
+                        verification_read.verifications
+                    )
+                    self.store.mark_managed_course_dirty(
+                        _dirty_for_actions(
+                            tuple(
+                                action
+                                for action in actions
+                                if not verified.get(action.id, False)
+                            )
+                        ),
+                        error_code="OR-RECOVERY-VERIFY-INCOMPLETE",
+                        recovery_required=True,
+                    )
                     for action in actions:
                         if not verified.get(action.id, False):
                             continue
@@ -910,6 +937,11 @@ class OneRosterExecutor:
                 durable_batch.id,
                 worker_count=worker_count,
             )
+        self.store.mark_managed_course_dirty(
+            _dirty_for_actions(chunk),
+            error_code="OR-EXECUTION-UNCERTAIN",
+            recovery_required=True,
+        )
         commands = [_command_for(action) for action in chunk]
         batch_failed = False
         throttling_count = 0
@@ -951,8 +983,12 @@ class OneRosterExecutor:
         if batch_receipt is not None:
             throttling_count = int(batch_receipt.throttling_count)
         try:
-            verified, verification_attempts, verification_seconds = (
-                await self._verify_with_retries(chunk, owner_ids)
+            verified, verification_attempts, verification_seconds, verifications = (
+                await self._verify_with_retries(
+                    chunk,
+                    owner_ids,
+                    include_verifications=True,
+                )
             )
             applied = guarded_applied
             failed = guarded_failed
@@ -980,6 +1016,9 @@ class OneRosterExecutor:
                     }:
                         blocked_courses.add(action.subject.casefold())
             if durable_batch is not None:
+                dirty = _dirty_for_actions(
+                    tuple(action for action in chunk if not verified.get(action.id))
+                )
                 completed_batch = self.store.complete_verified_batch(
                     durable_batch.id,
                     manifest_id,
@@ -990,10 +1029,19 @@ class OneRosterExecutor:
                     verification_attempts=verification_attempts,
                     worker_count=worker_count,
                     throttling_count=throttling_count,
+                    managed_verifications=verifications,
+                    managed_dirty=dirty,
                 )
                 persistence_seconds = completed_batch.persistence_seconds
             else:
                 persistence_started = time.perf_counter()
+                self.store.record_managed_course_verifications(verifications)
+                self.store.mark_managed_course_dirty(
+                    _dirty_for_actions(
+                        tuple(action for action in chunk if not verified.get(action.id))
+                    ),
+                    error_code="OR-BATCH-VERIFY-FAILED",
+                )
                 for action_id, (status, detail) in results.items():
                     self.store.mark_action_result(
                         manifest_id,
@@ -1076,10 +1124,13 @@ class OneRosterExecutor:
         self,
         actions: Sequence[ImportAction],
         owner_ids: Optional[Mapping[str, str]],
-    ) -> tuple[dict[str, bool], int, float]:
+        *,
+        include_verifications: bool = False,
+    ) -> Any:
         started = time.perf_counter()
         remaining = list(actions)
         verified = {action.id: False for action in actions}
+        verification_by_alias: dict[str, ManagedCourseVerification] = {}
         attempts = 0
         retry_offsets = (0.0, *self.stabilization_delays)
         for retry_offset in retry_offsets:
@@ -1088,16 +1139,37 @@ class OneRosterExecutor:
             wait_seconds = retry_offset - (time.perf_counter() - started)
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
-            result = await self._verify(remaining, owner_ids)
+            raw_read = await self._verify(remaining, owner_ids)
+            if isinstance(raw_read, _VerificationRead):
+                read_results = raw_read.results
+                read_verifications = raw_read.verifications
+            else:
+                # Keep the focused private-method test seam compatible with
+                # mapping-only verification fakes.
+                read_results = raw_read
+                read_verifications = ()
+            for verification in read_verifications:
+                key = verification.alias.casefold()
+                verification_by_alias[key] = _merge_verification(
+                    verification_by_alias.get(key),
+                    verification,
+                )
             attempts += 1
             next_remaining: list[ImportAction] = []
             for action in remaining:
-                if bool(result.get(action.id)):
+                if bool(read_results.get(action.id)):
                     verified[action.id] = True
                 else:
                     next_remaining.append(action)
             remaining = next_remaining
-        return verified, attempts, time.perf_counter() - started
+        result = (
+            verified,
+            attempts,
+            time.perf_counter() - started,
+        )
+        if include_verifications:
+            return (*result, tuple(verification_by_alias.values()))
+        return result
 
     def _record_performance_audit(
         self,
@@ -1221,7 +1293,7 @@ class OneRosterExecutor:
         self,
         actions: Sequence[ImportAction],
         owner_ids: Optional[Mapping[str, str]] = None,
-    ) -> dict[str, bool]:
+    ) -> _VerificationRead:
         aliases = sorted({action.subject for action in actions})
         bulk_courses = getattr(
             self.connector,
@@ -1262,12 +1334,21 @@ class OneRosterExecutor:
                 return alias.casefold(), detail
 
             details = dict(await asyncio.gather(*(read(alias) for alias in aliases)))
-        roster_aliases = {
+        teacher_aliases = {
             action.subject.casefold()
             for action in actions
-            if action.kind in {"teacher_add", "teacher_remove", "student_add", "student_remove"}
+            if action.kind in {"teacher_add", "teacher_remove"}
         }
-        rosters: dict[str, tuple[set[str], set[str]]] = {}
+        student_aliases = {
+            action.subject.casefold()
+            for action in actions
+            if action.kind in {"student_add", "student_remove"}
+        }
+        roster_aliases = teacher_aliases | student_aliases
+        rosters: dict[
+            str,
+            tuple[Optional[set[str]], Optional[set[str]]],
+        ] = {}
         roster_details = {
             alias: detail
             for alias in sorted(roster_aliases)
@@ -1280,42 +1361,63 @@ class OneRosterExecutor:
             None,
         )
         if roster_details and callable(bulk_rosters):
-            requested_course_ids = [
-                _text(detail, "id") for detail in roster_details.values()
-            ]
-            try:
-                participants = await bulk_rosters(
-                    requested_course_ids,
-                    "all",
-                )
-                if (
-                    not isinstance(participants, CourseRosterSnapshot)
-                    or not participants.covers(requested_course_ids)
-                ):
+            by_course = {
+                _text(detail, "id"): alias
+                for alias, detail in roster_details.items()
+            }
+            both_ids = sorted(
+                course_id
+                for course_id, alias in by_course.items()
+                if alias in teacher_aliases and alias in student_aliases
+            )
+            teacher_ids = sorted(
+                course_id
+                for course_id, alias in by_course.items()
+                if alias in teacher_aliases and alias not in student_aliases
+            )
+            student_ids = sorted(
+                course_id
+                for course_id, alias in by_course.items()
+                if alias in student_aliases and alias not in teacher_aliases
+            )
+            for requested_course_ids, role in (
+                (both_ids, "all"),
+                (teacher_ids, "teachers"),
+                (student_ids, "students"),
+            ):
+                if not requested_course_ids:
+                    continue
+                try:
+                    participants = await bulk_rosters(requested_course_ids, role)
+                    complete = bool(
+                        isinstance(participants, CourseRosterSnapshot)
+                        and participants.covers(requested_course_ids)
+                    )
+                except Exception:
+                    complete = False
                     participants = None
-            except Exception:
-                participants = None
-            if participants is not None:
-                by_course = {
-                    _text(detail, "id"): alias
-                    for alias, detail in roster_details.items()
-                }
-                rosters.update(
-                    {
-                        alias: (
-                            set(participants.for_course(course_id)[0]),
-                            set(participants.for_course(course_id)[1]),
-                        )
-                        for course_id, alias in by_course.items()
-                    }
-                )
+                if not complete or participants is None:
+                    continue
+                for course_id in requested_course_ids:
+                    alias = by_course[course_id]
+                    teachers, students = participants.for_course(course_id)
+                    rosters[alias] = (
+                        set(teachers) if role in {"all", "teachers"} else None,
+                        set(students) if role in {"all", "students"} else None,
+                    )
         elif roster_details:
             for alias, detail in roster_details.items():
                 course_id = _text(detail, "id")
+                teachers_needed = alias in teacher_aliases
+                students_needed = alias in student_aliases
                 try:
                     teachers, students = await asyncio.gather(
-                        self.connector.list_course_participants(course_id, "teachers"),
-                        self.connector.list_course_participants(course_id, "students"),
+                        self.connector.list_course_participants(course_id, "teachers")
+                        if teachers_needed
+                        else asyncio.sleep(0, result=()),
+                        self.connector.list_course_participants(course_id, "students")
+                        if students_needed
+                        else asyncio.sleep(0, result=()),
                     )
                 except Exception:
                     continue
@@ -1326,18 +1428,124 @@ class OneRosterExecutor:
                     # A course-only GAM row is not proof of a complete roster.
                     continue
                 rosters[alias] = (
-                    {_participant_email(item) for item in teachers if _participant_email(item)},
-                    {_participant_email(item) for item in students if _participant_email(item)},
+                    {_participant_email(item) for item in teachers if _participant_email(item)}
+                    if teachers_needed
+                    else None,
+                    {_participant_email(item) for item in students if _participant_email(item)}
+                    if students_needed
+                    else None,
                 )
-        return {
-            action.id: _verify_action(
+        action_results: dict[str, bool] = {}
+        for action in actions:
+            alias = action.subject.casefold()
+            roster = rosters.get(alias)
+            if action.kind in {"teacher_add", "teacher_remove"} and (
+                roster is None or roster[0] is None
+            ):
+                action_roster = None
+            elif action.kind in {"student_add", "student_remove"} and (
+                roster is None or roster[1] is None
+            ):
+                action_roster = None
+            else:
+                action_roster = (
+                    set(roster[0] or ()),
+                    set(roster[1] or ()),
+                ) if roster is not None else None
+            action_results[action.id] = _verify_action(
                 action,
-                details.get(action.subject.casefold()),
-                rosters.get(action.subject.casefold()),
+                details.get(alias),
+                action_roster,
                 owner_ids or {},
             )
-            for action in actions
+
+        states = self.store.get_managed_course_states(aliases)
+        kinds_by_alias: dict[str, set[str]] = {}
+        for action in actions:
+            kinds_by_alias.setdefault(action.subject.casefold(), set()).add(action.kind)
+        owners_by_id = {
+            str(user_id): str(email).casefold()
+            for email, user_id in (owner_ids or {}).items()
+            if str(user_id)
         }
+        verifications: list[ManagedCourseVerification] = []
+        metadata_kinds = {
+            "course_create",
+            "course_update",
+            "course_activate",
+            "course_archive",
+            "owner_transfer",
+        }
+        for alias in aliases:
+            key = alias.casefold()
+            if key not in states:
+                continue
+            detail = details.get(key)
+            if detail is None or not _has_alias(detail, alias):
+                continue
+            course_id = _text(detail, "id")
+            if not course_id:
+                continue
+            kinds = kinds_by_alias.get(key, set())
+            metadata_needed = bool(kinds & metadata_kinds)
+            teachers_needed = bool(kinds & {"teacher_add", "teacher_remove"})
+            students_needed = bool(kinds & {"student_add", "student_remove"})
+            roster = rosters.get(key)
+            owner_email = _text(detail, "owner_email", "ownerEmail").casefold()
+            if not owner_email:
+                owner_email = owners_by_id.get(
+                    _text(detail, "owner_id", "ownerId"),
+                    "",
+                )
+            state = _text(detail, "course_state", "courseState").upper()
+            metadata_covered = bool(metadata_needed and owner_email and state)
+            teacher_members = (
+                tuple(sorted(roster[0]))
+                if teachers_needed and roster is not None and roster[0] is not None
+                else None
+            )
+            student_members = (
+                tuple(sorted(roster[1]))
+                if students_needed and roster is not None and roster[1] is not None
+                else None
+            )
+            if not (metadata_covered or teacher_members is not None or student_members is not None):
+                continue
+            verifications.append(
+                ManagedCourseVerification(
+                    alias=alias,
+                    course_id=course_id,
+                    metadata_hash=(
+                        metadata_hash(
+                            alias,
+                            _text(detail, "name"),
+                            owner_email,
+                            _text(detail, "room"),
+                            _text(detail, "section"),
+                            state,
+                        )
+                        if metadata_covered
+                        else None
+                    ),
+                    teacher_hash=(
+                        teacher_hash(teacher_members)
+                        if teacher_members is not None
+                        else None
+                    ),
+                    student_hash=(
+                        student_hash(student_members)
+                        if student_members is not None
+                        else None
+                    ),
+                    teacher_members=teacher_members,
+                    student_members=student_members,
+                    course_state=state if metadata_covered else None,
+                )
+            )
+        return _VerificationRead(
+            results=action_results,
+            verifications=tuple(verifications),
+        )
 
 
 def _command_for(action: ImportAction) -> list[str]:
@@ -1438,6 +1646,77 @@ def _verify_action(
     if action.kind == "student_remove":
         return target not in students
     return False
+
+
+def _dirty_for_actions(
+    actions: Sequence[ImportAction],
+) -> tuple[ManagedCourseDirty, ...]:
+    by_alias: dict[str, dict[str, bool]] = {}
+    metadata_kinds = {
+        "course_create",
+        "course_update",
+        "course_activate",
+        "course_archive",
+        "owner_transfer",
+    }
+    for action in actions:
+        scopes = by_alias.setdefault(
+            action.subject,
+            {"metadata": False, "teachers": False, "students": False},
+        )
+        if action.kind in metadata_kinds:
+            scopes["metadata"] = True
+        elif action.kind in {"teacher_add", "teacher_remove"}:
+            scopes["teachers"] = True
+        elif action.kind in {"student_add", "student_remove"}:
+            scopes["students"] = True
+    return tuple(
+        ManagedCourseDirty(alias=alias, **scopes)
+        for alias, scopes in sorted(by_alias.items(), key=lambda item: item[0].casefold())
+        if any(scopes.values())
+    )
+
+
+def _merge_verification(
+    previous: Optional[ManagedCourseVerification],
+    current: ManagedCourseVerification,
+) -> ManagedCourseVerification:
+    if previous is None:
+        return current
+    return ManagedCourseVerification(
+        alias=current.alias,
+        course_id=current.course_id or previous.course_id,
+        source_class_id=current.source_class_id or previous.source_class_id,
+        last_seen_import_id=current.last_seen_import_id or previous.last_seen_import_id,
+        metadata_hash=(
+            current.metadata_hash
+            if current.metadata_hash is not None
+            else previous.metadata_hash
+        ),
+        teacher_hash=(
+            current.teacher_hash
+            if current.teacher_hash is not None
+            else previous.teacher_hash
+        ),
+        student_hash=(
+            current.student_hash
+            if current.student_hash is not None
+            else previous.student_hash
+        ),
+        teacher_members=(
+            current.teacher_members
+            if current.teacher_members is not None
+            else previous.teacher_members
+        ),
+        student_members=(
+            current.student_members
+            if current.student_members is not None
+            else previous.student_members
+        ),
+        course_state=current.course_state or previous.course_state,
+        verified_at=max(previous.verified_at, current.verified_at),
+        clear_recovery=previous.clear_recovery and current.clear_recovery,
+    )
 
 
 def _gate_allows(

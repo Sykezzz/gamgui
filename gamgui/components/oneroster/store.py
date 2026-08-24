@@ -44,6 +44,10 @@ from .models import (
     ImportAction,
     ImportIssue,
     IssueSeverity,
+    ManagedCourseDesired,
+    ManagedCourseDirty,
+    ManagedCourseState,
+    ManagedCourseVerification,
     ManifestPage,
     MAX_PAGE_SIZE,
     OneRosterError,
@@ -67,6 +71,7 @@ from .preview_index import (
     preview_total,
     source_rows,
 )
+from .semantic import normalize_email_values, student_hash, teacher_hash
 from .thresholds import evaluation_hash
 
 
@@ -96,7 +101,6 @@ _PROGRESS_PHASES = (
         frozenset({"student_add", "student_remove"}),
     ),
 )
-
 
 def _progress_phase(kind: str) -> tuple[str, str]:
     normalized = str(kind or "").casefold()
@@ -558,6 +562,346 @@ class OneRosterStore:
             conn.execute(
                 "UPDATE imports SET accepted_at = ? WHERE domain = ? AND id = ?",
                 (accepted_at, self.domain, import_id),
+            )
+
+    def get_managed_course_states(
+        self,
+        aliases: Optional[Sequence[str]] = None,
+    ) -> dict[str, ManagedCourseState]:
+        """Return durable verification state keyed by case-folded exact alias."""
+
+        requested = (
+            {_managed_alias(alias).casefold() for alias in aliases}
+            if aliases is not None
+            else None
+        )
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM managed_course_state
+                WHERE domain = ? ORDER BY alias COLLATE NOCASE
+                """,
+                (self.domain,),
+            ).fetchall()
+        return {
+            str(row["alias"]).casefold(): _managed_course_state_from_row(row)
+            for row in rows
+            if requested is None or str(row["alias"]).casefold() in requested
+        }
+
+    def record_managed_course_desired(
+        self,
+        values: Sequence[ManagedCourseDesired],
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        """Persist authoritative desired hashes without claiming live verification."""
+
+        timestamp = float(now if now is not None else time.time())
+        normalized: list[ManagedCourseDesired] = []
+        for value in values:
+            normalized.append(
+                ManagedCourseDesired(
+                    alias=_managed_alias(value.alias),
+                    import_id=str(value.import_id or "").strip(),
+                    metadata_hash=_validate_digest(value.metadata_hash),
+                    teacher_hash=_validate_digest(value.teacher_hash),
+                    student_hash=_validate_digest(value.student_hash),
+                    source_class_id=str(value.source_class_id or "").strip(),
+                )
+            )
+        if not normalized:
+            return
+        with closing(self._conn()) as conn, conn:
+            conn.executemany(
+                """
+                INSERT INTO managed_course_state (
+                    domain, alias, course_id, source_class_id, last_seen_import_id,
+                    desired_metadata_hash, desired_teacher_hash, desired_student_hash,
+                    verified_metadata_hash, verified_teacher_hash, verified_student_hash,
+                    last_metadata_verified_at, last_teacher_verified_at,
+                    last_student_verified_at, verified_course_state,
+                    metadata_dirty, teacher_roster_dirty, student_roster_dirty,
+                    recovery_required, last_error_code, version, updated_at
+                ) VALUES (
+                    ?, ?, '', ?, ?, ?, ?, ?, '', '', '', 0, 0, 0, '',
+                    1, 1, 1, 0, '', 1, ?
+                )
+                ON CONFLICT(domain, alias) DO UPDATE SET
+                    source_class_id = excluded.source_class_id,
+                    last_seen_import_id = excluded.last_seen_import_id,
+                    metadata_dirty = CASE
+                        WHEN managed_course_state.verified_metadata_hash != excluded.desired_metadata_hash
+                        THEN 1 ELSE managed_course_state.metadata_dirty END,
+                    teacher_roster_dirty = CASE
+                        WHEN managed_course_state.verified_teacher_hash != excluded.desired_teacher_hash
+                        THEN 1 ELSE managed_course_state.teacher_roster_dirty END,
+                    student_roster_dirty = CASE
+                        WHEN managed_course_state.verified_student_hash != excluded.desired_student_hash
+                        THEN 1 ELSE managed_course_state.student_roster_dirty END,
+                    desired_metadata_hash = excluded.desired_metadata_hash,
+                    desired_teacher_hash = excluded.desired_teacher_hash,
+                    desired_student_hash = excluded.desired_student_hash,
+                    version = managed_course_state.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    (
+                        self.domain,
+                        value.alias,
+                        value.source_class_id,
+                        value.import_id,
+                        value.metadata_hash,
+                        value.teacher_hash,
+                        value.student_hash,
+                        timestamp,
+                    )
+                    for value in normalized
+                ),
+            )
+
+    def record_managed_course_verifications(
+        self,
+        values: Sequence[ManagedCourseVerification],
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        """Persist only explicitly covered live scopes in one transaction."""
+
+        if not values:
+            return
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            for value in values:
+                self._record_managed_course_verification(
+                    conn,
+                    value,
+                    timestamp=timestamp,
+                )
+
+    def mark_managed_course_dirty(
+        self,
+        values: Sequence[ManagedCourseDirty],
+        *,
+        error_code: str,
+        recovery_required: bool = False,
+        now: Optional[float] = None,
+    ) -> None:
+        """Mark only uncertain scopes dirty; unrelated verification stays valid."""
+
+        if not values:
+            return
+        timestamp = float(now if now is not None else time.time())
+        with closing(self._conn()) as conn, conn:
+            for value in values:
+                alias = _managed_alias(value.alias)
+                conn.execute(
+                    """
+                    UPDATE managed_course_state SET
+                        metadata_dirty = CASE WHEN ? THEN 1 ELSE metadata_dirty END,
+                        teacher_roster_dirty = CASE WHEN ? THEN 1 ELSE teacher_roster_dirty END,
+                        student_roster_dirty = CASE WHEN ? THEN 1 ELSE student_roster_dirty END,
+                        recovery_required = CASE WHEN ? THEN 1 ELSE recovery_required END,
+                        last_error_code = ?, version = version + 1, updated_at = ?
+                    WHERE domain = ? AND alias = ?
+                    """,
+                    (
+                        bool(value.metadata),
+                        bool(value.teachers),
+                        bool(value.students),
+                        bool(recovery_required),
+                        str(error_code or "")[:100],
+                        timestamp,
+                        self.domain,
+                        alias,
+                    ),
+                )
+
+    def verified_managed_members(self, alias: str, role: str) -> tuple[str, ...]:
+        managed_alias = _managed_alias(alias)
+        normalized_role = str(role or "").strip().casefold()
+        if normalized_role not in {"teachers", "students"}:
+            raise ValueError("Managed-course role must be teachers or students.")
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT email FROM managed_course_members
+                WHERE domain = ? AND alias = ? AND role = ?
+                ORDER BY email
+                """,
+                (self.domain, managed_alias, normalized_role),
+            ).fetchall()
+        return tuple(str(row["email"]) for row in rows)
+
+    def verified_managed_members_many(
+        self,
+        aliases: Sequence[str],
+    ) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        requested = {_managed_alias(alias).casefold() for alias in aliases}
+        result: dict[str, tuple[list[str], list[str]]] = {
+            alias: ([], []) for alias in requested
+        }
+        if not requested:
+            return {}
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT alias, role, email FROM managed_course_members
+                WHERE domain = ? ORDER BY alias COLLATE NOCASE, role, email
+                """,
+                (self.domain,),
+            ).fetchall()
+        for row in rows:
+            key = str(row["alias"]).casefold()
+            if key not in result:
+                continue
+            teachers, students = result[key]
+            (teachers if str(row["role"]) == "teachers" else students).append(
+                str(row["email"])
+            )
+        return {
+            alias: (tuple(teachers), tuple(students))
+            for alias, (teachers, students) in result.items()
+        }
+
+    def select_managed_audit_aliases(
+        self,
+        aliases: Sequence[str],
+        *,
+        limit: int = 25,
+    ) -> tuple[str, ...]:
+        """Choose the oldest fully verified eligible aliases deterministically."""
+
+        cap = max(0, min(int(limit), 25))
+        if not cap:
+            return ()
+        requested = {_managed_alias(alias).casefold() for alias in aliases}
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT alias,
+                       MIN(last_metadata_verified_at,
+                           last_teacher_verified_at,
+                           last_student_verified_at) AS oldest
+                FROM managed_course_state
+                WHERE domain = ?
+                  AND metadata_dirty = 0
+                  AND teacher_roster_dirty = 0
+                  AND student_roster_dirty = 0
+                  AND recovery_required = 0
+                ORDER BY oldest ASC, alias COLLATE NOCASE ASC
+                """,
+                (self.domain,),
+            ).fetchall()
+        return tuple(
+            str(row["alias"])
+            for row in rows
+            if str(row["alias"]).casefold() in requested
+        )[:cap]
+
+    def _record_managed_course_verification(
+        self,
+        conn: sqlite3.Connection,
+        value: ManagedCourseVerification,
+        *,
+        timestamp: float,
+    ) -> None:
+        alias = _managed_alias(value.alias)
+        row = conn.execute(
+            "SELECT * FROM managed_course_state WHERE domain = ? AND alias = ?",
+            (self.domain, alias),
+        ).fetchone()
+        if row is None:
+            raise OneRosterError(
+                "OR-MANAGED-STATE-MISSING",
+                "Live verification cannot adopt an unregistered Classroom course.",
+            )
+        course_id = str(value.course_id or "").strip()
+        existing_id = str(row["course_id"] or "").strip()
+        if existing_id and course_id and existing_id != course_id:
+            raise OneRosterError(
+                "OR-MANAGED-COURSE-ID-DRIFT",
+                "The exact managed alias resolved to a different Classroom course.",
+            )
+        effective_course_id = course_id or existing_id
+        verified_at = float(value.verified_at or timestamp)
+        updates: dict[str, Any] = {
+            "course_id": effective_course_id,
+            "source_class_id": str(value.source_class_id or row["source_class_id"] or ""),
+            "last_seen_import_id": str(value.last_seen_import_id or row["last_seen_import_id"] or ""),
+            "last_error_code": "",
+            "updated_at": timestamp,
+        }
+        if value.metadata_hash is not None:
+            updates.update(
+                verified_metadata_hash=_validate_digest(value.metadata_hash),
+                last_metadata_verified_at=verified_at,
+                verified_course_state=str(value.course_state or "").strip().upper(),
+                metadata_dirty=0,
+            )
+        for role, supplied_hash, supplied_members, hash_function, dirty_column, time_column, hash_column in (
+            (
+                "teachers",
+                value.teacher_hash,
+                value.teacher_members,
+                teacher_hash,
+                "teacher_roster_dirty",
+                "last_teacher_verified_at",
+                "verified_teacher_hash",
+            ),
+            (
+                "students",
+                value.student_hash,
+                value.student_members,
+                student_hash,
+                "student_roster_dirty",
+                "last_student_verified_at",
+                "verified_student_hash",
+            ),
+        ):
+            if supplied_hash is None:
+                if supplied_members is not None:
+                    raise ValueError("Managed-course members require a matching verified hash.")
+                continue
+            if supplied_members is None:
+                raise ValueError("A verified roster hash requires covered member evidence.")
+            members = normalize_email_values(supplied_members)
+            digest = _validate_digest(supplied_hash)
+            if hash_function(members) != digest:
+                raise ValueError("Managed-course roster members do not match the verified hash.")
+            conn.execute(
+                "DELETE FROM managed_course_members WHERE domain = ? AND alias = ? AND role = ?",
+                (self.domain, alias, role),
+            )
+            conn.executemany(
+                """
+                INSERT INTO managed_course_members(domain, alias, role, email, verified_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ((self.domain, alias, role, email, verified_at) for email in members),
+            )
+            updates[hash_column] = digest
+            updates[time_column] = verified_at
+            updates[dirty_column] = 0
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        conn.execute(
+            f"""
+            UPDATE managed_course_state SET {assignments}, version = version + 1
+            WHERE domain = ? AND alias = ?
+            """,
+            (*updates.values(), self.domain, alias),
+        )
+        if value.clear_recovery:
+            conn.execute(
+                """
+                UPDATE managed_course_state
+                SET recovery_required = CASE
+                    WHEN metadata_dirty = 0 AND teacher_roster_dirty = 0
+                         AND student_roster_dirty = 0 THEN 0
+                    ELSE recovery_required END
+                WHERE domain = ? AND alias = ?
+                """,
+                (self.domain, alias),
             )
 
     def maybe_mark_import_accepted(
@@ -1519,6 +1863,8 @@ class OneRosterStore:
         verification_attempts: int,
         worker_count: int,
         throttling_count: int = 0,
+        managed_verifications: Sequence[ManagedCourseVerification] = (),
+        managed_dirty: Sequence[ManagedCourseDirty] = (),
         now: Optional[float] = None,
     ) -> ExecutionBatch:
         """Atomically save exact verified results and complete their durable batch."""
@@ -1604,6 +1950,33 @@ class OneRosterStore:
                 raise OneRosterError(
                     "OR-BATCH-ACTIONS-CHANGED",
                     "Not every immutable batch action could be updated.",
+                )
+            for verification in managed_verifications:
+                self._record_managed_course_verification(
+                    conn,
+                    verification,
+                    timestamp=timestamp,
+                )
+            for dirty in managed_dirty:
+                alias = _managed_alias(dirty.alias)
+                conn.execute(
+                    """
+                    UPDATE managed_course_state SET
+                        metadata_dirty = CASE WHEN ? THEN 1 ELSE metadata_dirty END,
+                        teacher_roster_dirty = CASE WHEN ? THEN 1 ELSE teacher_roster_dirty END,
+                        student_roster_dirty = CASE WHEN ? THEN 1 ELSE student_roster_dirty END,
+                        last_error_code = 'OR-BATCH-VERIFY-FAILED',
+                        version = version + 1, updated_at = ?
+                    WHERE domain = ? AND alias = ?
+                    """,
+                    (
+                        bool(dirty.metadata),
+                        bool(dirty.teachers),
+                        bool(dirty.students),
+                        timestamp,
+                        self.domain,
+                        alias,
+                    ),
                 )
             failed = any(status == "failed" for status, _detail in normalized.values())
             persistence_seconds = time.perf_counter() - persist_started
@@ -2866,6 +3239,52 @@ class OneRosterStore:
                 );
                 CREATE INDEX IF NOT EXISTS accepted_aliases_domain_time
                     ON accepted_managed_aliases(domain, accepted_at DESC, alias);
+                CREATE TABLE IF NOT EXISTS managed_course_state (
+                    domain TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    course_id TEXT NOT NULL DEFAULT '',
+                    source_class_id TEXT NOT NULL DEFAULT '',
+                    last_seen_import_id TEXT NOT NULL DEFAULT '',
+                    desired_metadata_hash TEXT NOT NULL DEFAULT '',
+                    desired_teacher_hash TEXT NOT NULL DEFAULT '',
+                    desired_student_hash TEXT NOT NULL DEFAULT '',
+                    verified_metadata_hash TEXT NOT NULL DEFAULT '',
+                    verified_teacher_hash TEXT NOT NULL DEFAULT '',
+                    verified_student_hash TEXT NOT NULL DEFAULT '',
+                    last_metadata_verified_at REAL NOT NULL DEFAULT 0,
+                    last_teacher_verified_at REAL NOT NULL DEFAULT 0,
+                    last_student_verified_at REAL NOT NULL DEFAULT 0,
+                    verified_course_state TEXT NOT NULL DEFAULT '',
+                    metadata_dirty INTEGER NOT NULL DEFAULT 1,
+                    teacher_roster_dirty INTEGER NOT NULL DEFAULT 1,
+                    student_roster_dirty INTEGER NOT NULL DEFAULT 1,
+                    recovery_required INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(domain, alias)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS managed_course_state_course_id
+                    ON managed_course_state(domain, course_id)
+                    WHERE course_id != '';
+                CREATE INDEX IF NOT EXISTS managed_course_state_audit
+                    ON managed_course_state(
+                        domain, metadata_dirty, teacher_roster_dirty,
+                        student_roster_dirty, recovery_required,
+                        last_metadata_verified_at, last_teacher_verified_at,
+                        last_student_verified_at, alias
+                    );
+                CREATE TABLE IF NOT EXISTS managed_course_members (
+                    domain TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('teachers', 'students')),
+                    email TEXT NOT NULL,
+                    verified_at REAL NOT NULL,
+                    PRIMARY KEY(domain, alias, role, email),
+                    FOREIGN KEY(domain, alias)
+                        REFERENCES managed_course_state(domain, alias)
+                        ON DELETE CASCADE
+                );
                 """
             )
             _ensure_column(
@@ -3068,6 +3487,47 @@ def _snapshot_write_conn(path: Path) -> sqlite3.Connection:
     except BaseException:
         conn.close()
         raise
+
+
+def _managed_alias(value: object) -> str:
+    alias = str(value or "").strip()
+    if (
+        not alias.startswith("Section_")
+        or len(alias) == len("Section_")
+        or any(character in alias for character in "\r\n\x00")
+    ):
+        raise OneRosterError(
+            "OR-ALIAS-INVALID",
+            "A managed Classroom alias must use the exact Section_<ID> form.",
+        )
+    return alias
+
+
+def _managed_course_state_from_row(row: sqlite3.Row) -> ManagedCourseState:
+    return ManagedCourseState(
+        domain=str(row["domain"]),
+        alias=str(row["alias"]),
+        course_id=str(row["course_id"] or ""),
+        source_class_id=str(row["source_class_id"] or ""),
+        last_seen_import_id=str(row["last_seen_import_id"] or ""),
+        desired_metadata_hash=str(row["desired_metadata_hash"] or ""),
+        desired_teacher_hash=str(row["desired_teacher_hash"] or ""),
+        desired_student_hash=str(row["desired_student_hash"] or ""),
+        verified_metadata_hash=str(row["verified_metadata_hash"] or ""),
+        verified_teacher_hash=str(row["verified_teacher_hash"] or ""),
+        verified_student_hash=str(row["verified_student_hash"] or ""),
+        last_metadata_verified_at=float(row["last_metadata_verified_at"] or 0),
+        last_teacher_verified_at=float(row["last_teacher_verified_at"] or 0),
+        last_student_verified_at=float(row["last_student_verified_at"] or 0),
+        verified_course_state=str(row["verified_course_state"] or ""),
+        metadata_dirty=bool(row["metadata_dirty"]),
+        teacher_roster_dirty=bool(row["teacher_roster_dirty"]),
+        student_roster_dirty=bool(row["student_roster_dirty"]),
+        recovery_required=bool(row["recovery_required"]),
+        last_error_code=str(row["last_error_code"] or ""),
+        version=int(row["version"] or 1),
+        updated_at=float(row["updated_at"] or 0),
+    )
 
 
 def _managed_aliases_from_snapshot(path: Path, domain: str) -> tuple[str, ...]:
