@@ -5,6 +5,8 @@ import sys
 
 import pytest
 
+from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,7 +50,16 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "$attempt -le 3" in fetch
     assert "Reusing checksum-verified" in fetch
     assert "gam.exe" in fetch
-    assert "gam-7.47.02-windows-x86_64.zip" in checksums
+    assert "& $stagedGam version simple" in fetch
+    assert "$reportedVersion -cne $requestedVersion" in fetch
+    assert "-not $cacheVerified" in fetch
+    assert "Get-Command gam" not in fetch
+    assert "https://github.com/GAM-team/GAM/releases/download/$Tag/$assetName" in fetch
+    assert "sourceforge" not in fetch.lower()
+    assert f"gam-{EXPECTED_GAM_VERSION}-windows-x86_64.zip" in checksums
+    assert "EXPECTED_GAM_VERSION" in script
+    assert 'if ($embeddedGamTag -cne "v$expectedGamVersion")' in script
+    assert "7.47.02" not in script
 
 
 def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():
@@ -146,6 +157,9 @@ def test_windows_setup_wizard_is_native_offline_and_fail_closed():
     assert "Refusing a validation-only signer switch in public Setup" in wizard
     assert "SETUP-RUNNING-SELF-TEST" in wizard
     assert "Also delete local application data" in wizard
+    assert "GamVersion must be supplied by build_windows_setup.ps1" in wizard
+    assert "Bundled GAM: {#GamVersion}" in wizard
+    assert "7.47.02" not in wizard
 
     preflight = (ROOT / "scripts" / "windows_signer_preflight.ps1").read_text(
         encoding="utf-8"
@@ -219,6 +233,10 @@ def test_windows_setup_builder_pins_compiler_and_emits_unsigned_receipts():
     assert 'signing_status = "NotSigned"' in build
     assert "windows-bootstrap-manifest.json" in build
     assert "gamgui-windows-setup-release-v1" in build
+    assert "EXPECTED_GAM_VERSION" in build
+    assert '"/DGamVersion=$gamVersion"' in build
+    assert "gam_version = $gamVersion" in build
+    assert "7.47.02" not in build
 
 
 def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
@@ -264,6 +282,8 @@ def test_windows_prerelease_is_exact_sha_protected_and_exercises_setup():
     assert "Setup process $($Process.Id) could not be stopped" in exercise
     assert "Temporary CI identity enrollment exceeded 60 seconds" in exercise
     assert "-RedirectStandardOutput $stdout" in exercise
+    assert "EXPECTED_GAM_VERSION" in workflow
+    assert "7.47.02" not in workflow
 
 
 def test_exact_sha_build_rejects_untracked_packaged_source():

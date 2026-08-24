@@ -14,6 +14,7 @@ sub-command and our builders break only against a live tenant. They need no cred
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -103,11 +104,54 @@ def test_catalog_matches_grammar():
     assert len(data["commands"]) == len(fresh), "command_catalog.json is stale — regenerate it after the GAM bump"
 
 
-def test_pinned_version_consistent():
+def _assert_pinned_version_contract(*, windows_fetch: str | None = None) -> None:
     # Committed sources of the pin must agree. (The vendored VERSION file is checked in the gam-compat
     # CI step instead — after a real fetch — since locally it may be a placeholder.)
+    assert EXPECTED_GAM_VERSION == "7.47.06"
+
     fetch = (ROOT / "scripts" / "fetch_gam.sh").read_text()
     assert f'TAG="v{EXPECTED_GAM_VERSION}"' in fetch, "scripts/fetch_gam.sh TAG must match EXPECTED_GAM_VERSION"
 
+    if windows_fetch is None:
+        windows_fetch = (ROOT / "scripts" / "fetch_gam_windows.ps1").read_text()
+    windows_defaults = re.findall(
+        r'\[string\]\$Tag\s*=\s*"v([^"]+)"',
+        windows_fetch,
+    )
+    assert windows_defaults == [EXPECTED_GAM_VERSION], (
+        "scripts/fetch_gam_windows.ps1 default Tag must match EXPECTED_GAM_VERSION"
+    )
+
     mock = (ROOT / "tests" / "fixtures" / "mock_gam.sh").read_text()
     assert EXPECTED_GAM_VERSION in mock, "mock_gam.sh must echo EXPECTED_GAM_VERSION"
+
+    checksums = (ROOT / "scripts" / "gam_checksums.txt").read_text()
+    windows_asset = f"gam-{EXPECTED_GAM_VERSION}-windows-x86_64.zip"
+    checksum_records = re.findall(
+        rf"^([0-9a-f]{{64}})\s+{re.escape(windows_asset)}$",
+        checksums,
+        re.MULTILINE,
+    )
+    assert len(checksum_records) == 1, (
+        f"scripts/gam_checksums.txt must contain exactly one lowercase SHA-256 for {windows_asset}"
+    )
+
+    workflow = (ROOT / ".github" / "workflows" / "windows-prerelease.yml").read_text()
+    assert "7.47.02" not in workflow, "Windows prerelease workflow still requires GAM 7.47.02"
+
+    bump = (ROOT / "scripts" / "bump_gam.py").read_text()
+    assert "windows-x86_64.zip" in bump, "bump_gam.py must select the Windows x86_64 ZIP"
+    assert "fetch_gam_windows.ps1" in bump, "bump_gam.py must update the Windows fetcher"
+
+
+def test_pinned_version_consistent():
+    _assert_pinned_version_contract()
+
+
+def test_windows_fetcher_only_drift_fails_version_consistency_contract():
+    windows_fetch = (ROOT / "scripts" / "fetch_gam_windows.ps1").read_text()
+    drifted = windows_fetch.replace('"v7.47.06"', '"v7.47.02"', 1)
+    assert drifted != windows_fetch
+
+    with pytest.raises(AssertionError, match="fetch_gam_windows.*default Tag"):
+        _assert_pinned_version_contract(windows_fetch=drifted)

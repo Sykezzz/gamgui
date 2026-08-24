@@ -10,6 +10,14 @@ $ErrorActionPreference = "Stop"
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw "The Windows Setup wizard must be built on Windows." }
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repoRoot
+$python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw "Run uv sync with the dev, desktop, and build extras first." }
+$gamVersionOutput = & $python -c "from gamgui.core.gam.commands import EXPECTED_GAM_VERSION; print(EXPECTED_GAM_VERSION)"
+$gamVersionExitCode = $LASTEXITCODE
+$gamVersion = ($gamVersionOutput | Out-String).Trim()
+if ($gamVersionExitCode -ne 0 -or $gamVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "The repository GAM source pin is invalid."
+}
 $sourceSha = (& git rev-parse HEAD).Trim().ToLowerInvariant()
 if (-not $ExpectedSha) { $ExpectedSha = $sourceSha }
 if ($ExpectedSha -notmatch '^[0-9a-fA-F]{40}$' -or $sourceSha -ne $ExpectedSha.ToLowerInvariant()) {
@@ -112,6 +120,7 @@ $defines = @(
     "/DSourceRoot=$repoRoot",
     "/DOutputRoot=$outputRoot",
     "/DSourceSha=$sourceSha",
+    "/DGamVersion=$gamVersion",
     "/DCoreBootstrap=$coreBootstrap",
     "/DClassroomBootstrap=$classroomBootstrap"
 )
@@ -147,7 +156,7 @@ $releaseManifest = [ordered]@{
     platform = "windows"
     architecture = "x86_64"
     profiles = @($profileReceipts)
-    gam_version = "7.47.02"
+    gam_version = $gamVersion
     setup = [ordered]@{
         file = [System.IO.Path]::GetFileName($setupPath)
         bytes = $setupSize
