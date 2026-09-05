@@ -337,7 +337,7 @@ intentional dependency change, regenerate and review the lock with exactly `uv 0
 `uv lock --check` and the complete offline suite.
 
 The GAM7 binary is **not committed** (platform-specific, large) — `make gam` / `scripts/fetch_gam.sh`
-fetches the pinned version (`v7.47.06`) from the official releases and records its checksum.
+fetches the pinned version (`v7.48.05`) from the official releases and records its checksum.
 
 `make setup` auto-selects a usable Python 3.10+ when `PYTHON` is unset; set
 `PYTHON=/path/to/python` to choose one explicitly.
@@ -442,7 +442,7 @@ alone is not local-update evidence; the updater requires `update-ready` on the e
 ### Staying current with GAM (and not breaking on updates)
 
 GamGUI pins a tested GAM7 version — `EXPECTED_GAM_VERSION` in `gamgui/core/gam/commands.py`, matched by
-`scripts/fetch_gam.sh`. The tested pin is currently **GAM 7.47.06**. The running app never downloads
+`scripts/fetch_gam.sh`. The tested pin is currently **GAM 7.48.05**. The running app never downloads
 or substitutes an unpinned GAM binary:
 
 - **Automated pin PR** (`.github/workflows/gam-update.yml`) compares the latest GAM release with the
