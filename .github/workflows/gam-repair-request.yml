@@ -1,0 +1,223 @@
+name: GAM bump repair request
+
+on:
+  workflow_run:
+    workflows: [Update GAM7 pin]
+    types: [completed]
+    branches: [district-main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Metadata-only delivery test using public historical failure 36756291192
+        required: true
+        type: choice
+        options: [historical-delivery-test]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: gam-bump-repair-request-${{ github.event.workflow_run.head_sha || 'historical-delivery-test' }}
+  cancel-in-progress: false
+
+jobs:
+  request:
+    if: >-
+      github.repository_id == '1309243040' &&
+      github.ref == 'refs/heads/district-main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Intentionally no checkout, actions, artifacts, caches, source execution or model auth.
+      - name: Validate failed run and create only a draft metadata marker
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from datetime import datetime
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          REPO = "Sykezzz/gamgui"
+          REPO_ID = 1309243040
+          WORKFLOW_ID = 318866333
+          WORKFLOW_PATH = ".github/workflows/gam-update.yml"
+          BASE = "district-main"
+          HISTORICAL_RUN = 36756291192
+          SHA = re.compile(r"^[0-9a-f]{40}$")
+
+          class Rejected(Exception):
+              pass
+
+          def require(value, reason):
+              if not value:
+                  raise Rejected(reason)
+
+          def same_repository(value):
+              return isinstance(value, dict) and value.get("id") == REPO_ID and value.get("full_name") == REPO
+
+          def valid_run(run, run_id):
+              require(isinstance(run, dict), "run shape")
+              require(type(run_id) is int and 0 < run_id <= 9223372036854775807 and run.get("id") == run_id, "run identity")
+              require(run.get("workflow_id") == WORKFLOW_ID and run.get("path") == WORKFLOW_PATH, "workflow identity")
+              require(run.get("event") in ("schedule", "workflow_dispatch"), "source event")
+              require(run.get("status") == "completed" and run.get("conclusion") == "failure", "source failure")
+              require(run.get("head_branch") == BASE and same_repository(run.get("head_repository")), "source repository/branch")
+              require(isinstance(run.get("head_sha"), str) and SHA.fullmatch(run["head_sha"]), "source SHA")
+              require(type(run.get("run_attempt")) is int and 1 <= run["run_attempt"] <= 100, "source attempt")
+
+          def relay(api, payload, event_name, ref, repository):
+              require(repository == REPO and ref == "refs/heads/" + BASE, "relay repository/ref")
+              require(same_repository(payload.get("repository")), "event repository")
+              test = event_name == "workflow_dispatch"
+              if test:
+                  require(payload.get("inputs", {}).get("mode") == "historical-delivery-test", "manual test mode")
+                  run_id = HISTORICAL_RUN
+              else:
+                  require(event_name == "workflow_run" and payload.get("action") == "completed", "completion event")
+                  source = payload.get("workflow_run", {})
+                  run_id = source.get("id")
+                  valid_run(source, run_id)
+              repository_data = api("GET", "")
+              require(same_repository(repository_data) and repository_data.get("default_branch") == BASE, "authoritative repository")
+              workflow = api("GET", f"/actions/workflows/{WORKFLOW_ID}")
+              require(workflow.get("id") == WORKFLOW_ID and workflow.get("path") == WORKFLOW_PATH
+                      and workflow.get("name") == "Update GAM7 pin" and workflow.get("state") == "active", "authoritative workflow")
+              run = api("GET", f"/actions/runs/{run_id}")
+              valid_run(run, run_id)
+              if not test:
+                  require(all(source.get(key) == run.get(key) for key in ("id", "run_attempt", "head_sha", "workflow_id", "event")), "stale event attempt")
+              base = api("GET", "/git/ref/heads/" + BASE)["object"]["sha"]
+              require(isinstance(base, str) and SHA.fullmatch(base), "base SHA")
+              if not test:
+                  if run["head_sha"] != base:
+                      return {"result": "suppressed", "reason": "default moved; explicit fresh reconciliation required"}
+                  runs = api("GET", f"/actions/workflows/{WORKFLOW_ID}/runs?branch={BASE}&head_sha={base}&per_page=100")["workflow_runs"]
+                  require(isinstance(runs, list) and len(runs) < 100, "bounded runs")
+                  # Conservative: any other newer completed success on this default head resolves the incident.
+                  if any(datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")) > datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00")) and item.get("head_sha") == base
+                         and item.get("head_branch") == BASE and same_repository(item.get("head_repository"))
+                         and item.get("workflow_id") == WORKFLOW_ID and item.get("event") in ("schedule", "workflow_dispatch")
+                         and item.get("status") == "completed" and item.get("conclusion") == "success" for item in runs):
+                      return {"result": "suppressed", "reason": "newer success"}
+                  # Persistent attempt refs are claimed atomically by native task BEFORE diagnosis.
+                  claimed = 0
+                  for n in (1, 2):
+                      attempt_branch = f"automation/gam-repair-{base}-attempt-{n}"
+                      claim = api("GET", "/git/ref/heads/" + attempt_branch, optional=True)
+                      if claim is not None:
+                          require(SHA.fullmatch(claim.get("object", {}).get("sha", "")), "malformed repair claim")
+                      history = api("GET", f"/pulls?state=all&base={BASE}&head=Sykezzz:{attempt_branch}&per_page=100")
+                      require(isinstance(history, list) and len(history) < 100, "bounded repair history")
+                      require(all(item.get("head", {}).get("ref") == attempt_branch and same_repository(item["head"].get("repo"))
+                                  and item.get("base", {}).get("ref") == BASE for item in history), "repair history identity")
+                      # PR history survives branch deletion; closed/failed attempts count too.
+                      claimed += int(claim is not None or bool(history))
+                  if claimed == 2:
+                      return {"result": "suppressed", "reason": "two repair claims exhausted"}
+              incident = run["head_sha"]
+              branch = ("automation/gam-repair-delivery-test-" + str(run_id) if test
+                        else "automation/gam-repair-request-" + incident)
+              pulls = api("GET", f"/pulls?state=all&base={BASE}&head=Sykezzz:{branch}&per_page=100")
+              require(isinstance(pulls, list) and len(pulls) < 100, "bounded marker history")
+              if pulls:
+                  require(all(item.get("head", {}).get("ref") == branch and same_repository(item["head"].get("repo"))
+                              and item.get("base", {}).get("ref") == BASE for item in pulls), "marker history identity")
+                  # Closed markers are durable tombstones; never reopen/update/synchronize them.
+                  return {"result": "deduplicated", "reason": "incident marker already exists"}
+              marker = {"schema": 1, "kind": "delivery-test" if test else "repair-request",
+                        "repository_id": REPO_ID, "workflow_id": WORKFLOW_ID,
+                        "run_id": run_id, "run_attempt": run["run_attempt"], "head_sha": incident,
+                        "base_branch": BASE, "max_repair_attempts": 0 if test else 2}
+              text = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+              path = ".github/repair-requests/" + ("delivery-test-" + str(run_id) if test else "gam-bump-" + incident) + ".json"
+              existing = api("GET", "/git/ref/heads/" + branch, optional=True)
+              if existing:
+                  # A stranded branch (e.g. PR creation disabled) is held for human reconciliation.
+                  # Never create a PR from an existing possibly tampered branch.
+                  return {"result": "held", "reason": "branch exists without marker PR"}
+              # Recheck default immediately before writes. No force updates, scripts/artifacts or merges.
+              require(api("GET", "/git/ref/heads/" + BASE)["object"]["sha"] == base, "base changed")
+              tree = api("GET", "/git/commits/" + base)["tree"]["sha"]
+              require(isinstance(tree, str) and SHA.fullmatch(tree), "base tree")
+              tree = api("POST", "/git/trees", {"base_tree": tree, "tree": [{"path": path, "mode": "100644", "type": "blob", "content": text}]})["sha"]
+              require(isinstance(tree, str) and SHA.fullmatch(tree), "marker tree")
+              commit = api("POST", "/git/commits", {"message": "chore: record GAM bump repair request metadata", "tree": tree, "parents": [base]})["sha"]
+              require(isinstance(commit, str) and SHA.fullmatch(commit), "marker commit")
+              api("POST", "/git/refs", {"ref": "refs/heads/" + branch, "sha": commit})
+              require(api("GET", "/git/ref/heads/" + branch)["object"]["sha"] == commit, "marker branch changed")
+              diff = api("GET", f"/compare/{base}...{commit}")
+              require(diff.get("status") == "ahead" and diff.get("ahead_by") == 1 and diff.get("behind_by") == 0
+                      and len(diff.get("files", [])) == 1 and diff["files"][0].get("filename") == path
+                      and diff["files"][0].get("status") == "added", "metadata-only marker diff")
+              title = "[GAM repair delivery test] historical metadata only" if test else "[GAM bump repair request] " + incident
+              body = ("Metadata-only draft event marker. NEVER merge this PR; it is separate from any repair PR.\n"
+                      "Native receiver must re-fetch the failed run and validate exact repository/workflow/attempt/head.\n"
+                      "Delivery tests permit acknowledgment only, no repair. Normal requests require atomic attempt-ref claims (maximum two), isolated subscription tasks, independent exact-SHA review, full CI and ordinary branch protections.\n\n```json\n" + text + "```\n")
+              pull = api("POST", "/pulls", {"title": title, "body": body, "head": branch, "base": BASE, "draft": True})
+              require(pull.get("draft") is True and pull.get("state") == "open"
+                      and pull.get("head", {}).get("sha") == commit and pull["head"].get("ref") == branch
+                      and same_repository(pull["head"].get("repo")) and pull.get("base", {}).get("ref") == BASE
+                      and same_repository(pull["base"].get("repo")),
+                      "draft marker identity changed; receiver must independently hold this request")
+              require(pull.get("user", {}).get("login") == "github-actions[bot]"
+                      and pull["user"].get("id") == 41898282 and pull["user"].get("type") == "Bot", "marker bot provenance")
+              return {"result": "created", "pull_request": pull.get("number"), "kind": marker["kind"]}
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, url):
+                  return None
+
+          def api_client(token):
+              # Fixed origin/path, no proxies/redirects, timeout/no retries, no error-body/token logging.
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+              def api(method, suffix, data=None, optional=False):
+                  branch_pattern = r"automation/(?:gam-repair-[0-9a-f]{40}-attempt-[12]|gam-repair-request-[0-9a-f]{40}|gam-repair-delivery-test-36756291192)"
+                  get_patterns = (
+                      r"", r"/actions/workflows/318866333", r"/actions/runs/[1-9][0-9]{0,18}",
+                      r"/git/ref/heads/(?:district-main|" + branch_pattern + r")",
+                      r"/actions/workflows/318866333/runs\?branch=district-main&head_sha=[0-9a-f]{40}&per_page=100",
+                      r"/pulls\?state=all&base=district-main&head=Sykezzz:" + branch_pattern + r"&per_page=100",
+                      r"/git/commits/[0-9a-f]{40}", r"/compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40}",
+                  )
+                  allowed = (method == "GET" and any(re.fullmatch(pattern, suffix) for pattern in get_patterns)) or (
+                      method == "POST" and suffix in ("/git/trees", "/git/commits", "/git/refs", "/pulls"))
+                  require(allowed, "fixed API endpoint rejected")
+                  request = urllib.request.Request("https://api.github.com/repos/" + REPO + suffix,
+                      data=None if data is None else json.dumps(data).encode(), method=method,
+                      headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "gamgui-metadata-relay", "Content-Type": "application/json"})
+                  try:
+                      with opener.open(request, timeout=15) as response:
+                          raw = response.read(1048577)
+                  except urllib.error.HTTPError as error:
+                      if method == "GET" and optional and error.code == 404:
+                          return None
+                      raise Rejected("GitHub operation rejected (status " + str(error.code) + ")") from None
+                  except OSError:
+                      raise Rejected("GitHub transport failed; no retry") from None
+                  require(len(raw) <= 1048576, "bounded API response")
+                  return json.loads(raw)
+              return api
+
+          if __name__ == "__main__":
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"], "rb") as source:
+                      raw = source.read(1048577)
+                  require(len(raw) <= 1048576, "bounded event")
+                  result = relay(api_client(os.environ["GITHUB_TOKEN"]), json.loads(raw), os.environ["GITHUB_EVENT_NAME"],
+                                 os.environ["GITHUB_REF"], os.environ["GITHUB_REPOSITORY"])
+                  print(json.dumps(result, sort_keys=True))
+              except (Rejected, KeyError, TypeError, ValueError):
+                  # Do not echo payload, account data, API errors or credentials.
+                  print("Relay held/rejected; no repair or merge performed")
+                  raise SystemExit(1)
+          PY
