@@ -48,7 +48,9 @@ def test_windows_release_uses_pinned_gam_exact_sha_and_self_test():
     assert "$attempt -le 3" in fetch
     assert "Reusing checksum-verified" in fetch
     assert "gam.exe" in fetch
-    assert "gam-7.47.02-windows-x86_64.zip" in checksums
+    from gamgui.core.gam.commands import EXPECTED_GAM_VERSION
+    assert f'"v{EXPECTED_GAM_VERSION}"' in fetch
+    assert f"gam-{EXPECTED_GAM_VERSION}-windows-x86_64.zip" in checksums
 
 
 def test_windows_bootstrap_is_transactional_sanitized_and_preserves_data():

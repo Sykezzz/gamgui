@@ -139,6 +139,9 @@ $profileReceipts = foreach ($profile in @("core", "classroom-oneroster")) {
         toolchain_manifest_digest = [string]$receipt.toolchain_manifest_digest
     }
 }
+$python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+$expectedGamVersion = (& $python -c "from gamgui.core.gam.commands import EXPECTED_GAM_VERSION; print(EXPECTED_GAM_VERSION)").Trim()
+if ($LASTEXITCODE -or $expectedGamVersion -notmatch '^\d+\.\d+\.\d+$') { throw "The tested application GAM pin is unavailable." }
 $releaseManifest = [ordered]@{
     schema_version = 1
     format = "gamgui-windows-setup-release-v1"
@@ -147,7 +150,7 @@ $releaseManifest = [ordered]@{
     platform = "windows"
     architecture = "x86_64"
     profiles = @($profileReceipts)
-    gam_version = "7.47.02"
+    gam_version = $expectedGamVersion
     setup = [ordered]@{
         file = [System.IO.Path]::GetFileName($setupPath)
         bytes = $setupSize
