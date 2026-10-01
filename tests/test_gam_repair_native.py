@@ -3,7 +3,7 @@ import base64
 import json
 import unittest
 from unittest.mock import Mock
-from test_gam_repair_claim import GitHub, REPO, INCIDENT, NONCE1, NONCE2
+from tests.test_gam_repair_claim import GitHub, REPO, INCIDENT, NONCE1, NONCE2
 from scripts.gam_repair_claim import Hold, Conflict
 from scripts.gam_repair_native import NativeGitHub, Coordinator, TaskStatus, decode, ORIGIN
 
