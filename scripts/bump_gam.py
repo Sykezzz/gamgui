@@ -42,6 +42,11 @@ def update_versioned_sources(root: Path, version: str) -> None:
         f'TAG="v{version}"',
     )
     _replace_once(
+        root / "scripts" / "fetch_gam_windows.ps1",
+        r'^(\s*\[string\]\$Tag = )"v[^"]+"$',
+        rf'\g<1>"v{version}"',
+    )
+    _replace_once(
         root / "tests" / "fixtures" / "mock_gam.sh",
         r'echo "GAM [0-9.]+ - mock"',
         f'echo "GAM {version} - mock"',
@@ -76,7 +81,7 @@ def record_checksum(root: Path) -> None:
 
 
 def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str, str]]:
-    """Return the newest-platform SHA-256 pin for each supported Mac architecture."""
+    """Return verified release pins for both Mac architectures and Windows x86_64."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "GamGUI-GAM-Bump",
@@ -94,10 +99,17 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
     with opener(request, timeout=30, context=tls_context) as response:
         payload = json.loads(response.read().decode("utf-8"))
     selected: dict[str, tuple[tuple[int, ...], str, str]] = {}
+    windows_record: tuple[str, str] | None = None
     for asset in payload.get("assets", ()) if isinstance(payload, dict) else ():
         if not isinstance(asset, dict):
             continue
         name = str(asset.get("name") or "")
+        if name == f"gam-{tag.removeprefix('v')}-windows-x86_64.zip":
+            digest = str(asset.get("digest") or "")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise RuntimeError(f"GitHub did not publish a SHA-256 digest for {name}.")
+            windows_record = (digest.split(":", 1)[1], name)
+            continue
         match = MAC_ASSET_RE.fullmatch(name)
         if not match:
             continue
@@ -117,10 +129,12 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
             "GAM release is missing supported macOS assets for: "
             + ", ".join(sorted(missing))
         )
+    if windows_record is None:
+        raise RuntimeError("GAM release is missing the supported Windows x86_64 asset.")
     return [
         (selected[arch][2], selected[arch][1])
         for arch in ("arm64", "x86_64")
-    ]
+    ] + [windows_record]
 
 
 def record_release_checksums(
@@ -128,7 +142,7 @@ def record_release_checksums(
 ) -> None:
     checksums = root / "scripts" / "gam_checksums.txt"
     version = tag.removeprefix("v")
-    prefix = f"gam-{version}-macos"
+    assets = {name for _digest, name in records}
     kept = [
         line
         for line in checksums.read_text(encoding="utf-8").splitlines()
@@ -136,7 +150,7 @@ def record_release_checksums(
             line.strip()
             and not line.lstrip().startswith("#")
             and len(line.split()) >= 2
-            and line.split()[1].startswith(prefix)
+            and line.split()[1] in assets
         )
     ]
     additions = [f"{digest}  {name}" for digest, name in records]

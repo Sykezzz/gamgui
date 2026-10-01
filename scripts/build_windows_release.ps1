@@ -89,7 +89,8 @@ if (
     [string]$embeddedProfile.artifact.signer_thumbprint -ne $CertificateSha256.ToLowerInvariant()
 ) { throw "The embedded Windows artifact identity did not match the exact build inputs." }
 $embeddedGamVersion = (Get-Content -Raw -LiteralPath (Join-Path $bundle "_internal\resources\gam7\VERSION")).Trim()
-if ($embeddedGamVersion -notmatch '7\.47\.02') { throw "The embedded Windows GAM version did not match the tested pin." }
+$expectedGamVersion = (& $python -c "from gamgui.core.gam.commands import EXPECTED_GAM_VERSION; print(EXPECTED_GAM_VERSION)").Trim()
+if ($LASTEXITCODE -or $embeddedGamVersion -ne "v$expectedGamVersion") { throw "The embedded Windows GAM version did not match the tested pin." }
 & $python -c "import struct,sys; p=open(sys.argv[1],'rb'); p.seek(0x3c); p.seek(struct.unpack('<I',p.read(4))[0]+4); assert struct.unpack('<H',p.read(2))[0] == 0x8664" $executable
 if ($LASTEXITCODE) { throw "The Windows executable architecture did not match x86_64." }
 $helperProbe = Start-Process -FilePath $helper -Wait -PassThru -WindowStyle Hidden
