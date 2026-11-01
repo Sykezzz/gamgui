@@ -11,7 +11,7 @@ set -eu
 
 case "${1:-}" in
   version)
-    echo "GAM 7.49.05 - mock"
+    echo "GAM 7.50.00 - mock"
     exit 0
     ;;
   MOCKFAIL)
