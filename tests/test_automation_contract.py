@@ -44,14 +44,14 @@ def test_gam_update_refreshes_every_pinned_contract_before_auto_merge():
     assert 'scripts/bump_gam.py --tag "${{ steps.release.outputs.tag }}"' not in workflow
 
 
-def test_automation_merge_helper_requires_the_new_exact_sha_ci_run():
+def test_automation_merge_helper_requires_eligible_exact_sha_pr_ci():
     script = (ROOT / "scripts" / "merge_tested_automation_pr.py").read_text(
         encoding="utf-8"
     )
-    assert "workflow_dispatch" in script
+    assert "workflow_dispatch" not in script
     assert "pull_request" in script
     assert "/approve" in script
-    assert "previous_run_ids" in script
+    assert "discovery_deadline" in script
     assert 'run.get("headSha") == head_sha' in script
     assert 'selected.get("conclusion") != "success"' in script
     assert 'details.get("headRefOid") != head_sha' in script

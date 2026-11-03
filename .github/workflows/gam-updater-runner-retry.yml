@@ -1,0 +1,169 @@
+name: Retry GAM updater runner allocation
+
+on:
+  workflow_run:
+    workflows: [Update GAM7 pin]
+    types: [completed]
+    branches: [district-main]
+
+permissions:
+  contents: read
+  checks: read
+  actions: write
+
+concurrency:
+  group: gam-updater-runner-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    if: >-
+      github.repository_id == '1309243040' &&
+      github.ref == 'refs/heads/district-main' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # No checkout or execution of source, artifacts, caches, or external actions.
+      - name: Retry only a verified hosted runner allocation failure
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+          from datetime import datetime
+
+          REPO = "Sykezzz/gamgui"
+          REPO_ID = 1309243040
+          WORKFLOW_ID = 318866333
+          WORKFLOW_PATH = ".github/workflows/gam-update.yml"
+          BASE = "district-main"
+          ALLOCATION_ERROR = "The job was not acquired by Runner of type hosted even after multiple attempts"
+          SHA = re.compile(r"[0-9a-f]{40}")
+          MAX_BYTES = 1048576
+
+          class Held(Exception):
+              pass
+
+          def require(value, reason):
+              if not value:
+                  raise Held(reason)
+
+          def same_repository(value):
+              return isinstance(value, dict) and value.get("id") == REPO_ID and value.get("full_name") == REPO
+
+          def valid_run(run, run_id):
+              require(isinstance(run, dict) and type(run_id) is int and 0 < run_id <= 9223372036854775807
+                      and run.get("id") == run_id, "run identity")
+              require(run.get("workflow_id") == WORKFLOW_ID and run.get("path") == WORKFLOW_PATH, "workflow identity")
+              require(run.get("event") in ("schedule", "workflow_dispatch") and run.get("head_branch") == BASE
+                      and same_repository(run.get("head_repository")), "source repository/event")
+              require(isinstance(run.get("head_sha"), str) and SHA.fullmatch(run["head_sha"]), "source SHA")
+              require(type(run.get("run_attempt")) is int and 1 <= run["run_attempt"] <= 100, "source attempt")
+
+          def unchanged(api, source):
+              current = api("GET", f"/actions/runs/{source['id']}")
+              valid_run(current, source["id"])
+              require(all(current.get(key) == source.get(key) for key in ("run_attempt", "head_sha", "status", "conclusion")),
+                      "stale completion")
+
+          def retry(api, payload, event, ref, repository):
+              require(event == "workflow_run" and ref == "refs/heads/" + BASE and repository == REPO
+                      and payload.get("action") == "completed" and same_repository(payload.get("repository")), "event identity")
+              source = payload.get("workflow_run", {})
+              valid_run(source, source.get("id"))
+              require(source.get("status") == "completed" and source.get("conclusion") == "failure", "source failure")
+              unchanged(api, source)
+              if source["run_attempt"] >= 3:
+                  return {"result": "held", "reason": "two retries exhausted"}
+              repo = api("GET", "")
+              require(same_repository(repo) and repo.get("default_branch") == BASE, "authoritative repository")
+              workflow = api("GET", f"/actions/workflows/{WORKFLOW_ID}")
+              require(workflow.get("id") == WORKFLOW_ID and workflow.get("path") == WORKFLOW_PATH
+                      and workflow.get("name") == "Update GAM7 pin" and workflow.get("state") == "active", "authoritative workflow")
+
+              def current_head():
+                  require(api("GET", "/git/ref/heads/" + BASE).get("object", {}).get("sha") == source["head_sha"], "default moved")
+
+              def latest_run():
+                  listing = api("GET", f"/actions/workflows/{WORKFLOW_ID}/runs?branch={BASE}&head_sha={source['head_sha']}&per_page=100")
+                  runs = listing.get("workflow_runs")
+                  require(isinstance(runs, list) and len(runs) < 100 and listing.get("total_count") == len(runs), "bounded runs")
+                  require(any(item.get("id") == source["id"] for item in runs), "source absent from runs")
+                  for item in runs:
+                      valid_run(item, item.get("id"))
+                      require(item["head_sha"] == source["head_sha"], "run list SHA")
+                      if item["id"] != source["id"]:
+                          require(datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+                                  < datetime.fromisoformat(source["created_at"].replace("Z", "+00:00"))
+                                  and datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00"))
+                                  <= datetime.fromisoformat(source["updated_at"].replace("Z", "+00:00")), "newer run")
+
+              current_head()
+              latest_run()
+              jobs = api("GET", f"/actions/runs/{source['id']}/attempts/{source['run_attempt']}/jobs?per_page=100")
+              require(jobs.get("total_count") == 1 and isinstance(jobs.get("jobs"), list) and len(jobs["jobs"]) == 1, "one bump job")
+              job = jobs["jobs"][0]
+              job_id = job.get("id")
+              require(type(job_id) is int and job_id > 0 and job.get("run_id") == source["id"]
+                      and job.get("run_attempt") == source["run_attempt"] and job.get("head_sha") == source["head_sha"], "job identity")
+              require(job.get("name") == "bump" and job.get("labels") == ["macos-latest"]
+                      and job.get("status") == "completed" and job.get("conclusion") in ("cancelled", "failure")
+                      and job.get("steps") == [] and job.get("runner_id") == 0, "allocation-only job")
+              annotations = api("GET", f"/check-runs/{job_id}/annotations?per_page=100")
+              require(isinstance(annotations, list) and 0 < len(annotations) < 100, "bounded annotations")
+              require(any(isinstance(item, dict) and item.get("annotation_level") == "failure"
+                          and item.get("message") == ALLOCATION_ERROR for item in annotations), "allocation annotation")
+              current_head()
+              latest_run()
+              # A queued/completed rerun invalidates duplicate completion deliveries.
+              unchanged(api, source)
+              api("POST", f"/actions/runs/{source['id']}/rerun-failed-jobs")
+              return {"result": "retry requested", "run_id": source["id"], "failed_attempt": source["run_attempt"]}
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, url):
+                  return None
+
+          def api_client(token):
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+              def api(method, path):
+                  get_paths = (
+                      r"", r"/actions/workflows/318866333", r"/actions/runs/[1-9][0-9]{0,18}",
+                      r"/git/ref/heads/district-main",
+                      r"/actions/workflows/318866333/runs\?branch=district-main&head_sha=[0-9a-f]{40}&per_page=100",
+                      r"/actions/runs/[1-9][0-9]{0,18}/attempts/[12]/jobs\?per_page=100",
+                      r"/check-runs/[1-9][0-9]{0,18}/annotations\?per_page=100",
+                  )
+                  require((method == "GET" and any(re.fullmatch(pattern, path) for pattern in get_paths))
+                          or (method == "POST" and re.fullmatch(r"/actions/runs/[1-9][0-9]{0,18}/rerun-failed-jobs", path)), "fixed endpoint")
+                  request = urllib.request.Request("https://api.github.com/repos/" + REPO + path, method=method,
+                      headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "gamgui-runner-retry"})
+                  try:
+                      with opener.open(request, timeout=15) as response:
+                          raw = response.read(MAX_BYTES + 1)
+                  except (urllib.error.HTTPError, OSError):
+                      # A failed POST can have an uncertain outcome; never retry it here.
+                      raise Held("GitHub request failed; no retry") from None
+                  require(len(raw) <= MAX_BYTES, "bounded response")
+                  return json.loads(raw) if raw else None
+              return api
+
+          if __name__ == "__main__":
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"], "rb") as source:
+                      raw = source.read(MAX_BYTES + 1)
+                  require(len(raw) <= MAX_BYTES, "bounded event")
+                  result = retry(api_client(os.environ["GITHUB_TOKEN"]), json.loads(raw), os.environ["GITHUB_EVENT_NAME"],
+                                 os.environ["GITHUB_REF"], os.environ["GITHUB_REPOSITORY"])
+                  print(json.dumps(result, sort_keys=True))
+              except (Held, KeyError, TypeError, ValueError, AttributeError):
+                  print("Runner retry held; inspect the source run. No additional request attempted.")
+                  raise SystemExit(1)
+          PY
