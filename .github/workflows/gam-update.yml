@@ -17,7 +17,9 @@ concurrency:
 
 jobs:
   bump:
-    runs-on: macos-latest
+    # Use the supported Intel pool while hosted arm64 runners are capacity constrained.
+    # The generated update still passes the existing arm64 CI and build gates.
+    runs-on: macos-26-intel
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

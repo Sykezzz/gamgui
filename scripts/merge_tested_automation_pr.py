@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Approve or dispatch exact-SHA CI, then merge the unchanged automation PR."""
+"""Wait for exact-SHA pull request CI, then merge the unchanged automation PR."""
 
 from __future__ import annotations
 
@@ -18,15 +18,60 @@ class GitHubCLI:
         command = ["gh", *args]
         completed = subprocess.run(
             command,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             input=json.dumps(payload) if payload is not None else None,
         )
+        if completed.returncode:
+            raise RuntimeError(_github_error(completed, payload))
         return json.loads(completed.stdout)
 
     def run(self, args: list[str]) -> None:
         subprocess.run(["gh", *args], check=True)
+
+
+def _github_error(
+    completed: subprocess.CompletedProcess[str], payload: dict[str, str] | None
+) -> str:
+    # Report the provider's message, never the full response, command, or request body.
+    try:
+        response = json.loads(completed.stdout)
+    except (ValueError, TypeError):
+        response = {}
+    if not isinstance(response, dict):
+        response = {}
+    message = response.get("message")
+    stderr = completed.stderr or ""
+    status = str(response.get("status", ""))
+    http = re.search(r"\(HTTP ([45]\d{2})\)", stderr)
+    if not re.fullmatch(r"[45]\d{2}", status):
+        status = http.group(1) if http else ""
+    if not isinstance(message, str):
+        match = re.search(r"^gh: (.+?)(?: \(HTTP [45]\d{2}\))?$", stderr, re.MULTILINE)
+        message = match.group(1) if match else "No GitHub error message was returned."
+    secrets = [
+        os.environ.get(name, "")
+        for name in (
+            "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"
+        )
+    ]
+    secrets.extend((payload or {}).values())
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        message = message.replace(secret, "[redacted]")
+    message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", message)
+    message = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b",
+        "[redacted]", message,
+    )
+    message = re.sub(
+        r"\b(?:Bearer|Basic)\s+\S+", "[redacted]", message, flags=re.IGNORECASE
+    )
+    message = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", message).split())
+    if len(message) > 500:
+        message = message[:497] + "..."
+    suffix = f", HTTP {status}" if status else ""
+    return f"GitHub CLI failed (exit {completed.returncode}{suffix}): {message}"
 
 
 def _workflow_runs(
@@ -52,7 +97,7 @@ def _workflow_runs(
             "--limit",
             "30",
             "--json",
-            "databaseId,headSha,status,conclusion,url",
+            "databaseId,headSha,status,conclusion,url,attempt",
         ]
     )
     if not isinstance(result, list):
@@ -93,102 +138,80 @@ def dispatch_test_and_merge(
     if details.get("state") != "OPEN":
         raise RuntimeError("The automation pull request is not open.")
 
-    pull_request_runs = [
-        run
-        for run in _workflow_runs(
-            gh,
-            repository=repository,
-            workflow=workflow,
-            branch=branch,
-            event="pull_request",
-        )
-        if run.get("headSha") == head_sha
-    ]
-    selected_run_id: int | None = None
-    if pull_request_runs:
-        selected = max(
-            pull_request_runs,
-            key=lambda run: int(run["databaseId"]),
-        )
-        selected_run_id = int(selected["databaseId"])
-        conclusion = selected.get("conclusion")
-        if conclusion == "action_required":
-            gh.run(
-                [
-                    "api",
-                    "--method",
-                    "POST",
-                    f"repos/{repository}/actions/runs/{selected_run_id}/approve",
-                ]
-            )
-        elif selected.get("status") == "completed" and conclusion != "success":
-            gh.run(
-                [
-                    "run",
-                    "rerun",
-                    str(selected_run_id),
-                    "--repo",
-                    repository,
-                ]
-            )
-    else:
-        previous_run_ids = {
-            int(run["databaseId"])
+    deadline = monotonic() + timeout_seconds
+    discovery_deadline = min(deadline, monotonic() + 60)
+    selected: dict[str, Any] | None = None
+    # Newly created pull request runs can take time to appear in GitHub's index.
+    while monotonic() < discovery_deadline:
+        pull_request_runs = [
+            run
             for run in _workflow_runs(
                 gh,
                 repository=repository,
                 workflow=workflow,
                 branch=branch,
-                event="workflow_dispatch",
+                event="pull_request",
             )
             if run.get("headSha") == head_sha
-        }
-        gh.run(
-            [
-                "workflow",
-                "run",
-                workflow,
-                "--repo",
-                repository,
-                "--ref",
-                branch,
-            ]
+        ]
+        if pull_request_runs:
+            selected = max(
+                pull_request_runs, key=lambda run: int(run["databaseId"])
+            )
+            break
+        sleep(min(poll_seconds, max(0, discovery_deadline - monotonic())))
+    if selected is None:
+        raise RuntimeError(
+            f"No eligible pull_request {workflow} run appeared at {head_sha}. "
+            "Manually dispatched CI cannot satisfy required pull request checks."
         )
 
-    deadline = monotonic() + timeout_seconds
-    selected: dict[str, Any] | None = None
+    selected_run_id = int(selected["databaseId"])
+    minimum_attempt = int(selected["attempt"])
+    conclusion = selected.get("conclusion")
+    if conclusion == "action_required":
+        gh.run(
+            [
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repository}/actions/runs/{selected_run_id}/approve",
+            ]
+        )
+    elif selected.get("status") == "completed" and conclusion != "success":
+        gh.run(
+            [
+                "run",
+                "rerun",
+                str(selected_run_id),
+                "--failed",
+                "--repo",
+                repository,
+            ]
+        )
+        minimum_attempt += 1
+
+    selected = None
     while monotonic() < deadline:
-        if selected_run_id is not None:
-            candidates = [
-                run
-                for run in _workflow_runs(
-                    gh,
-                    repository=repository,
-                    workflow=workflow,
-                    branch=branch,
-                    event="pull_request",
-                )
-                if int(run["databaseId"]) == selected_run_id
-                and run.get("headSha") == head_sha
-            ]
-        else:
-            candidates = [
-                run
-                for run in _workflow_runs(
-                    gh,
-                    repository=repository,
-                    workflow=workflow,
-                    branch=branch,
-                    event="workflow_dispatch",
-                )
-                if run.get("headSha") == head_sha
-                and int(run["databaseId"]) not in previous_run_ids
-            ]
+        candidates = [
+            run
+            for run in _workflow_runs(
+                gh,
+                repository=repository,
+                workflow=workflow,
+                branch=branch,
+                event="pull_request",
+            )
+            if int(run["databaseId"]) == selected_run_id
+            and run.get("headSha") == head_sha
+            and int(run["attempt"]) >= minimum_attempt
+            and run.get("conclusion") != "action_required"
+        ]
         if candidates:
             selected = max(candidates, key=lambda run: int(run["databaseId"]))
             if selected.get("status") == "completed":
                 break
-        sleep(poll_seconds)
+        sleep(min(poll_seconds, max(0, deadline - monotonic())))
 
     if selected is None or selected.get("status") != "completed":
         raise RuntimeError(
