@@ -90,6 +90,17 @@ class RunnerRetryTests(unittest.TestCase):
         self.assertEqual(self.emit()["result"], "retry requested")
         self.assertEqual(self.api.writes, [("POST", "/actions/runs/123/rerun-failed-jobs")])
 
+    def test_supported_intel_pool_allocation_failure_also_retried(self):
+        self.api.jobs["jobs"][0]["labels"] = ["macos-26-intel"]
+        self.assertEqual(self.emit()["result"], "retry requested")
+        self.assertEqual(self.api.writes, [("POST", "/actions/runs/123/rerun-failed-jobs")])
+
+    def test_mixed_or_unrelated_macos_pool_rejected(self):
+        for labels in (["macos-latest", "macos-26-intel"], ["macos-15"], ["macos-26"]):
+            with self.subTest(labels=labels):
+                self.api = API(); self.api.jobs["jobs"][0]["labels"] = labels
+                self.rejected()
+
     def test_second_attempt_allowed_but_third_held(self):
         for target in (self.payload["workflow_run"], self.api.run, self.api.jobs["jobs"][0]):
             target["run_attempt"] = 2

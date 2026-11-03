@@ -112,7 +112,7 @@ jobs:
               job_id = job.get("id")
               require(type(job_id) is int and job_id > 0 and job.get("run_id") == source["id"]
                       and job.get("run_attempt") == source["run_attempt"] and job.get("head_sha") == source["head_sha"], "job identity")
-              require(job.get("name") == "bump" and job.get("labels") == ["macos-latest"]
+              require(job.get("name") == "bump" and job.get("labels") in (["macos-latest"], ["macos-26-intel"])
                       and job.get("status") == "completed" and job.get("conclusion") in ("cancelled", "failure")
                       and job.get("steps") == [] and job.get("runner_id") == 0, "allocation-only job")
               annotations = api("GET", f"/check-runs/{job_id}/annotations?per_page=100")

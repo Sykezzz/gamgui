@@ -5,9 +5,16 @@ acquire a hosted macOS runner. It runs on Ubuntu without checking out or executi
 repository source, artifacts, caches, or external actions. It uses the existing
 workflow token with Contents:read, Checks:read (for failure annotations), and Actions:write.
 
+The updater uses the supported `macos-26-intel` pool to avoid depending on the
+capacity-constrained arm64 pool for update generation. The existing fetcher
+selects the pinned macOS 26.6 x86_64 asset. All arm64 CI, application build, and
+promotion gates remain in place. This mitigates one pool dependency; it does not
+guarantee Intel runner availability.
+
 The handler re-fetches the fixed repository and updater workflow, failed run and
 attempt, current default SHA, bounded same-head run history, and the single `bump`
-job. That job must request only `macos-latest`, have no steps and no runner, and
+job. That job must request only `macos-26-intel` (or the prior `macos-latest`
+configuration), have no steps and no runner, and
 carry the exact GitHub failure annotation:
 
 > The job was not acquired by Runner of type hosted even after multiple attempts

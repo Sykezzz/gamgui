@@ -29,6 +29,8 @@ def test_upstream_sync_is_non_forcing_and_targets_district_branch():
 
 def test_gam_update_refreshes_every_pinned_contract_before_auto_merge():
     workflow = _workflow("gam-update.yml")
+    assert "runs-on: macos-26-intel" in workflow
+    assert "os: [ubuntu-latest, macos-latest]" in _workflow("ci.yml")
     assert "scripts/bump_gam.py" in workflow
     assert "scripts/gam_checksums.txt" in workflow
     assert "command_catalog.json" in workflow
