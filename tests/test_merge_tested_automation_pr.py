@@ -278,3 +278,102 @@ def test_does_not_merge_when_head_changes_after_ci():
         _merge(gh)
 
     assert gh.merge_payload is None
+
+
+def _metadata(*, head=HEAD, state="OPEN"):
+    return {"headRefOid": head, "state": state, "mergeCommit": None}
+
+
+class MetadataGitHub(FakeGitHub):
+    def __init__(self, responses, **kwargs):
+        super().__init__(**kwargs)
+        self.responses = responses
+
+    def json(self, args, payload=None):
+        if args[:2] == ["pr", "view"]:
+            response = self.responses[min(self.pr_view_calls, len(self.responses) - 1)]
+            self.pr_view_calls += 1
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return super().json(args, payload)
+
+
+def test_waits_for_initial_head_metadata_to_catch_up_after_push():
+    clock = FakeClock()
+    old = _metadata(head="b" * 40)
+    gh = MetadataGitHub([old, old, _metadata()])
+
+    _merge(gh, clock=clock)
+
+    assert clock.now == 2
+    assert gh.pr_view_calls == 4
+    assert gh.runs == []
+    assert gh.merge_payload == {"merge_method": "merge", "sha": HEAD}
+
+
+@pytest.mark.parametrize("timeout,elapsed", [(100, 60), (5, 5)])
+def test_permanent_initial_head_mismatch_fails_with_expected_and_observed_sha(
+    timeout, elapsed
+):
+    clock = FakeClock()
+    old_head = "b" * 40
+    gh = MetadataGitHub([_metadata(head=old_head)])
+
+    with pytest.raises(RuntimeError, match="pull request head to update") as error:
+        _merge(gh, timeout=timeout, clock=clock)
+
+    assert f"expected {HEAD}, observed {old_head}" in str(error.value)
+    assert clock.now == elapsed
+    assert gh.list_calls == 0
+    assert gh.runs == []
+    assert gh.merge_payload is None
+
+
+@pytest.mark.parametrize("phase", ["discovery", "ci"])
+def test_initial_head_wait_uses_the_same_total_timeout_as_later_phases(phase):
+    clock = FakeClock()
+    old = _metadata(head="b" * 40)
+    batches = [[]] if phase == "discovery" else [
+        [_run(status="in_progress", conclusion=None)]
+    ]
+    gh = MetadataGitHub([old, old, _metadata()], batches=batches)
+    message = "No eligible" if phase == "discovery" else "Timed out waiting for an exact"
+
+    with pytest.raises(RuntimeError, match=message):
+        _merge(gh, timeout=3, clock=clock)
+
+    assert clock.now == 3
+    assert gh.merge_payload is None
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+@pytest.mark.parametrize("head", [HEAD, "b" * 40])
+def test_nonopen_initial_pull_request_stops_without_waiting(state, head):
+    clock = FakeClock()
+    gh = MetadataGitHub([_metadata(head=head, state=state)])
+
+    with pytest.raises(RuntimeError, match="not open"):
+        _merge(gh, clock=clock)
+
+    assert clock.now == 0
+    assert gh.pr_view_calls == 1
+    assert gh.list_calls == 0
+    assert gh.runs == []
+    assert gh.merge_payload is None
+
+
+def test_initial_metadata_api_error_stops_without_retry():
+    clock = FakeClock()
+    failure = RuntimeError("GitHub CLI failed (exit 1, HTTP 403): Forbidden.")
+    gh = MetadataGitHub([failure])
+
+    with pytest.raises(RuntimeError) as error:
+        _merge(gh, clock=clock)
+
+    assert error.value is failure
+    assert clock.now == 0
+    assert gh.pr_view_calls == 1
+    assert gh.list_calls == 0
+    assert gh.runs == []
+    assert gh.merge_payload is None
