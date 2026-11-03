@@ -450,6 +450,13 @@ or substitutes an unpinned GAM binary:
   SHA-256 metadata, regenerates the catalog/version contracts, runs focused tests, and opens an
   auto-merge PR to `district-main`. Branch protection and exact-SHA post-merge validation still
   gate deployment.
+- **Runner recovery** retries a confirmed hosted macOS allocation failure at most twice, only
+  when no updater step ran and the default branch has not moved. It does not retry test or merge
+  failures. See [runner recovery](docs/gam-updater-runner-retry.md).
+- **Protected merge checks** must come from an exact-SHA `pull_request` CI run. The merge helper
+  waits for GitHub to register that run and can approve workflow execution; it never submits a PR
+  review. Dispatched CI jobs do not satisfy GitHub's required PR checks. If eligible CI is missing,
+  the helper stops with an explanation instead of attempting an unqualified merge.
 - **Compatibility checks** assert every GAM sub-command our builders use still exists in the
   vendored command reference. Post-merge validation checks both the pin and current latest release,
   so a renamed/removed command fails before an installed app can see `update-ready`.
