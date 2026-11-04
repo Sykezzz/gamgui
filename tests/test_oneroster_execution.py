@@ -1220,14 +1220,16 @@ async def test_execution_reuses_preflight_owner_ids_without_second_directory_exp
 ):
     service, import_id = _ready_service(tmp_path)
     connector = BulkExecutionClassroom()
-    plan = await service.build_live_plan(connector, import_id)
+    moment = datetime(2026, 8, 3, 12, tzinfo=timezone.utc)
+    plan = await service.build_live_plan(connector, import_id, now=moment)
     assert plan.owner_ids == {"teacher@example.org": "teacher-id"}
-    manifest = service.persist_live_plan(plan).ordinary
+    manifest = service.persist_live_plan(plan, now=moment).ordinary
 
     prepared = await service.execute_manifest(
         connector,
         manifest.id,
         typed_import_id=import_id,
+        now=moment,
     )
 
     assert prepared.awaiting_students
