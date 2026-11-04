@@ -5,7 +5,7 @@ import io
 import json
 import os
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,61 @@ from gamgui.components.oneroster import (
 )
 from gamgui.components.oneroster import ingest as ingest_module
 from tests.test_oneroster_helpers import csv_text, valid_files, zip_bytes
+
+
+class LocalFallbackDatetime(datetime):
+    def astimezone(self, tz=None):
+        local_zone = timezone(timedelta(hours=-6))
+        return super().astimezone(local_zone if tz is None else tz)
+
+
+@pytest.fixture
+def missing_district_zone(monkeypatch: pytest.MonkeyPatch):
+    def missing_zone(_name):
+        raise ingest_module.ZoneInfoNotFoundError
+
+    monkeypatch.setattr(ingest_module, "ZoneInfo", missing_zone)
+
+
+def test_roster_date_fallback_uses_same_local_day_for_utc_and_local_instant(
+    missing_district_zone,
+):
+    moment = LocalFallbackDatetime(2026, 11, 4, 0, 14, tzinfo=timezone.utc)
+    local_moment = moment.astimezone()
+
+    assert moment.date() != local_moment.date()
+    assert ingest_module.district_roster_date(moment) == date(2026, 11, 3)
+    assert ingest_module.district_roster_date(local_moment) == date(2026, 11, 3)
+
+
+def test_roster_date_fallback_preserves_naive_calendar_date(missing_district_zone):
+    moment = LocalFallbackDatetime(2026, 11, 4, 0, 14)
+
+    assert ingest_module.district_roster_date(moment) == date(2026, 11, 4)
+
+
+def test_roster_date_fallback_without_argument_uses_local_today(
+    missing_district_zone,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class LocalDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 11, 3)
+
+    monkeypatch.setattr(ingest_module, "date", LocalDate)
+
+    assert ingest_module.district_roster_date() == date(2026, 11, 3)
+
+
+def test_roster_date_fallback_changes_when_local_midnight_is_crossed(
+    missing_district_zone,
+):
+    before = LocalFallbackDatetime(2026, 11, 4, 5, 59, tzinfo=timezone.utc)
+    after = before + timedelta(minutes=2)
+
+    assert ingest_module.district_roster_date(before) == date(2026, 11, 3)
+    assert ingest_module.district_roster_date(after) == date(2026, 11, 4)
 
 
 def test_valid_full_snapshot_normalizes_previews_and_exports(tmp_path: Path) -> None:
