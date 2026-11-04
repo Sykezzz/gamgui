@@ -1495,7 +1495,11 @@ def district_roster_date(now: Optional[datetime] = None) -> date:
     except ZoneInfoNotFoundError:
         # Some Windows Python distributions omit the IANA timezone database.
         # The signed macOS app has it; local calendar time is the safe fallback.
-        return now.date() if now is not None else date.today()
+        if now is None:
+            return date.today()
+        if now.tzinfo is None:
+            return now.date()
+        return now.astimezone().date()
     if now is None:
         return datetime.now(district_zone).date()
     if now.tzinfo is None:
