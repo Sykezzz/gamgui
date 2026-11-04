@@ -122,23 +122,33 @@ def dispatch_test_and_merge(
     if not match:
         raise ValueError("Pull request must be a number or a GitHub pull request URL.")
     pull_number = match.group(1)
-    details = gh.json(
-        [
-            "pr",
-            "view",
-            pull_number,
-            "--repo",
-            repository,
-            "--json",
-            "headRefOid,state,mergeCommit",
-        ]
-    )
-    if details.get("headRefOid") != head_sha:
-        raise RuntimeError("The pull request does not point to the expected head SHA.")
-    if details.get("state") != "OPEN":
-        raise RuntimeError("The automation pull request is not open.")
-
     deadline = monotonic() + timeout_seconds
+    head_deadline = min(deadline, monotonic() + 60)
+    details: dict[str, Any] = {}
+    # Pull request metadata can briefly lag the branch push that refreshed it.
+    while monotonic() < head_deadline:
+        details = gh.json(
+            [
+                "pr",
+                "view",
+                pull_number,
+                "--repo",
+                repository,
+                "--json",
+                "headRefOid,state,mergeCommit",
+            ]
+        )
+        if details.get("state") != "OPEN":
+            raise RuntimeError("The automation pull request is not open.")
+        if details.get("headRefOid") == head_sha:
+            break
+        sleep(min(poll_seconds, max(0, head_deadline - monotonic())))
+    else:
+        raise RuntimeError(
+            "Timed out waiting for the pull request head to update: "
+            f"expected {head_sha}, observed {details.get('headRefOid') or 'unknown'}."
+        )
+
     discovery_deadline = min(deadline, monotonic() + 60)
     selected: dict[str, Any] | None = None
     # Newly created pull request runs can take time to appear in GitHub's index.
