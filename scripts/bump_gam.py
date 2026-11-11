@@ -14,11 +14,14 @@ from pathlib import Path
 
 import requests
 
+if __package__:
+    from .gam_assets import mac_assets
+else:
+    from gam_assets import mac_assets
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
-MAC_ASSET_RE = re.compile(
-    r"^gam-[0-9.]+-macos(?P<platform>[0-9.]+)-(?P<arch>arm64|x86_64)\.tar\.xz$"
-)
+
 
 
 def _replace_once(path: Path, pattern: str, replacement: str) -> None:
@@ -81,7 +84,7 @@ def record_checksum(root: Path) -> None:
 
 
 def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str, str]]:
-    """Return verified release pins for both Mac architectures and Windows x86_64."""
+    """Pin every Mac deployment target and Windows x86_64 from release metadata."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "GamGUI-GAM-Bump",
@@ -98,7 +101,10 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
     tls_context = ssl.create_default_context(cafile=requests.certs.where())
     with opener(request, timeout=30, context=tls_context) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    selected: dict[str, tuple[tuple[int, ...], str, str]] = {}
+    selected: list[tuple[str, tuple[int, ...], str, str]] = []
+    if not isinstance(payload, dict) or payload.get("tag_name", tag) != tag:
+        raise RuntimeError("GAM release metadata does not match the requested tag.")
+    payload["tag_name"] = tag
     windows_record: tuple[str, str] | None = None
     for asset in payload.get("assets", ()) if isinstance(payload, dict) else ():
         if not isinstance(asset, dict):
@@ -110,20 +116,13 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
                 raise RuntimeError(f"GitHub did not publish a SHA-256 digest for {name}.")
             windows_record = (digest.split(":", 1)[1], name)
             continue
-        match = MAC_ASSET_RE.fullmatch(name)
-        if not match:
-            continue
+    for asset, arch, target in mac_assets(payload):
+        name = asset["name"]
         digest = str(asset.get("digest") or "")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
             raise RuntimeError(f"GitHub did not publish a SHA-256 digest for {name}.")
-        platform = tuple(
-            int(part) for part in match.group("platform").split(".") if part
-        )
-        record = (platform, name, digest.split(":", 1)[1])
-        current = selected.get(match.group("arch"))
-        if current is None or record[0] > current[0]:
-            selected[match.group("arch")] = record
-    missing = {"arm64", "x86_64"} - set(selected)
+        selected.append((arch, target, name, digest.split(":", 1)[1]))
+    missing = {"arm64", "x86_64"} - {record[0] for record in selected}
     if missing:
         raise RuntimeError(
             "GAM release is missing supported macOS assets for: "
@@ -131,10 +130,7 @@ def release_checksums(tag: str, opener=urllib.request.urlopen) -> list[tuple[str
         )
     if windows_record is None:
         raise RuntimeError("GAM release is missing the supported Windows x86_64 asset.")
-    return [
-        (selected[arch][2], selected[arch][1])
-        for arch in ("arm64", "x86_64")
-    ] + [windows_record]
+    return [(record[3], record[2]) for record in sorted(selected)] + [windows_record]
 
 
 def record_release_checksums(
@@ -170,7 +166,7 @@ def main() -> int:
     version = match.group(1)
     tag = f"v{version}"
 
-    # Pin both supported Mac assets from GitHub's signed release metadata before the
+    # Pin all targets for both Mac architectures from GitHub's release metadata before the
     # downloader is allowed to execute either binary.  fetch_gam.sh deliberately
     # fails closed when the selected asset is not already present in the committed
     # checksum catalog.

@@ -75,27 +75,11 @@ fi
 curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
   -H "Accept: application/vnd.github+json" ${GH_API_AUTH[@]+"${GH_API_AUTH[@]}"} "$API" -o "$TMP/release.json"
 
-# Parse the release JSON from the file (no stdin, so a heredoc script is safe here). Print one
-# line: "<tag> <asset-name> <download-url>". Prefer the highest macosNN build if several match.
-PICK="$(python3 - "$TMP/release.json" "$ARCH" <<'PY'
-import json, re, sys
-data = json.load(open(sys.argv[1]))
-arch = sys.argv[2]
-cands = []
-for a in data.get("assets", []):
-    n = a["name"]
-    if "macos" in n and arch in n and n.endswith(".tar.xz"):
-        m = re.search(r"macos(\d+)", n)
-        cands.append((int(m.group(1)) if m else 0, n, a["browser_download_url"]))
-if not cands:
-    sys.exit("no matching macOS asset found in release")
-cands.sort()
-_, name, url = cands[-1]
-print(data.get("tag_name", ""), name, url)
-PY
-)"
+# Upstream names encode the minimum OS deployment target, not just a build label.
+HOST_MACOS="$(sw_vers -productVersion)"
+PICK="$(python3 "$ROOT/scripts/gam_assets.py" "$TMP/release.json" "$ARCH" "$HOST_MACOS")"
 read -r VERSION ASSET_NAME ASSET_URL <<<"$PICK"
-echo "==> Selected: $ASSET_NAME (release $VERSION)"
+echo "==> Selected: $ASSET_NAME (release $VERSION; host macOS $HOST_MACOS/$ARCH)"
 
 echo "==> Downloading..."
 curl -fSL --retry 5 --retry-all-errors --retry-delay 3 --progress-bar "$ASSET_URL" -o "$TMP/gam.tar.xz"
@@ -152,6 +136,22 @@ if [ -f "$TMP/command_catalog.json" ]; then
   cp "$TMP/command_catalog.json" "$INSTALL_STAGE/command_catalog.json"
 fi
 
+# Validate before replacing a working payload. Loader failures must not become a successful build.
+python3 - "$INSTALL_STAGE/gam" "$VERSION" "$ASSET_NAME" "$HOST_MACOS" <<'PYTHON'
+import re, subprocess, sys
+try:
+    result = subprocess.run([sys.argv[1], "version"], capture_output=True, text=True, timeout=20)
+except (OSError, subprocess.SubprocessError) as exc:
+    sys.exit(f"GAM runtime probe failed for {sys.argv[3]} on macOS {sys.argv[4]}: {type(exc).__name__}")
+version = re.search(r"^GAM ([0-9]+\.[0-9]+\.[0-9]+)(?=\s|$)", result.stdout, re.MULTILINE)
+if result.returncode or version is None or version.group(1) != sys.argv[2].removeprefix("v"):
+    diagnostic = (result.stderr or result.stdout)[-2000:]
+    diagnostic = "".join(c if c.isprintable() or c in "\n\t" else "?" for c in diagnostic)
+    sys.exit(f"GAM runtime probe failed for {sys.argv[3]} on macOS {sys.argv[4]} "
+             f"(exit {result.returncode}):\n{diagnostic}")
+print(result.stdout.splitlines()[0])
+PYTHON
+
 # Stage completely before replacing the executable payload. If activation fails,
 # the EXIT trap restores the prior directory.
 if [ -e "$DEST" ]; then
@@ -171,4 +171,3 @@ if [ -n "$INSTALL_BACKUP" ]; then
 fi
 
 echo "==> Done. Vendored GAM $VERSION."
-"$DEST/gam" version 2>/dev/null | head -2 || echo "(could not run gam version yet — may need Gatekeeper approval)"
