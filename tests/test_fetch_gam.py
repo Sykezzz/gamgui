@@ -42,9 +42,9 @@ pytestmark = pytest.mark.skipif(
 
 # --- hermetic harness --------------------------------------------------------------------
 
-def _fake_tarball(path: Path) -> str:
+def _fake_tarball(path: Path, content: bytes = b'#!/bin/sh\necho "GAM 9.99.99"\n') -> str:
     """A real .tar.xz holding an executable `gam`, so the install path can run to completion."""
-    gam = io.BytesIO(b'#!/bin/sh\necho "GAM 9.99.99"\n')
+    gam = io.BytesIO(content)
     with tarfile.open(path, "w:xz") as tf:
         info = tarfile.TarInfo("gam-9.99.99/gam")
         info.size = len(gam.getvalue())
@@ -80,6 +80,7 @@ def _make_root(tmp_path: Path, pinned: str | None) -> tuple[Path, str]:
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(SCRIPT, root / "scripts" / "fetch_gam.sh")
+    shutil.copy2(REPO_ROOT / "scripts" / "gam_assets.py", root / "scripts" / "gam_assets.py")
 
     sha = _fake_tarball(tmp_path / "asset.tar.xz")
     (tmp_path / "release.json").write_text(
@@ -97,6 +98,9 @@ def _run(root: Path, tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     _stub_curl(bin_dir)
+    sw_vers = bin_dir / "sw_vers"
+    sw_vers.write_text("#!/bin/sh\necho 26.7.2\n")
+    sw_vers.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -197,3 +201,67 @@ def test_pywebview_is_pinned():
     assert "pywebview>=" not in build, build
     assert "pip install" not in build, build
     assert '"$PY" -c "import PyInstaller, webview"' in build, build
+
+
+def _stub_bsd_find(tmp_path):
+    # Let the complete macOS shell flow run hermetically on Linux too.
+    if sys.platform == "darwin":
+        return
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    find = bin_dir / "find"
+    find.write_text(
+        "#!/usr/bin/env bash\n"
+        "args=(); for arg in \"$@\"; do \n"
+        "  if [ \"$arg\" = '+111' ]; then args+=('/111'); else args+=(\"$arg\"); fi; done\n"
+        "/usr/bin/find \"${args[@]}\"\n"
+    )
+    find.chmod(0o755)
+
+
+def test_failed_runtime_probe_keeps_existing_payload(tmp_path):
+    root, _sha = _make_root(tmp_path, pinned=None)
+    sha = _fake_tarball(tmp_path / "asset.tar.xz", b'#!/bin/sh\necho "incompatible deployment target" >&2\nexit 9\n')
+    (root / "scripts" / "gam_checksums.txt").write_text(f"{sha}  {ASSET}\n")
+    _dest(root).mkdir(parents=True)
+    (_dest(root) / "gam").write_text("previous working payload")
+    _stub_bsd_find(tmp_path)
+    result = _run(root, tmp_path)
+    assert result.returncode != 0
+    assert "runtime probe failed" in result.stderr
+    assert "exit 9" in result.stderr
+    assert "incompatible deployment target" in result.stderr
+    assert (_dest(root) / "gam").read_text() == "previous working payload"
+    assert not list(_dest(root).parent.glob(".gam7-stage.*"))
+
+
+def test_runtime_version_mismatch_is_not_installed(tmp_path):
+    root, _sha = _make_root(tmp_path, pinned=None)
+    sha = _fake_tarball(tmp_path / "asset.tar.xz", b'#!/bin/sh\necho "GAM 1.0.0"\n')
+    (root / "scripts" / "gam_checksums.txt").write_text(f"{sha}  {ASSET}\n")
+    _stub_bsd_find(tmp_path)
+    result = _run(root, tmp_path)
+    assert result.returncode != 0
+    assert "runtime probe failed" in result.stderr
+    assert not _dest(root).exists()
+
+
+def test_successful_runtime_probe_installs_payload(tmp_path):
+    root, sha = _make_root(tmp_path, pinned=None)
+    (root / "scripts" / "gam_checksums.txt").write_text(f"{sha}  {ASSET}\n")
+    _stub_bsd_find(tmp_path)
+    result = _run(root, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (_dest(root) / "VERSION").read_text().strip() == "v9.99.99"
+
+
+@pytest.mark.parametrize("output", ["GAM 19.99.99", "GAM 9.99.990", "GAM 9.99.99beta", "Expected GAM 9.99.99"])
+def test_runtime_probe_requires_exact_parsed_version(tmp_path, output):
+    root, _sha = _make_root(tmp_path, pinned=None)
+    sha = _fake_tarball(tmp_path / "asset.tar.xz", f'#!/bin/sh\necho "{output}"\n'.encode())
+    (root / "scripts" / "gam_checksums.txt").write_text(f"{sha}  {ASSET}\n")
+    _stub_bsd_find(tmp_path)
+    result = _run(root, tmp_path)
+    assert result.returncode != 0
+    assert "runtime probe failed" in result.stderr
+    assert not _dest(root).exists()

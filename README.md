@@ -337,7 +337,7 @@ intentional dependency change, regenerate and review the lock with exactly `uv 0
 `uv lock --check` and the complete offline suite.
 
 The GAM7 binary is **not committed** (platform-specific, large) — `make gam` / `scripts/fetch_gam.sh`
-fetches the pinned version (`v7.50.00`) from the official releases and records its checksum.
+fetches the pinned version (`v7.51.00`) from the official releases and records its checksum.
 
 `make setup` auto-selects a usable Python 3.10+ when `PYTHON` is unset; set
 `PYTHON=/path/to/python` to choose one explicitly.
@@ -442,14 +442,19 @@ alone is not local-update evidence; the updater requires `update-ready` on the e
 ### Staying current with GAM (and not breaking on updates)
 
 GamGUI pins a tested GAM7 version — `EXPECTED_GAM_VERSION` in `gamgui/core/gam/commands.py`, matched by
-`scripts/fetch_gam.sh`. The tested pin is currently **GAM 7.50.00**. The running app never downloads
+`scripts/fetch_gam.sh`. The tested pin is currently **GAM 7.51.00**. The running app never downloads
 or substitutes an unpinned GAM binary:
 
 - **Automated pin PR** (`.github/workflows/gam-update.yml`) compares the latest GAM release with the
-  pin, runs `scripts/bump_gam.py`, downloads both supported macOS assets using GitHub-published
-  SHA-256 metadata, regenerates the catalog/version contracts, runs focused tests, and opens an
+  pin, runs `scripts/bump_gam.py`, pins all macOS deployment targets for both supported
+  architectures using GitHub-published SHA-256 metadata, regenerates the catalog/version contracts, runs focused tests, and opens an
   auto-merge PR to `district-main`. Branch protection and exact-SHA post-merge validation still
   gate deployment.
+- **macOS asset compatibility** selects the newest GAM deployment target no newer than the local
+  macOS version, for the native architecture. The download must have a committed checksum and pass
+  `gam version` before replacing the existing payload. A newer upstream target is not a reason to
+  skip runtime validation. Built app metadata records the greater of the configured minimum and
+  the bundled GAM target; a build on a newer Mac does not claim to run on older Macs.
 - **Runner recovery** retries a confirmed hosted macOS allocation failure at most twice, only
   when no updater step ran and the default branch has not moved. It does not retry test or merge
   failures. See [runner recovery](docs/gam-updater-runner-retry.md).

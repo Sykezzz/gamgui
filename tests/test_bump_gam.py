@@ -166,3 +166,18 @@ def test_record_release_checksums_replaces_windows_pin_preserving_other_releases
     assert text.count(name) == 1
     assert "c" * 64 + "  " + name in text
     assert "b" * 64 + "  " + old in text
+
+
+def test_release_checksums_records_all_mac_targets_for_compatible_selection():
+    from tests.test_gam_assets import release
+    payload = release(("15.8", "arm64"), ("26.7", "arm64"), ("27.0", "arm64"), ("26.6", "x86_64"))
+    payload["assets"].append({"name": "gam-7.51.00-windows-x86_64.zip", "digest": "sha256:" + "b" * 64})
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def read(self): return json.dumps(payload).encode()
+
+    records = release_checksums("v7.51.00", opener=lambda *_args, **_kwargs: Response())
+    assert {name for _, name in records} == {asset["name"] for asset in payload["assets"]}
+    assert len(records) == 5

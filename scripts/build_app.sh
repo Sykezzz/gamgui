@@ -35,6 +35,7 @@ PACKAGED_SOURCE_STATUS="$(
     uv.lock \
     scripts/build_app.sh \
     scripts/fetch_gam.sh \
+    scripts/gam_assets.py \
     scripts/gam_checksums.txt
 )"
 if [ -n "$PACKAGED_SOURCE_STATUS" ] && [ "${GAMGUI_ALLOW_DIRTY_BUILD:-}" != "1" ]; then
@@ -59,7 +60,20 @@ trap 'rm -rf "$BUILD_METADATA_DIR"' EXIT
 export GAMGUI_BUILD_PROFILE="$PROFILE"
 export GAMGUI_SOURCE_SHA="$SOURCE_SHA"
 export GAMGUI_BUILD_ARCH="$(uname -m)"
-export GAMGUI_MINIMUM_MACOS="${GAMGUI_MINIMUM_MACOS:-12.0}"
+GAMGUI_MINIMUM_MACOS="$("$PY" - "${GAMGUI_MINIMUM_MACOS:-12.0}" "$(sw_vers -productVersion)" <<'PYTHON'
+import sys
+from pathlib import Path
+from scripts.gam_assets import effective_minimum_macos
+
+asset = Path("gamgui/resources/gam7/SHA256").read_text().split()[1]
+try:
+    print(effective_minimum_macos(asset, sys.argv[1], sys.argv[2]))
+except ValueError as exc:
+    sys.exit(str(exc))
+PYTHON
+)"
+export GAMGUI_MINIMUM_MACOS
+echo "==> Effective minimum macOS: $GAMGUI_MINIMUM_MACOS (includes bundled GAM target)"
 export GAMGUI_PACKAGING_REVISION="${GAMGUI_PACKAGING_REVISION:-1}"
 export GAMGUI_BUILD_METADATA_DIR="$BUILD_METADATA_DIR"
 
