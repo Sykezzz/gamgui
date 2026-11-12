@@ -1,6 +1,9 @@
 name: Continue GAM verification
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch: {}
@@ -18,7 +21,13 @@ concurrency:
 
 jobs:
   reconcile:
-    if: github.repository == 'Sykezzz/gamgui' && github.ref == 'refs/heads/district-main'
+    if: >-
+      github.repository_id == '1309243040' &&
+      github.repository == 'Sykezzz/gamgui' && github.ref == 'refs/heads/district-main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.id == 1309243040 &&
+        github.event.workflow_run.head_repository.full_name == 'Sykezzz/gamgui'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

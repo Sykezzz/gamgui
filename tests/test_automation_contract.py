@@ -187,9 +187,25 @@ def test_capacity_handoff_preserves_native_and_release_gates():
     assert "cron: '7,22,37,52 * * * *'" in recovery
     assert 'ref: district-main' in recovery
     assert 'persist-credentials: false' in recovery
-    assert 'workflow_run:' not in recovery
+    assert 'workflows: [CI]' in recovery
+    assert 'types: [completed]' in recovery
+    assert 'github.event.workflow_run.head_repository.id == 1309243040' in recovery
     assert 'pull_request_target:' not in recovery
     assert 'group: district-maintenance' in recovery
     assert 'python3 scripts/reconcile_gam_ci.py' in recovery
     assert 'continue-on-error' not in recovery
     assert 'test "$MATRIX_RESULT" = "success"' in _workflow('ci.yml')
+
+
+def test_ci_completion_handler_executes_only_trusted_default_branch_code():
+    recovery = _workflow('gam-ci-recovery.yml')
+    assert 'ref: district-main' in recovery
+    assert 'persist-credentials: false' in recovery
+    assert 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' in recovery
+    assert 'head_sha' not in recovery
+    assert 'download-artifact' not in recovery
+    assert 'actions/cache' not in recovery
+    assert 'pull_request_target' not in recovery
+    assert 'checks: read' in recovery
+    assert 'checks: write' not in recovery
+    assert 'permissions: write-all' not in recovery

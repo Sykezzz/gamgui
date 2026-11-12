@@ -605,7 +605,10 @@ A provider-confirmed macOS runner allocation failure can finish the **Update GAM
 workflow successfully with a **Deferred** summary. An exact-SHA CI run still in progress
 with no failed jobs can also hand off as **verification pending** when the synchronous wait expires. This means the automation handed off
 verification, not that macOS passed or the PR merged. Raw CI jobs are not made green, and required macOS merge gates remain unchanged.
-**Continue GAM verification** checks open GAM bump PRs every 15 minutes and retries only
+**Continue GAM verification** wakes when eligible same-repository pull-request CI completes,
+with the 15-minute schedule and manual dispatch as backstops. Event-triggered recovery
+validates the authoritative workflow, repository, current run attempt, and unchanged PR
+head before acting on that one PR. It retries only
 cancelled, never-started macOS jobs with GitHub's explicit allocation-error annotation,
 up to three CI attempts. Executed or unclassified failures are not excused; they open a
 deduplicated exact-head GitHub issue. Exhausted capacity recovery opens a separate,

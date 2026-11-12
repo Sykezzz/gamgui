@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
+import os
+from pathlib import Path
 import re
 
 if __package__:
@@ -15,6 +18,8 @@ else:
     from merge_tested_automation_pr import GitHubCLI, dispatch_test_and_merge
 
 REPOSITORY = "Sykezzz/gamgui"
+REPOSITORY_ID = 1309243040
+CI_WORKFLOW_ID = 318866180
 BASE = "district-main"
 MAX_ATTEMPTS = 3
 BRANCH = re.compile(r"automation/gam-v\d+\.\d+\.\d+-[0-9a-f]{12}(?:-run-\d+)?")
@@ -59,7 +64,7 @@ def newer_than_pin(gh, pr):
     return version(target) > version(pin)
 
 
-def reconcile(gh, pr):
+def reconcile(gh, pr, *, expected_run=None):
     if not eligible(pr):
         return "ineligible"
     if not newer_than_pin(gh, pr):
@@ -79,6 +84,9 @@ def reconcile(gh, pr):
     if not candidates:
         return "waiting for eligible CI"
     run = max(candidates, key=lambda item: item["id"])
+    if expected_run is not None and any(run.get(key) != expected_run.get(key) for key in
+            ("id", "head_sha", "workflow_id", "run_attempt", "status", "conclusion")):
+        return "completion superseded; recovery held"
     if run.get("status") != "completed":
         return "verification running"
 
@@ -151,9 +159,71 @@ def resume_release_validation(gh):
     return "missing exact-SHA validation dispatched"
 
 
+def _same_repository(value):
+    return (isinstance(value, dict) and value.get("id") == REPOSITORY_ID
+            and value.get("full_name") == REPOSITORY)
+
+
+def _valid_completion(run):
+    return (isinstance(run, dict) and type(run.get("id")) is int and 0 < run["id"] <= 9223372036854775807
+            and run.get("workflow_id") == CI_WORKFLOW_ID
+            and run.get("path") == ".github/workflows/ci.yml" and run.get("name") == "CI"
+            and run.get("event") == "pull_request" and run.get("status") == "completed"
+            and run.get("conclusion") in ("success", "failure", "cancelled", "timed_out")
+            and type(run.get("run_attempt")) is int and 1 <= run["run_attempt"] <= 10000
+            and isinstance(run.get("head_sha"), str) and SHA.fullmatch(run["head_sha"])
+            and isinstance(run.get("head_branch"), str) and BRANCH.fullmatch(run["head_branch"])
+            and _same_repository(run.get("head_repository")))
+
+
+def ci_completion(gh, payload, *, repository, repository_id, ref, event_name):
+    # workflow_run is privileged even for a fork. Reject before invoking any write path.
+    if (event_name != "workflow_run" or repository != REPOSITORY
+            or repository_id != str(REPOSITORY_ID) or ref != "refs/heads/" + BASE
+            or not isinstance(payload, dict) or payload.get("action") != "completed"
+            or not _same_repository(payload.get("repository"))):
+        return "ignored unrelated completion context"
+    source = payload.get("workflow_run")
+    if not _valid_completion(source):
+        return "ignored ineligible CI source"
+    workflow = gh.json(["api", f"repos/{REPOSITORY}/actions/workflows/ci.yml"])
+    if (workflow.get("id") != CI_WORKFLOW_ID or workflow.get("path") != source["path"]
+            or workflow.get("name") != "CI" or workflow.get("state") != "active"):
+        return "ignored unexpected CI workflow"
+    current = gh.json(["api", f"repos/{REPOSITORY}/actions/runs/{source['id']}"])
+    if (not _valid_completion(current)
+            or any(current.get(key) != source.get(key) for key in
+                   ("id", "head_sha", "head_branch", "workflow_id", "run_attempt", "status", "conclusion"))):
+        return "ignored stale CI completion"
+    pulls = current.get("pull_requests")
+    if (not isinstance(pulls, list) or len(pulls) != 1 or not isinstance(pulls[0], dict)
+            or type(pulls[0].get("number")) is not int or pulls[0]["number"] <= 0):
+        return "ignored ambiguous CI pull request"
+    number = pulls[0]["number"]
+    pr = gh.json(["api", f"repos/{REPOSITORY}/pulls/{number}"])
+    if (not eligible(pr) or not _same_repository(pr["head"].get("repo"))
+            or not _same_repository(pr["base"].get("repo"))
+            or pr["number"] != number or pr["head"]["sha"] != current["head_sha"]
+            or pr["head"]["ref"] != current["head_branch"]):
+        return "ignored changed or ineligible pull request"
+    # Event handling is scoped to this exact PR/run, never a broad scheduled scan.
+    return reconcile(gh, pr, expected_run=current)
+
+
 def main():
     argparse.ArgumentParser(description=__doc__).parse_args()
     gh = GitHubCLI()
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_run":
+        with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event_file:
+            raw = event_file.read(1048577)
+        if len(raw) > 1048576:
+            raise RuntimeError("Completion event exceeds size limit.")
+        print(ci_completion(
+            gh, json.loads(raw), repository=os.environ.get("GITHUB_REPOSITORY"),
+            repository_id=os.environ.get("GITHUB_REPOSITORY_ID"),
+            ref=os.environ.get("GITHUB_REF"), event_name=os.environ.get("GITHUB_EVENT_NAME"),
+        ))
+        return 0
     print(resume_release_validation(gh))
     prs = pages(gh, f"repos/{REPOSITORY}/pulls?state=open&base={BASE}&per_page=100")
     failed = False
