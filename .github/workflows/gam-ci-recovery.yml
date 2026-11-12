@@ -1,0 +1,33 @@
+name: Continue GAM verification
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  checks: read
+  issues: write
+
+concurrency:
+  group: district-maintenance
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.repository == 'Sykezzz/gamgui' && github.ref == 'refs/heads/district-main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Never execute PR-head code or consume artifacts with this write token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: district-main
+          persist-credentials: false
+      - name: Recover capacity failures and merge only verified exact heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/reconcile_gam_ci.py

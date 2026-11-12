@@ -7,6 +7,7 @@ on:
 
 permissions:
   actions: write
+  checks: read
   contents: write
   issues: write
   pull-requests: write
@@ -126,12 +127,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/merge_tested_automation_pr.py \
+            --defer-macos-capacity \
             --repository "$GITHUB_REPOSITORY" \
             --branch "${{ steps.branch.outputs.name }}" \
             --head-sha "${{ steps.pull.outputs.head_sha }}" \
             --pull-request "${{ steps.pull.outputs.url }}"
       - name: Start exact post-merge validation
-        if: steps.release.outputs.needed == 'true'
+        if: steps.merge.outputs.merge_sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
           MERGED_SHA: ${{ steps.merge.outputs.merge_sha }}
@@ -144,7 +146,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           TITLE="GAM7 automatic update blocked"
-          BODY="The automatic bump for \`$TAG\` failed. No update was merged. Run: $RUN_URL"
+          BODY="The automatic bump for \`$TAG\` failed. Inspect the PR and exact-SHA validation before using an update. Run: $RUN_URL"
           NUMBER="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
           if [ -n "$NUMBER" ]; then
             gh issue comment "$NUMBER" --body "$BODY"

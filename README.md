@@ -598,3 +598,22 @@ report a vulnerability privately.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+#### Deferred macOS runner verification
+
+A provider-confirmed macOS runner allocation failure can finish the **Update GAM7 pin**
+workflow successfully with a **Deferred** summary. An exact-SHA CI run still in progress
+with no failed jobs can also hand off as **verification pending** when the synchronous wait expires. This means the automation handed off
+verification, not that macOS passed or the PR merged. Raw CI jobs are not made green, and required macOS merge gates remain unchanged.
+**Continue GAM verification** checks open GAM bump PRs every 15 minutes and retries only
+cancelled, never-started macOS jobs with GitHub's explicit allocation-error annotation,
+up to three CI attempts. Executed or unclassified failures are not excused; they open a
+deduplicated exact-head GitHub issue. Exhausted capacity recovery opens a separate,
+clearly worded verification-blocked issue rather than claiming a product defect.
+
+The reconciler executes trusted `district-main` code, checks the unchanged PR head and
+eligible pull-request CI, and uses the ordinary protected merge API. If the merge succeeds but dispatch fails, the next scheduled check resumes missing
+validation for the current merged SHA. Both the native
+checks and exact-SHA post-merge validation must pass before `update-ready` advances.
+Post-merge validation and its existing failure reporting remain unchanged.
+A green deferred automation result never authorizes distribution of an unverified build.

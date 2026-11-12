@@ -12,6 +12,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+if __package__:
+    from . import macos_capacity
+else:
+    import macos_capacity
+
 
 class GitHubCLI:
     def json(self, args: list[str], payload: dict[str, str] | None = None) -> Any:
@@ -115,6 +120,7 @@ def dispatch_test_and_merge(
     timeout_seconds: int,
     poll_seconds: int,
     gh: GitHubCLI,
+    defer_macos_capacity: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, str]:
@@ -189,6 +195,8 @@ def dispatch_test_and_merge(
             ]
         )
     elif selected.get("status") == "completed" and conclusion != "success":
+        if defer_macos_capacity:
+            return _defer_capacity(gh, repository, selected, head_sha)
         gh.run(
             [
                 "run",
@@ -224,10 +232,17 @@ def dispatch_test_and_merge(
         sleep(min(poll_seconds, max(0, deadline - monotonic())))
 
     if selected is None or selected.get("status") != "completed":
+        if defer_macos_capacity and selected is not None:
+            if macos_capacity.verification_pending(gh, repository, selected_run_id, head_sha):
+                return {"deferred": "true", "reason": "verification pending",
+                        "merge_sha": "", "ci_run_url": str(selected.get("url", ""))}
+            return _defer_capacity(gh, repository, selected, head_sha)
         raise RuntimeError(
             f"Timed out waiting for an exact-SHA {workflow} run at {head_sha}."
         )
     if selected.get("conclusion") != "success":
+        if defer_macos_capacity:
+            return _defer_capacity(gh, repository, selected, head_sha)
         raise RuntimeError(
             f"Exact-SHA CI did not pass: {selected.get('url', 'unknown run')} "
             f"concluded {selected.get('conclusion') or 'without a conclusion'}."
@@ -276,6 +291,13 @@ def dispatch_test_and_merge(
     }
 
 
+def _defer_capacity(gh, repository, selected, head_sha):
+    # The reconciler, not this synchronous bump job, owns bounded capacity recovery.
+    if not macos_capacity.capacity_only(gh, repository, int(selected["databaseId"]), head_sha):
+        raise RuntimeError("Exact-SHA CI failed without verified macOS allocation-only evidence.")
+    return {"deferred": "true", "merge_sha": "", "ci_run_url": str(selected.get("url", ""))}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
@@ -284,6 +306,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--pull-request", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1500)
+    parser.add_argument("--defer-macos-capacity", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=10)
     return parser
 
@@ -306,12 +329,22 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
         poll_seconds=args.poll_seconds,
         gh=GitHubCLI(),
+        defer_macos_capacity=args.defer_macos_capacity,
     )
     output_path = os.environ.get("GITHUB_OUTPUT")
     if output_path:
         with Path(output_path).open("a", encoding="utf-8") as output:
             for key, value in result.items():
                 output.write(f"{key}={value}\n")
+    if result.get("deferred") == "true":
+        message = (f"Deferred: {result.get('reason', 'macOS runner capacity')} for {args.head_sha.lower()}. "
+                   f"Nothing merged; scheduled recovery will continue. {result['ci_run_url']}")
+        print(message)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with Path(summary).open("a", encoding="utf-8") as output:
+                output.write(message + "\n")
+        return 0
     print(
         f"Merged exact tested revision {args.head_sha.lower()} as "
         f"{result['merge_sha']} ({result['ci_run_url']})."
