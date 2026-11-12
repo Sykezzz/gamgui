@@ -29,9 +29,14 @@ def pages(gh: Any, endpoint: str, key: str | None = None) -> list:
 
 def capacity_only(gh: Any, repository: str, run_id: int, head_sha: str) -> bool:
     jobs = pages(gh, f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100", "jobs")
+    return _capacity_jobs(gh, repository, run_id, head_sha, jobs)
+
+
+def _capacity_jobs(gh, repository, run_id, head_sha, jobs, *, allow_pending=False):
     if not jobs or len({job.get("id") for job in jobs}) != len(jobs):
         return False
     allocation = set()
+    pending = set()
     aggregates = []
     for job in jobs:
         if (job.get("run_id") != run_id or job.get("head_sha") != head_sha):
@@ -43,6 +48,10 @@ def capacity_only(gh: Any, repository: str, run_id: int, head_sha: str) -> bool:
             continue
         if name == "macOS application build smoke":
             aggregates.append(job)
+            continue
+        if (allow_pending and name in MACOS_JOBS
+                and job.get("labels") == ["macos-latest"] and _pending_job(job)):
+            pending.add(name)
             continue
         if (name not in MACOS_JOBS or job.get("status") != "completed" or conclusion not in ("cancelled", "failure")
                 or job.get("steps") != [] or job.get("runner_id") != 0
@@ -62,22 +71,35 @@ def capacity_only(gh: Any, repository: str, run_id: int, head_sha: str) -> bool:
                     "macOS application build smoke (classroom-oneroster)"}
         failed_steps = [step.get("name") for step in job.get("steps", [])
                         if step.get("conclusion") not in ("success", "skipped")]
-        if (allocation.intersection(profiles) and job.get("status") == "queued"
+        if ((allocation | pending).intersection(profiles) and job.get("status") == "queued"
                 and job.get("steps") == [] and job.get("runner_id") == 0
                 and job.get("labels") == ["ubuntu-latest"]):
             continue
         if (not allocation.intersection(profiles) or job.get("conclusion") != "failure"
                 or failed_steps != ["Require every application profile build"]):
             return False
-    return bool(allocation)
+    return bool(allocation) and (bool(pending) if allow_pending else True)
+
+
+def _pending_job(job):
+    return (job.get("status") in ("queued", "in_progress", "waiting")
+            and job.get("conclusion") is None
+            and all(step.get("conclusion") in (None, "success", "skipped")
+                    for step in job.get("steps", [])))
 
 
 def verification_pending(gh: Any, repository: str, run_id: int, head_sha: str) -> bool:
     jobs = pages(gh, f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100", "jobs")
-    return bool(jobs) and all(
+    if not jobs or len({job.get("id") for job in jobs}) != len(jobs):
+        return False
+    clean_pending = all(
         job.get("run_id") == run_id and job.get("head_sha") == head_sha
-        and ((job.get("status") in ("queued", "in_progress", "waiting") and job.get("conclusion") is None)
+        and (_pending_job(job)
              or (job.get("status") == "completed" and job.get("conclusion") == "success")
              or (job.get("conclusion") == "skipped" and job.get("name") in SKIPPABLE_JOBS))
         for job in jobs
+    )
+    # Only the timeout handoff uses this mixed state; terminal CI stays strict.
+    return clean_pending or _capacity_jobs(
+        gh, repository, run_id, head_sha, jobs, allow_pending=True
     )

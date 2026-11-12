@@ -95,11 +95,11 @@ def test_historical_queued_aggregate_is_dependent_not_executed_failure():
     assert not capacity_only(GitHub([source, aggregate]), 'owner/repo', 20, HEAD)
 
 
-def test_pending_is_not_inferred_for_any_failed_job():
+def test_pending_is_not_inferred_for_unverified_failed_job():
     from scripts.macos_capacity import verification_pending
     queued = job(status='queued', conclusion=None)
     assert verification_pending(GitHub([queued]), 'owner/repo', 20, HEAD)
-    assert not verification_pending(GitHub([queued, job(id=2)]), 'owner/repo', 20, HEAD)
+    assert not verification_pending(GitHub([queued, job(id=2, steps=[{}])]), 'owner/repo', 20, HEAD)
     assert not verification_pending(GitHub([]), 'owner/repo', 20, HEAD)
 
 
@@ -109,3 +109,48 @@ def test_mixed_running_and_executed_failure_is_not_pending_or_capacity():
                     job(id=2, name='test (ubuntu-latest, py3.12)', conclusion='failure', steps=[{}])])
     assert not verification_pending(mixed, 'owner/repo', 20, HEAD)
     assert not capacity_only(mixed, 'owner/repo', 20, HEAD)
+
+
+@pytest.mark.parametrize('status', ['queued', 'in_progress'])
+def test_mixed_verified_capacity_and_pending_macos_defers_without_passing_ci(status):
+    from scripts.macos_capacity import verification_pending
+    mixed = [job(), job('test (macos-latest, py3.12)', id=2, status=status, conclusion=None)]
+    assert verification_pending(GitHub(mixed), 'owner/repo', 20, HEAD)
+    assert not capacity_only(GitHub(mixed), 'owner/repo', 20, HEAD)
+
+
+@pytest.mark.parametrize('changes', [
+    {'name': 'unknown job'}, {'labels': ['ubuntu-latest']},
+    {'status': 'unknown'}, {'status': 'completed'},
+    {'head_sha': 'b' * 40}, {'run_id': 21},
+    {'steps': [{'conclusion': 'failure'}]},
+    {'steps': [{'conclusion': 'cancelled'}]},
+    {'steps': [{'conclusion': 'timed_out'}]},
+])
+def test_mixed_capacity_does_not_excuse_unknown_or_already_failed_pending_job(changes):
+    from scripts.macos_capacity import verification_pending
+    pending = job('test (macos-latest, py3.12)', id=2, status='in_progress', conclusion=None)
+    assert not verification_pending(GitHub([job(), pending | changes]), 'owner/repo', 20, HEAD)
+
+
+def test_mixed_pending_needs_provider_evidence_and_does_not_hide_executed_failure():
+    from scripts.macos_capacity import verification_pending
+    pending = job('test (macos-latest, py3.12)', id=2, status='queued', conclusion=None)
+    assert not verification_pending(GitHub([job(), pending], annotations=[[]]), 'owner/repo', 20, HEAD)
+    executed = job('test (macos-latest, py3.14)', id=3, conclusion='failure', steps=[{}], runner_id=42)
+    assert not verification_pending(GitHub([job(), pending, executed]), 'owner/repo', 20, HEAD)
+
+
+def test_mixed_pending_build_and_queued_aggregate_can_wait_for_verification():
+    from scripts.macos_capacity import verification_pending
+    pending = job('macOS application build smoke (core)', id=2, status='queued', conclusion=None)
+    aggregate = job('macOS application build smoke', id=3, status='queued', conclusion=None,
+                    labels=['ubuntu-latest'])
+    assert verification_pending(GitHub([job(), pending, aggregate]), 'owner/repo', 20, HEAD)
+    assert not capacity_only(GitHub([job(), pending, aggregate]), 'owner/repo', 20, HEAD)
+
+
+def test_pending_job_with_failed_step_is_not_excused_even_without_capacity_cancellation():
+    from scripts.macos_capacity import verification_pending
+    running = job(status='in_progress', conclusion=None, steps=[{'conclusion': 'failure'}])
+    assert not verification_pending(GitHub([running]), 'owner/repo', 20, HEAD)

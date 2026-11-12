@@ -422,3 +422,51 @@ def test_pending_timeout_handoff_is_truthful_and_does_not_merge(monkeypatch):
     assert result['merge_sha'] == ''
     assert clock.now == 3
     assert gh.runs == [] and gh.merge_payload is None
+
+
+class MixedCapacityGitHub(FakeGitHub):
+    def __init__(self, *, pending_status='queued', completed=False, executed_failure=False):
+        super().__init__([[_run(status='completed' if completed else 'in_progress',
+                               conclusion='failure' if completed else None)]])
+        self.pending_status = pending_status
+        self.executed_failure = executed_failure
+
+    def json(self, args, payload=None):
+        if args[:3] == ['api', '--paginate', '--slurp']:
+            from scripts.macos_capacity import ALLOCATION_ERROR
+            if '/annotations?' in args[-1]:
+                return [[{'annotation_level': 'failure', 'message': ALLOCATION_ERROR}]]
+            base = dict(run_id=20, head_sha=HEAD, steps=[], runner_id=0, labels=['macos-latest'])
+            jobs = [base | dict(id=1, name='gam-compat (pinned binary)', status='completed', conclusion='cancelled'),
+                    base | dict(id=2, name='test (macos-latest, py3.12)', status=self.pending_status, conclusion=None)]
+            if self.executed_failure:
+                jobs.append(base | dict(id=3, name='test (macos-latest, py3.14)', status='completed',
+                                        conclusion='failure', steps=[{'conclusion': 'failure'}], runner_id=42))
+            return [{'jobs': jobs}]
+        return super().json(args, payload)
+
+
+def _merge_with_capacity_handoff(gh):
+    clock = FakeClock()
+    return dispatch_test_and_merge(
+        repository='owner/repo', workflow='ci.yml', branch='automation/update',
+        head_sha=HEAD, pull_request='42', timeout_seconds=3, poll_seconds=1,
+        gh=gh, defer_macos_capacity=True, sleep=clock.sleep, monotonic=clock.monotonic,
+    )
+
+
+@pytest.mark.parametrize('pending_status', ['queued', 'in_progress'])
+def test_timeout_mixed_provider_allocation_and_pending_job_hands_off(pending_status):
+    gh = MixedCapacityGitHub(pending_status=pending_status)
+    result = _merge_with_capacity_handoff(gh)
+    assert result['reason'] == 'verification pending'
+    assert result['merge_sha'] == ''
+    assert gh.runs == [] and gh.merge_payload is None
+
+
+@pytest.mark.parametrize('completed,executed_failure', [(True, False), (False, True)])
+def test_mixed_state_cannot_excuse_completed_run_or_executed_failure(completed, executed_failure):
+    gh = MixedCapacityGitHub(completed=completed, executed_failure=executed_failure)
+    with pytest.raises(RuntimeError, match='without verified'):
+        _merge_with_capacity_handoff(gh)
+    assert gh.runs == [] and gh.merge_payload is None
