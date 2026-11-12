@@ -377,3 +377,48 @@ def test_initial_metadata_api_error_stops_without_retry():
     assert gh.list_calls == 0
     assert gh.runs == []
     assert gh.merge_payload is None
+
+
+def test_opt_in_capacity_handoff_does_not_retry_or_merge(monkeypatch):
+    from scripts import macos_capacity
+    monkeypatch.setattr(macos_capacity, 'capacity_only', lambda *args: True)
+    gh = FakeGitHub([[_run(conclusion='failure')]])
+    clock = FakeClock()
+    result = dispatch_test_and_merge(
+        repository='owner/repo', workflow='ci.yml', branch='automation/update',
+        head_sha=HEAD, pull_request='42', timeout_seconds=10, poll_seconds=1,
+        gh=gh, defer_macos_capacity=True, sleep=clock.sleep, monotonic=clock.monotonic,
+    )
+    assert result['deferred'] == 'true'
+    assert result['merge_sha'] == ''
+    assert gh.runs == [] and gh.merge_payload is None
+
+
+def test_opt_in_executed_failure_is_not_retried_or_excused(monkeypatch):
+    from scripts import macos_capacity
+    monkeypatch.setattr(macos_capacity, 'capacity_only', lambda *args: False)
+    gh = FakeGitHub([[_run(conclusion='failure')]])
+    clock = FakeClock()
+    with pytest.raises(RuntimeError, match='without verified'):
+        dispatch_test_and_merge(
+            repository='owner/repo', workflow='ci.yml', branch='automation/update',
+            head_sha=HEAD, pull_request='42', timeout_seconds=10, poll_seconds=1,
+            gh=gh, defer_macos_capacity=True, sleep=clock.sleep, monotonic=clock.monotonic,
+        )
+    assert gh.runs == [] and gh.merge_payload is None
+
+
+def test_pending_timeout_handoff_is_truthful_and_does_not_merge(monkeypatch):
+    from scripts import macos_capacity
+    monkeypatch.setattr(macos_capacity, 'verification_pending', lambda *args: True)
+    gh = FakeGitHub([[_run(status='queued', conclusion=None)]])
+    clock = FakeClock()
+    result = dispatch_test_and_merge(
+        repository='owner/repo', workflow='ci.yml', branch='automation/update',
+        head_sha=HEAD, pull_request='42', timeout_seconds=3, poll_seconds=1,
+        gh=gh, defer_macos_capacity=True, sleep=clock.sleep, monotonic=clock.monotonic,
+    )
+    assert result['reason'] == 'verification pending'
+    assert result['merge_sha'] == ''
+    assert clock.now == 3
+    assert gh.runs == [] and gh.merge_payload is None

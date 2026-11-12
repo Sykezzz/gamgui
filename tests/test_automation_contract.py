@@ -176,3 +176,20 @@ def test_workflow_actions_are_immutable_and_dependencies_are_locked():
     assert "$(UV) sync --frozen" in makefile
     assert "pip install" not in build_script
     assert 'name = "pyinstaller"' in lock and 'version = "6.20.0"' in lock
+
+
+def test_capacity_handoff_preserves_native_and_release_gates():
+    bump = _workflow('gam-update.yml')
+    recovery = _workflow('gam-ci-recovery.yml')
+    assert '--defer-macos-capacity' in bump
+    assert "if: steps.merge.outputs.merge_sha != ''" in bump
+    assert 'checks: read' in bump
+    assert "cron: '7,22,37,52 * * * *'" in recovery
+    assert 'ref: district-main' in recovery
+    assert 'persist-credentials: false' in recovery
+    assert 'workflow_run:' not in recovery
+    assert 'pull_request_target:' not in recovery
+    assert 'group: district-maintenance' in recovery
+    assert 'python3 scripts/reconcile_gam_ci.py' in recovery
+    assert 'continue-on-error' not in recovery
+    assert 'test "$MATRIX_RESULT" = "success"' in _workflow('ci.yml')
